@@ -84,6 +84,8 @@ pub struct RoomInfoDetail {
     pub cover: String,
     #[serde(default)]
     pub live_start_time: i64,
+    #[serde(default)]
+    pub special_type: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +97,7 @@ pub struct BiliRoomInfo {
     pub title: String,
     pub cover_url: String,
     pub live_start_time: Option<i64>,
+    pub special_type: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

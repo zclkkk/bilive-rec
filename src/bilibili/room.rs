@@ -110,6 +110,7 @@ fn parse_room_info(resp: &RoomInfoResponse) -> AppResult<BiliRoomInfo> {
         title: detail.title.clone(),
         cover_url: detail.cover.clone(),
         live_start_time,
+        special_type: detail.special_type,
     })
 }
 
@@ -188,7 +189,8 @@ mod tests {
                     "live_status": 1,
                     "title": "测试直播间",
                     "cover": "https://example.com/cover.png",
-                    "live_start_time": 1716300000
+                    "live_start_time": 1716300000,
+                    "special_type": 1
                 }
             }
         }"#;
@@ -204,6 +206,7 @@ mod tests {
         assert_eq!(info.title, "测试直播间");
         assert_eq!(info.cover_url, "https://example.com/cover.png");
         assert_eq!(info.live_start_time, Some(1716300000));
+        assert_eq!(info.special_type, 1);
     }
 
     #[test]
@@ -231,6 +234,7 @@ mod tests {
         assert_eq!(info.live_status, LiveStatus::Offline);
         assert!(!info.live_status.is_live());
         assert_eq!(info.live_start_time, None);
+        assert_eq!(info.special_type, 0);
     }
 
     #[test]
