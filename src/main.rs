@@ -1,29 +1,14 @@
-#[allow(dead_code)]
-mod bilibili;
-mod cli;
-#[allow(dead_code)]
-mod config;
-#[allow(dead_code)]
-mod error;
-#[allow(dead_code)]
-mod pipeline;
-#[allow(dead_code)]
-mod recorder;
-#[allow(dead_code)]
-mod state;
-#[allow(dead_code)]
-mod uploader;
-
 use std::process;
 
+use bilive_rec::bilibili;
+use bilive_rec::bilibili::client::BiliClient;
+use bilive_rec::cli::{Cli, Command, StateAction};
+use bilive_rec::config::{AppConfig, RecordConfig};
+use bilive_rec::error::{AppError, AppResult};
+use bilive_rec::state;
+use bilive_rec::state::store::StateStore;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
-
-use bilibili::client::BiliClient;
-use cli::{Cli, Command, StateAction};
-use config::AppConfig;
-use error::{AppError, AppResult};
-use state::store::StateStore;
 
 #[tokio::main]
 async fn main() {
@@ -100,15 +85,7 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
             if default_path.exists() {
                 AppConfig::load(default_path)?.record
             } else {
-                config::RecordConfig {
-                    output_dir: std::path::PathBuf::from("./recordings"),
-                    segment_time: None,
-                    segment_size: None,
-                    min_segment_size: "20MiB".to_string(),
-                    prefer_protocol: config::PreferredProtocol::Flv,
-                    qn: 10000,
-                    cdn: vec![],
-                }
+                RecordConfig::default()
             }
         }
         Some(path) => AppConfig::load(path)?.record,
@@ -132,13 +109,11 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
 
         println!("candidates = {}", candidates.len());
         for candidate in &candidates {
-            let proto_str = format!("{:?}", candidate.protocol).to_lowercase();
-            let codec_str = format!("{:?}", candidate.codec).to_lowercase();
             println!(
                 "  - protocol={}, format={}, codec={}, qn={}, cdn={}, url={}",
-                proto_str,
+                candidate.protocol.as_str(),
                 candidate.format,
-                codec_str,
+                candidate.codec.as_str(),
                 candidate.qn,
                 candidate.cdn_name,
                 candidate.url

@@ -34,11 +34,8 @@ pub enum AppError {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
 
-    #[error("wbi error: {0}")]
-    Wbi(String),
-
-    #[error("not implemented: {0}")]
-    NotImplemented(String),
+    #[error("bilibili error: {0}")]
+    Bilibili(String),
 }
 
 impl From<redb::TransactionError> for AppError {

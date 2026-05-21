@@ -162,12 +162,21 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+    pub fn from_api_name(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
             "flv" => Protocol::Flv,
             "fmp4" => Protocol::HlsFmp4,
             "ts" => Protocol::HlsTs,
             _ => Protocol::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Flv => "flv",
+            Protocol::HlsFmp4 => "hls_fmp4",
+            Protocol::HlsTs => "hls_ts",
+            Protocol::Unknown => "unknown",
         }
     }
 }
@@ -182,12 +191,21 @@ pub enum Codec {
 }
 
 impl Codec {
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_api_name(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "avc" => Codec::Avc,
             "hevc" => Codec::Hevc,
             "av1" => Codec::Av1,
             _ => Codec::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Codec::Avc => "avc",
+            Codec::Hevc => "hevc",
+            Codec::Av1 => "av1",
+            Codec::Unknown => "unknown",
         }
     }
 }

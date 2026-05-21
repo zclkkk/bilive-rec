@@ -18,7 +18,7 @@ pub async fn fetch_play_info(
     let keys = client.fetch_wbi_keys().await?;
 
     // 2. Mix keys
-    let mixed_key = mix_wbi_keys(&keys.img_key, &keys.sub_key);
+    let mixed_key = mix_wbi_keys(&keys.img_key, &keys.sub_key)?;
 
     // 3. Prepare parameters
     let mut params = HashMap::new();
@@ -46,6 +46,7 @@ pub async fn fetch_play_info(
         .client()
         .get(url)
         .query(&signed_params)
+        .header("Referer", "https://live.bilibili.com")
         .send()
         .await?
         .json()
@@ -64,7 +65,7 @@ pub fn parse_stream_candidates(resp: &PlayInfoResponse) -> AppResult<Vec<StreamC
         } else {
             "Unknown error"
         };
-        return Err(AppError::Wbi(format!(
+        return Err(AppError::Bilibili(format!(
             "getRoomPlayInfo API returned code {}: {}",
             resp.code, msg
         )));
@@ -73,20 +74,20 @@ pub fn parse_stream_candidates(resp: &PlayInfoResponse) -> AppResult<Vec<StreamC
     let data = resp
         .data
         .as_ref()
-        .ok_or_else(|| AppError::Wbi("getRoomPlayInfo API returned empty data".to_string()))?;
+        .ok_or_else(|| AppError::Bilibili("getRoomPlayInfo API returned empty data".to_string()))?;
 
     let playurl_info = data
         .playurl_info
         .as_ref()
-        .ok_or_else(|| AppError::Wbi("playurl_info is missing in response".to_string()))?;
+        .ok_or_else(|| AppError::Bilibili("playurl_info is missing in response".to_string()))?;
 
     let mut candidates = Vec::new();
 
     for stream_info in &playurl_info.playurl.stream {
         for format_info in &stream_info.format {
-            let protocol = Protocol::from_str(&format_info.format_name);
+            let protocol = Protocol::from_api_name(&format_info.format_name);
             for codec_info in &format_info.codec {
-                let codec = Codec::from_str(&codec_info.codec_name);
+                let codec = Codec::from_api_name(&codec_info.codec_name);
                 for url_info in &codec_info.url_info {
                     let url = format!("{}{}{}", url_info.host, codec_info.base_url, url_info.extra);
                     let cdn_name = extract_cdn_name(&url_info.extra);

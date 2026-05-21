@@ -1,7 +1,11 @@
+use std::time::Duration;
+
 use crate::bilibili::types::{NavResponse, WbiKeys};
 use crate::bilibili::wbi::extract_key;
 use crate::error::{AppError, AppResult};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
+
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct BiliClient {
     client: reqwest::Client,
@@ -25,6 +29,7 @@ impl BiliClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(DEFAULT_HTTP_TIMEOUT)
             .build()?;
 
         Ok(Self { client })
@@ -50,7 +55,7 @@ impl BiliClient {
 fn parse_wbi_keys(resp: &NavResponse) -> AppResult<WbiKeys> {
     let is_ok = resp.code == 0 || (resp.code == -101 && resp.message == "账号未登录");
     if !is_ok {
-        return Err(AppError::Wbi(format!(
+        return Err(AppError::Bilibili(format!(
             "nav API returned code {}: {}",
             resp.code, resp.message
         )));
@@ -59,20 +64,20 @@ fn parse_wbi_keys(resp: &NavResponse) -> AppResult<WbiKeys> {
     let data = resp
         .data
         .as_ref()
-        .ok_or_else(|| AppError::Wbi("nav API returned empty data".to_string()))?;
+        .ok_or_else(|| AppError::Bilibili("nav API returned empty data".to_string()))?;
     let wbi_img = data
         .wbi_img
         .as_ref()
-        .ok_or_else(|| AppError::Wbi("wbi_img is missing in nav response".to_string()))?;
+        .ok_or_else(|| AppError::Bilibili("wbi_img is missing in nav response".to_string()))?;
 
     let img_key = extract_key(&wbi_img.img_url).ok_or_else(|| {
-        AppError::Wbi(format!(
+        AppError::Bilibili(format!(
             "failed to extract img_key from {}",
             wbi_img.img_url
         ))
     })?;
     let sub_key = extract_key(&wbi_img.sub_url).ok_or_else(|| {
-        AppError::Wbi(format!(
+        AppError::Bilibili(format!(
             "failed to extract sub_key from {}",
             wbi_img.sub_url
         ))

@@ -34,6 +34,20 @@ pub struct RecordConfig {
     pub cdn: Vec<String>,
 }
 
+impl Default for RecordConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: PathBuf::from("./recordings"),
+            segment_time: None,
+            segment_size: None,
+            min_segment_size: default_min_segment_size(),
+            prefer_protocol: PreferredProtocol::default(),
+            qn: default_qn(),
+            cdn: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadConfig {
     pub cookie_file: PathBuf,
@@ -62,11 +76,13 @@ pub struct RoomConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum PreferredProtocol {
+    #[serde(rename = "flv")]
     #[default]
     Flv,
+    #[serde(rename = "hls_ts", alias = "hlsts", alias = "ts")]
     HlsTs,
+    #[serde(rename = "hls_fmp4", alias = "hlsfmp4", alias = "fmp4")]
     HlsFmp4,
 }
 
@@ -196,11 +212,34 @@ url = "https://live.bilibili.com/1"
     }
 
     #[test]
+    fn record_config_default_matches_schema_defaults() {
+        let config = RecordConfig::default();
+        assert_eq!(config.output_dir, std::path::PathBuf::from("./recordings"));
+        assert_eq!(config.segment_time, None);
+        assert_eq!(config.segment_size, None);
+        assert_eq!(config.min_segment_size, "20MiB");
+        assert!(matches!(config.prefer_protocol, PreferredProtocol::Flv));
+        assert_eq!(config.qn, 10000);
+        assert!(config.cdn.is_empty());
+    }
+
+    #[test]
     fn preferred_protocol_serde_roundtrip() {
         let json = serde_json::to_string(&PreferredProtocol::Flv).unwrap();
         assert_eq!(json, "\"flv\"");
-        let p: PreferredProtocol = serde_json::from_str("\"hlsts\"").unwrap();
+
+        let hls_ts = serde_json::to_string(&PreferredProtocol::HlsTs).unwrap();
+        assert_eq!(hls_ts, "\"hls_ts\"");
+        let p: PreferredProtocol = serde_json::from_str("\"hls_ts\"").unwrap();
         assert!(matches!(p, PreferredProtocol::HlsTs));
+
+        let legacy_p: PreferredProtocol = serde_json::from_str("\"hlsts\"").unwrap();
+        assert!(matches!(legacy_p, PreferredProtocol::HlsTs));
+
+        let hls_fmp4 = serde_json::to_string(&PreferredProtocol::HlsFmp4).unwrap();
+        assert_eq!(hls_fmp4, "\"hls_fmp4\"");
+        let f: PreferredProtocol = serde_json::from_str("\"fmp4\"").unwrap();
+        assert!(matches!(f, PreferredProtocol::HlsFmp4));
     }
 
     #[test]

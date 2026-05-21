@@ -33,7 +33,6 @@ pub fn extract_room_id(input: &str) -> Option<u64> {
     let parsed = reqwest::Url::parse(&url_str).ok()?;
     let host = parsed.host_str()?;
 
-    // Issue 1: Must only accept raw numeric IDs and live.bilibili.com URLs
     if host != "live.bilibili.com" {
         return None;
     }
@@ -48,7 +47,7 @@ pub fn extract_room_id(input: &str) -> Option<u64> {
 /// Fetches room details using `/xlive/web-room/v1/index/getInfoByRoom`.
 pub async fn fetch_room_info(client: &BiliClient, room_id: u64) -> AppResult<BiliRoomInfo> {
     let keys = client.fetch_wbi_keys().await?;
-    let mixed_key = mix_wbi_keys(&keys.img_key, &keys.sub_key);
+    let mixed_key = mix_wbi_keys(&keys.img_key, &keys.sub_key)?;
     let params = build_room_info_params(room_id, &mixed_key, current_unix_timestamp());
 
     let resp: RoomInfoResponse = client
@@ -85,7 +84,7 @@ fn build_room_info_params(
 /// Converts a RoomInfoResponse to BiliRoomInfo domain object and handles error cases.
 fn parse_room_info(resp: &RoomInfoResponse) -> AppResult<BiliRoomInfo> {
     if resp.code != 0 {
-        return Err(AppError::Wbi(format!(
+        return Err(AppError::Bilibili(format!(
             "getInfoByRoom API returned code {}: {}",
             resp.code, resp.message
         )));
@@ -94,7 +93,7 @@ fn parse_room_info(resp: &RoomInfoResponse) -> AppResult<BiliRoomInfo> {
     let data = resp
         .data
         .as_ref()
-        .ok_or_else(|| AppError::Wbi("getInfoByRoom API returned empty data".to_string()))?;
+        .ok_or_else(|| AppError::Bilibili("getInfoByRoom API returned empty data".to_string()))?;
 
     let detail = &data.room_info;
     let live_start_time = if detail.live_start_time <= 0 {
@@ -149,7 +148,6 @@ mod tests {
         assert_eq!(extract_room_id(""), None);
         assert_eq!(extract_room_id("   "), None);
 
-        // Issue 2: Regression tests returning None for specific formats
         assert_eq!(
             extract_room_id("https://www.bilibili.com/video/123456"),
             None
@@ -196,7 +194,6 @@ mod tests {
         }"#;
 
         let resp: RoomInfoResponse = serde_json::from_str(json_data).unwrap();
-        // Issue 4: Update tests to call that helper
         let info = parse_room_info(&resp).unwrap();
 
         assert_eq!(info.room_id, 456);
@@ -227,7 +224,6 @@ mod tests {
         }"#;
 
         let resp: RoomInfoResponse = serde_json::from_str(json_data).unwrap();
-        // Issue 4: Update tests to call that helper
         let info = parse_room_info(&resp).unwrap();
 
         assert_eq!(info.room_id, 456);
@@ -246,7 +242,6 @@ mod tests {
         }"#;
 
         let resp: RoomInfoResponse = serde_json::from_str(json_data).unwrap();
-        // Issue 4: Update tests to call that helper and check error handling
         let res = parse_room_info(&resp);
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
