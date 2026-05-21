@@ -96,3 +96,109 @@ pub struct BiliRoomInfo {
     pub cover_url: String,
     pub live_start_time: Option<i64>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayInfoResponse {
+    pub code: i32,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub msg: String,
+    pub data: Option<PlayInfoData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayInfoData {
+    pub playurl_info: Option<PlayurlInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayurlInfo {
+    pub playurl: PlayurlDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayurlDetail {
+    pub stream: Vec<StreamInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamInfo {
+    pub protocol_name: String,
+    pub format: Vec<FormatInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FormatInfo {
+    pub format_name: String,
+    pub codec: Vec<CodecInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodecInfo {
+    pub codec_name: String,
+    pub current_qn: u32,
+    #[serde(default)]
+    pub accept_qn: Vec<u32>,
+    pub base_url: String,
+    pub url_info: Vec<UrlInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UrlInfo {
+    pub host: String,
+    pub extra: String,
+    #[serde(default)]
+    pub stream_ttl: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    Flv,
+    HlsFmp4,
+    HlsTs,
+    Unknown,
+}
+
+impl Protocol {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "flv" => Protocol::Flv,
+            "fmp4" => Protocol::HlsFmp4,
+            "ts" => Protocol::HlsTs,
+            _ => Protocol::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Codec {
+    Avc,
+    Hevc,
+    Av1,
+    Unknown,
+}
+
+impl Codec {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "avc" => Codec::Avc,
+            "hevc" => Codec::Hevc,
+            "av1" => Codec::Av1,
+            _ => Codec::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamCandidate {
+    pub url: String,
+    pub protocol: Protocol,
+    pub format: String,
+    pub codec: Codec,
+    pub qn: u32,
+    pub cdn_name: String,
+    pub host: String,
+}
