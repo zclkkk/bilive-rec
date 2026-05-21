@@ -257,7 +257,7 @@ async fn upload_cmd(
         tid: upload_config.tid,
         copyright: upload_config.copyright,
         tags: upload_config.tags,
-        source: String::new(),
+        source: upload_config.source.clone(),
         parts: uploaded_parts,
     };
 

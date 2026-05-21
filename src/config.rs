@@ -61,6 +61,8 @@ pub struct UploadConfig {
     pub tid: u16,
     #[serde(default = "default_copyright")]
     pub copyright: u8,
+    #[serde(default = "default_source")]
+    pub source: String,
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -116,6 +118,10 @@ fn default_tid() -> u16 {
 
 fn default_copyright() -> u8 {
     2
+}
+
+fn default_source() -> String {
+    "直播录像".to_string()
 }
 
 impl AppConfig {
