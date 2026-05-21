@@ -19,12 +19,14 @@ use std::process;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use bilibili::client::BiliClient;
 use cli::{Cli, Command, StateAction};
 use config::AppConfig;
-use error::AppResult;
+use error::{AppError, AppResult};
 use state::store::StateStore;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
@@ -32,10 +34,7 @@ fn main() {
             println!("not implemented: login");
             Ok(())
         }
-        Command::Check { room_url } => {
-            println!("not implemented: check {room_url}");
-            Ok(())
-        }
+        Command::Check { room_url, config } => check_cmd(&room_url, config.as_deref()).await,
         Command::Record { room_url } => {
             println!("not implemented: record {room_url}");
             Ok(())
@@ -91,5 +90,72 @@ fn state_recover_cmd(config_path: &std::path::Path) -> AppResult<()> {
     for action in &actions {
         println!("{action}");
     }
+    Ok(())
+}
+
+async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> AppResult<()> {
+    let record_config = match config_path {
+        None => {
+            let default_path = std::path::Path::new("config.toml");
+            if default_path.exists() {
+                AppConfig::load(default_path)?.record
+            } else {
+                config::RecordConfig {
+                    output_dir: std::path::PathBuf::from("./recordings"),
+                    segment_time: None,
+                    segment_size: None,
+                    min_segment_size: "20MiB".to_string(),
+                    prefer_protocol: config::PreferredProtocol::Flv,
+                    qn: 10000,
+                    cdn: vec![],
+                }
+            }
+        }
+        Some(path) => AppConfig::load(path)?.record,
+    };
+
+    let room_id = bilibili::room::extract_room_id(room_url).ok_or_else(|| {
+        AppError::Config(format!("Failed to extract room ID from '{}'", room_url))
+    })?;
+
+    let client = BiliClient::new(None)?;
+    let room_info = bilibili::room::fetch_room_info(&client, room_id).await?;
+
+    if room_info.live_status.is_live() {
+        println!("live");
+        println!("title = {}", room_info.title);
+        println!("room_id = {}", room_info.room_id);
+
+        let play_info_resp =
+            bilibili::stream::fetch_play_info(&client, room_info.room_id, record_config.qn).await?;
+        let candidates = bilibili::stream::parse_stream_candidates(&play_info_resp)?;
+
+        println!("candidates = {}", candidates.len());
+        for candidate in &candidates {
+            let proto_str = format!("{:?}", candidate.protocol).to_lowercase();
+            let codec_str = format!("{:?}", candidate.codec).to_lowercase();
+            println!(
+                "  - protocol={}, format={}, codec={}, qn={}, cdn={}, url={}",
+                proto_str,
+                candidate.format,
+                codec_str,
+                candidate.qn,
+                candidate.cdn_name,
+                candidate.url
+            );
+        }
+
+        let selected = bilibili::stream::select_stream_candidate(&candidates, &record_config);
+        if let Some(ref sel) = selected {
+            println!("selected = {}", sel.url);
+        } else {
+            println!("selected = none");
+        }
+    } else {
+        println!("offline");
+        println!("room_id = {}", room_info.room_id);
+        println!("title = {}", room_info.title);
+    }
+
     Ok(())
 }

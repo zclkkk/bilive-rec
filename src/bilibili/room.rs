@@ -1,5 +1,8 @@
+use std::collections::HashMap;
+
 use crate::bilibili::client::BiliClient;
 use crate::bilibili::types::{BiliRoomInfo, LiveStatus, RoomInfoResponse};
+use crate::bilibili::wbi::{mix_wbi_keys, sign_wbi_query};
 use crate::error::{AppError, AppResult};
 
 /// Extracts the numerical room ID from a raw input string or Bilibili URL.
@@ -44,14 +47,39 @@ pub fn extract_room_id(input: &str) -> Option<u64> {
 
 /// Fetches room details using `/xlive/web-room/v1/index/getInfoByRoom`.
 pub async fn fetch_room_info(client: &BiliClient, room_id: u64) -> AppResult<BiliRoomInfo> {
-    let url = format!(
-        "https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom?room_id={}",
-        room_id
-    );
+    let keys = client.fetch_wbi_keys().await?;
+    let mixed_key = mix_wbi_keys(&keys.img_key, &keys.sub_key);
+    let params = build_room_info_params(room_id, &mixed_key, current_unix_timestamp());
 
-    let resp: RoomInfoResponse = client.client().get(&url).send().await?.json().await?;
+    let resp: RoomInfoResponse = client
+        .client()
+        .get("https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom")
+        .query(&params)
+        .header("Referer", "https://live.bilibili.com")
+        .send()
+        .await?
+        .json()
+        .await?;
 
     parse_room_info(&resp)
+}
+
+fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn build_room_info_params(
+    room_id: u64,
+    mixed_key: &str,
+    timestamp: i64,
+) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    params.insert("room_id".to_string(), room_id.to_string());
+    params.insert("web_location".to_string(), "444.8".to_string());
+    sign_wbi_query(&params, mixed_key, timestamp)
 }
 
 /// Converts a RoomInfoResponse to BiliRoomInfo domain object and handles error cases.
@@ -130,6 +158,22 @@ mod tests {
         assert_eq!(
             extract_room_id("https://live.bilibili.com.evil.test/123456"),
             None
+        );
+    }
+
+    #[test]
+    fn test_build_room_info_params_signs_wbi_query() {
+        let params = build_room_info_params(123, "ea1db124c0beaec8d8d73b06385d38a0", 114514);
+
+        assert_eq!(params.get("room_id").map(String::as_str), Some("123"));
+        assert_eq!(
+            params.get("web_location").map(String::as_str),
+            Some("444.8")
+        );
+        assert_eq!(params.get("wts").map(String::as_str), Some("114514"));
+        assert_eq!(
+            params.get("w_rid").map(String::as_str),
+            Some("5f385b31068c44413a179c5334108a07")
         );
     }
 

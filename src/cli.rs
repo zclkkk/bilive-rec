@@ -18,6 +18,10 @@ pub enum Command {
     Check {
         /// Room URL (e.g. https://live.bilibili.com/123456)
         room_url: String,
+
+        /// Path to config file
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
 
     /// Record a live stream
