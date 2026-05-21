@@ -150,7 +150,17 @@ impl FlvTag {
         let header = FlvTagHeader::read(reader)?;
         let mut data = vec![0u8; header.data_size as usize];
         reader.read_exact(&mut data)?;
-        let _previous_tag_size = read_previous_tag_size(reader)?;
+        let previous_tag_size = read_previous_tag_size(reader)?;
+        let expected_size = 11 + header.data_size;
+        if previous_tag_size != expected_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid PreviousTagSize: expected {}, got {}",
+                    expected_size, previous_tag_size
+                ),
+            ));
+        }
         Ok(Self { header, data })
     }
 
@@ -278,8 +288,32 @@ mod tests {
         // 11 bytes header + 5 bytes data + 4 bytes previous tag size = 20 bytes
         assert_eq!(buf.len(), 20);
 
-        let read_tag = FlvTag::read(&mut buf.as_slice()).unwrap();
+        let mut slice = buf.as_slice();
+        let read_tag = FlvTag::read(&mut slice).unwrap();
         assert_eq!(read_tag, tag);
+    }
+
+    #[test]
+    fn test_flv_tag_read_invalid_previous_tag_size() {
+        let tag = FlvTag {
+            header: FlvTagHeader {
+                tag_type: FlvTagType::Video,
+                data_size: 5,
+                timestamp: 12345,
+                stream_id: 0,
+            },
+            data: vec![0x17, 0x01, 0x00, 0x00, 0x00],
+        };
+
+        let mut buf = Vec::new();
+        tag.write(&mut buf).unwrap();
+
+        // Corrupt the PreviousTagSize (last 4 bytes)
+        let len = buf.len();
+        buf[len - 1] = 0xFF; // Was 16 (11 + 5), now wrong
+
+        let mut slice = buf.as_slice();
+        assert!(FlvTag::read(&mut slice).is_err());
     }
 
     #[test]
