@@ -66,3 +66,83 @@ pub enum SubmissionStatus {
     Submitted,
     Failed,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jiff::Timestamp;
+    use std::path::PathBuf;
+
+    #[test]
+    fn session_status_serde_roundtrip() {
+        for status in [
+            SessionStatus::Recording,
+            SessionStatus::Finalized,
+            SessionStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let decoded: SessionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn segment_status_serde_roundtrip() {
+        let variants = [
+            SegmentStatus::Recording,
+            SegmentStatus::Finalized,
+            SegmentStatus::Filtered,
+            SegmentStatus::Uploading,
+            SegmentStatus::Uploaded,
+            SegmentStatus::Failed,
+        ];
+        for status in variants {
+            let json = serde_json::to_string(&status).unwrap();
+            let decoded: SegmentStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn submission_status_serde_roundtrip() {
+        for status in [
+            SubmissionStatus::Pending,
+            SubmissionStatus::Submitted,
+            SubmissionStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let decoded: SubmissionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, status);
+        }
+    }
+
+    #[test]
+    fn live_session_serde_roundtrip() {
+        let session = LiveSession {
+            id: Uuid::new_v4(),
+            room_key: "12345".to_string(),
+            title: "Test".to_string(),
+            started_at: Timestamp::now(),
+            status: SessionStatus::Recording,
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        let decoded: LiveSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, session.id);
+        assert_eq!(decoded.status, SessionStatus::Recording);
+    }
+
+    #[test]
+    fn segment_serde_roundtrip() {
+        let seg = Segment {
+            session_id: Uuid::new_v4(),
+            index: 0,
+            path: PathBuf::from("/tmp/test.flv"),
+            status: SegmentStatus::Finalized,
+            error: Some("test error".to_string()),
+        };
+        let json = serde_json::to_string(&seg).unwrap();
+        let decoded: Segment = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.index, 0);
+        assert_eq!(decoded.error.as_deref(), Some("test error"));
+    }
+}

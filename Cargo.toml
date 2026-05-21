@@ -15,3 +15,6 @@ thiserror = "2"
 redb = "2"
 jiff = { version = "0.2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

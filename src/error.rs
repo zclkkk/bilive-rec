@@ -13,9 +13,30 @@ pub enum AppError {
     #[error("config error: {0}")]
     Config(String),
 
+    #[error("database error: {0}")]
+    Database(#[from] redb::DatabaseError),
+
+    #[error("table error: {0}")]
+    Table(#[from] redb::TableError),
+
+    #[error("transaction error: {0}")]
+    Transaction(Box<redb::TransactionError>),
+
+    #[error("storage error: {0}")]
+    Storage(#[from] redb::StorageError),
+
+    #[error("commit error: {0}")]
+    Commit(#[from] redb::CommitError),
+
     #[error("state store error: {0}")]
     State(String),
 
     #[error("not implemented: {0}")]
     NotImplemented(String),
+}
+
+impl From<redb::TransactionError> for AppError {
+    fn from(e: redb::TransactionError) -> Self {
+        AppError::Transaction(Box::new(e))
+    }
 }

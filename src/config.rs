@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 
@@ -61,7 +61,7 @@ pub struct RoomConfig {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PreferredProtocol {
     #[default]
@@ -70,7 +70,7 @@ pub enum PreferredProtocol {
     HlsFmp4,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubmitApi {
     #[default]
@@ -108,6 +108,106 @@ impl AppConfig {
             path: path.to_path_buf(),
             source: e,
         })?;
-        toml::from_str(&content).map_err(|e| AppError::Config(e.to_string()))
+        Self::parse(&content)
+    }
+
+    pub fn parse(content: &str) -> AppResult<Self> {
+        toml::from_str(content).map_err(|e| AppError::Config(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_TOML: &str = r#"
+[data]
+dir = "./data"
+
+[record]
+output_dir = "./recordings"
+segment_time = "01:00:00"
+segment_size = "2GiB"
+min_segment_size = "20MiB"
+prefer_protocol = "flv"
+qn = 10000
+cdn = []
+
+[upload]
+cookie_file = "./data/cookies.json"
+line = "auto"
+threads = 3
+submit_api = "app"
+tid = 171
+copyright = 2
+tags = ["直播录像"]
+
+[[rooms]]
+name = "example"
+url = "https://live.bilibili.com/123456"
+title = "{streamer} {title} {date}"
+description = "{streamer} 直播录像\n原直播间：{url}"
+"#;
+
+    #[test]
+    fn parse_sample_config() {
+        let config = AppConfig::parse(SAMPLE_TOML).unwrap();
+        assert_eq!(config.data.dir, std::path::PathBuf::from("./data"));
+        assert_eq!(
+            config.record.output_dir,
+            std::path::PathBuf::from("./recordings")
+        );
+        assert_eq!(config.record.segment_time.as_deref(), Some("01:00:00"));
+        assert_eq!(config.record.segment_size.as_deref(), Some("2GiB"));
+        assert_eq!(config.record.min_segment_size, "20MiB");
+        assert_eq!(config.record.qn, 10000);
+        assert!(config.record.cdn.is_empty());
+        assert_eq!(config.upload.threads, 3);
+        assert_eq!(config.upload.tid, 171);
+        assert_eq!(config.upload.copyright, 2);
+        assert_eq!(config.upload.tags, vec!["直播录像"]);
+        assert_eq!(config.rooms.len(), 1);
+        assert_eq!(config.rooms[0].name, "example");
+    }
+
+    #[test]
+    fn parse_config_with_defaults() {
+        let toml = r#"
+[data]
+dir = "./data"
+
+[record]
+output_dir = "./rec"
+
+[upload]
+cookie_file = "./cookies.json"
+
+[[rooms]]
+name = "test"
+url = "https://live.bilibili.com/1"
+"#;
+        let config = AppConfig::parse(toml).unwrap();
+        assert_eq!(config.record.min_segment_size, "20MiB");
+        assert_eq!(config.record.qn, 10000);
+        assert_eq!(config.upload.line, "auto");
+        assert_eq!(config.upload.threads, 3);
+        assert_eq!(config.upload.tid, 171);
+        assert_eq!(config.upload.copyright, 2);
+    }
+
+    #[test]
+    fn preferred_protocol_serde_roundtrip() {
+        let json = serde_json::to_string(&PreferredProtocol::Flv).unwrap();
+        assert_eq!(json, "\"flv\"");
+        let p: PreferredProtocol = serde_json::from_str("\"hlsts\"").unwrap();
+        assert!(matches!(p, PreferredProtocol::HlsTs));
+    }
+
+    #[test]
+    fn submit_api_serde_roundtrip() {
+        let json = serde_json::to_string(&SubmitApi::App).unwrap();
+        assert_eq!(json, "\"app\"");
+        let s: SubmitApi = serde_json::from_str("\"web\"").unwrap();
+        assert!(matches!(s, SubmitApi::Web));
     }
 }

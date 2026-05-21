@@ -41,6 +41,10 @@ pub enum Command {
 
     /// Inspect or recover persisted state
     State {
+        /// Path to config file
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+
         #[command(subcommand)]
         action: StateAction,
     },
