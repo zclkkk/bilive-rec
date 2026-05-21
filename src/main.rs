@@ -24,10 +24,11 @@ async fn main() {
             println!("not implemented: record {room_url}");
             Ok(())
         }
-        Command::Upload { files } => {
-            println!("not implemented: upload {:?}", files);
-            Ok(())
-        }
+        Command::Upload {
+            files,
+            title,
+            config,
+        } => upload_cmd(files, title, config.as_deref()).await,
         Command::Run { config } => run_cmd(&config),
         Command::State { config, action } => match action {
             StateAction::Inspect => state_inspect_cmd(&config),
@@ -64,6 +65,8 @@ fn state_inspect_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let summary = store.summary()?;
     println!("sessions: {}", summary.session_count);
     println!("segments: {}", summary.segment_count);
+    println!("uploaded_parts: {}", summary.uploaded_parts_count);
+    println!("submissions: {}", summary.submission_count);
     Ok(())
 }
 
@@ -129,6 +132,159 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
         println!("offline");
         println!("room_id = {}", room_info.room_id);
         println!("title = {}", room_info.title);
+    }
+
+    Ok(())
+}
+
+async fn upload_cmd(
+    files: Vec<std::path::PathBuf>,
+    title: Option<String>,
+    config_path: Option<&std::path::Path>,
+) -> AppResult<()> {
+    use bilive_rec::state::model::{Submission, SubmissionStatus};
+    use bilive_rec::state::store::StateStore;
+    use bilive_rec::uploader::biliup_adapter::BiliupUploader;
+    use bilive_rec::uploader::types::{SubmissionRequest, UploadRequest, Uploader};
+    use uuid::Uuid;
+
+    let upload_config = match config_path {
+        None => {
+            let default_path = std::path::Path::new("config.toml");
+            if default_path.exists() {
+                AppConfig::load(default_path)?.upload
+            } else {
+                return Err(bilive_rec::error::AppError::Config(
+                    "No config file provided for upload command".into(),
+                ));
+            }
+        }
+        Some(path) => AppConfig::load(path)?.upload,
+    };
+
+    use bilive_rec::config::SubmitApi;
+    if !matches!(upload_config.submit_api, SubmitApi::App) {
+        return Err(bilive_rec::error::AppError::Config(
+            "Only 'app' submit API is supported for now.".into(),
+        ));
+    }
+
+    if upload_config.line != "auto" && upload_config.line != "bda2" {
+        return Err(bilive_rec::error::AppError::Config(format!(
+            "Unsupported upload line '{}'. Only 'auto' and 'bda2' are supported for now.",
+            upload_config.line
+        )));
+    }
+
+    if files.is_empty() {
+        return Err(bilive_rec::error::AppError::Config(
+            "No files provided for upload.".into(),
+        ));
+    }
+
+    for file in &files {
+        if !file.exists() {
+            return Err(bilive_rec::error::AppError::Config(format!(
+                "Upload file does not exist: {}",
+                file.display()
+            )));
+        }
+        if !file.is_file() {
+            return Err(bilive_rec::error::AppError::Config(format!(
+                "Upload path is not a regular file: {}",
+                file.display()
+            )));
+        }
+    }
+
+    println!("Checking login...");
+    let uploader = BiliupUploader::new(
+        upload_config.cookie_file.clone(),
+        upload_config.line.clone(),
+        upload_config.threads,
+    );
+    uploader.check_login().await?;
+
+    // Open store
+    let config = AppConfig::load(config_path.unwrap_or(std::path::Path::new("config.toml")))?;
+    let db_path = config.data.dir.join("state.redb");
+    let store = StateStore::open(&db_path)?;
+
+    let session_id = Uuid::new_v4();
+    let mut uploaded_parts = Vec::new();
+
+    let display_title = title.unwrap_or_else(|| {
+        files
+            .first()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled")
+            .to_string()
+    });
+
+    for (index, file) in files.into_iter().enumerate() {
+        println!("Uploading: {}", file.display());
+        let part_title = if index == 0 {
+            display_title.clone()
+        } else {
+            format!("{} P{}", display_title, index + 1)
+        };
+
+        let req = UploadRequest {
+            session_id,
+            segment_index: index as u32,
+            path: file,
+            part_title,
+        };
+
+        let part = uploader.upload_segment(req).await?;
+        println!("Uploaded part: {}", part.bili_filename);
+        store.put_uploaded_part(&part)?;
+        uploaded_parts.push(part);
+    }
+
+    println!("Submitting...");
+    let submit_req = SubmissionRequest {
+        title: display_title,
+        description: String::new(),
+        tid: upload_config.tid,
+        copyright: upload_config.copyright,
+        tags: upload_config.tags,
+        source: String::new(),
+        parts: uploaded_parts,
+    };
+
+    let mut submission = Submission {
+        session_id,
+        status: SubmissionStatus::Pending,
+        aid: None,
+        bvid: None,
+        error: None,
+    };
+    store.put_submission(&submission)?;
+
+    let res = uploader.submit(submit_req).await;
+    match res {
+        Ok(sres) => {
+            submission.status = SubmissionStatus::Submitted;
+            submission.aid = sres.aid;
+            submission.bvid = sres.bvid.clone();
+            store.put_submission(&submission)?;
+
+            println!("Submission complete!");
+            if let Some(ref bvid) = sres.bvid {
+                println!("BVID: {}", bvid);
+            }
+            if let Some(aid) = sres.aid {
+                println!("AID: {}", aid);
+            }
+        }
+        Err(e) => {
+            submission.status = SubmissionStatus::Failed;
+            submission.error = Some(e.to_string());
+            store.put_submission(&submission)?;
+            return Err(e);
+        }
     }
 
     Ok(())

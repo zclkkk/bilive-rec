@@ -4,11 +4,13 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::state::model::{LiveSession, Segment};
+use crate::state::model::{LiveSession, Segment, Submission, UploadedPart};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
 const SEGMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("segments");
+const UPLOADED_PARTS: TableDefinition<&str, &[u8]> = TableDefinition::new("uploaded_parts");
+const SUBMISSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("submissions");
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -16,6 +18,8 @@ const SCHEMA_VERSION: u32 = 1;
 pub struct StateSummary {
     pub session_count: usize,
     pub segment_count: usize,
+    pub uploaded_parts_count: usize,
+    pub submission_count: usize,
 }
 
 pub struct StateStore {
@@ -46,6 +50,8 @@ impl StateStore {
             }
             write_txn.open_table(SESSIONS)?;
             write_txn.open_table(SEGMENTS)?;
+            write_txn.open_table(UPLOADED_PARTS)?;
+            write_txn.open_table(SUBMISSIONS)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -135,10 +141,79 @@ impl StateStore {
             let table = read_txn.open_table(SEGMENTS)?;
             table.len()? as usize
         };
+        let uploaded_parts_count = {
+            let table = read_txn.open_table(UPLOADED_PARTS)?;
+            table.len()? as usize
+        };
+        let submission_count = {
+            let table = read_txn.open_table(SUBMISSIONS)?;
+            table.len()? as usize
+        };
         Ok(StateSummary {
             session_count,
             segment_count,
+            uploaded_parts_count,
+            submission_count,
         })
+    }
+
+    pub fn put_uploaded_part(&self, part: &UploadedPart) -> AppResult<()> {
+        let key = format!("{}:{:010}", part.session_id, part.segment_index);
+        let value = serde_json::to_vec(part)
+            .map_err(|e| AppError::State(format!("serialize uploaded part: {e}")))?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(UPLOADED_PARTS)?;
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn put_submission(&self, submission: &Submission) -> AppResult<()> {
+        let key = submission.session_id.to_string();
+        let value = serde_json::to_vec(submission)
+            .map_err(|e| AppError::State(format!("serialize submission: {e}")))?;
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(SUBMISSIONS)?;
+            table.insert(key.as_str(), value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn list_uploaded_parts(&self, session_id: Uuid) -> AppResult<Vec<UploadedPart>> {
+        let prefix = format!("{session_id}:");
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(UPLOADED_PARTS)?;
+        let mut parts = Vec::new();
+        let iter = table.range(prefix.as_str()..)?;
+        for entry in iter {
+            let (key_guard, value_guard) = entry?;
+            let key = key_guard.value();
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let part: UploadedPart = serde_json::from_slice(value_guard.value())
+                .map_err(|e| AppError::State(format!("deserialize uploaded part: {e}")))?;
+            parts.push(part);
+        }
+        Ok(parts)
+    }
+
+    pub fn get_submission(&self, session_id: Uuid) -> AppResult<Option<Submission>> {
+        let key = session_id.to_string();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SUBMISSIONS)?;
+        match table.get(key.as_str())? {
+            Some(v) => {
+                let submission: Submission = serde_json::from_slice(v.value())
+                    .map_err(|e| AppError::State(format!("deserialize submission: {e}")))?;
+                Ok(Some(submission))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -302,5 +377,37 @@ mod tests {
         let loaded = store.get_session(session.id).unwrap().unwrap();
         assert_eq!(loaded.room_key, "reopen");
         assert_eq!(loaded.status, SessionStatus::Finalized);
+    }
+
+    #[test]
+    fn put_and_list_uploaded_parts() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let part = UploadedPart {
+            session_id,
+            segment_index: 0,
+            bili_filename: "test.flv".to_string(),
+            part_title: "Test Part".to_string(),
+        };
+        store.put_uploaded_part(&part).unwrap();
+        let parts = store.list_uploaded_parts(session_id).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].bili_filename, "test.flv");
+    }
+
+    #[test]
+    fn put_and_get_submission() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let sub = crate::state::model::Submission {
+            session_id,
+            status: crate::state::model::SubmissionStatus::Submitted,
+            aid: Some(123),
+            bvid: Some("BV123".to_string()),
+            error: None,
+        };
+        store.put_submission(&sub).unwrap();
+        let loaded = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(loaded.aid, Some(123));
     }
 }

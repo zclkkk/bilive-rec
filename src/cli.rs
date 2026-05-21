@@ -33,7 +33,16 @@ pub enum Command {
     /// Upload recorded files
     Upload {
         /// Files to upload
+        #[arg(num_args = 1..)]
         files: Vec<PathBuf>,
+
+        /// Title of the video
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Path to config file
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
 
     /// Run the full pipeline
