@@ -6,19 +6,32 @@ use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
     pub data: DataConfig,
+    #[serde(default)]
     pub record: RecordConfig,
     pub upload: UploadConfig,
+    #[serde(default)]
     pub rooms: Vec<RoomConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DataConfig {
+    #[serde(default = "default_data_dir")]
     pub dir: PathBuf,
+}
+
+impl Default for DataConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_data_dir(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecordConfig {
+    #[serde(default = "default_output_dir")]
     pub output_dir: PathBuf,
     #[serde(default)]
     pub segment_time: Option<String>,
@@ -94,6 +107,14 @@ pub enum SubmitApi {
     #[default]
     App,
     Web,
+}
+
+fn default_data_dir() -> PathBuf {
+    PathBuf::from("./data")
+}
+
+fn default_output_dir() -> PathBuf {
+    PathBuf::from("./recordings")
 }
 
 fn default_min_segment_size() -> String {
@@ -215,6 +236,25 @@ url = "https://live.bilibili.com/1"
         assert_eq!(config.upload.threads, 3);
         assert_eq!(config.upload.tid, 171);
         assert_eq!(config.upload.copyright, 2);
+    }
+
+    #[test]
+    fn parse_upload_only_config() {
+        let toml = r#"
+[upload]
+cookie_file = "./data/cookies.json"
+"#;
+        let config = AppConfig::parse(toml).unwrap();
+
+        // Check defaults for omitted sections
+        assert_eq!(config.data.dir, std::path::PathBuf::from("./data"));
+        assert_eq!(
+            config.record.output_dir,
+            std::path::PathBuf::from("./recordings")
+        );
+        assert!(config.rooms.is_empty());
+
+        assert_eq!(config.upload.source, "直播录像");
     }
 
     #[test]
