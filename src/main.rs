@@ -176,6 +176,12 @@ async fn upload_cmd(
         )));
     }
 
+    if upload_config.threads == 0 {
+        return Err(bilive_rec::error::AppError::Config(
+            "upload.threads must be greater than 0".into(),
+        ));
+    }
+
     if files.is_empty() {
         return Err(bilive_rec::error::AppError::Config(
             "No files provided for upload.".into(),
@@ -211,6 +217,7 @@ async fn upload_cmd(
     let store = StateStore::open(&db_path)?;
 
     let session_id = Uuid::new_v4();
+    println!("Session ID: {}", session_id);
     let mut uploaded_parts = Vec::new();
 
     let display_title = title.unwrap_or_else(|| {
