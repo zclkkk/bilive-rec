@@ -1,2 +1,4 @@
 .temp/*
 target/
+data/
+config.toml
