@@ -15,6 +15,18 @@ The project has two governing ideas:
 - Radical modernization: use typed Rust APIs, explicit state transitions,
   durable local state, and clean module boundaries instead of script glue.
 
+Additional engineering philosophy:
+
+- Sufficiency does not mean accepting weak designs. It means implementing
+  exactly the necessary design, no less and no more.
+- The project does not compromise on correctness, state durability, explicit
+  boundaries, or long-term maintainability.
+- Large refactors are acceptable when they are necessary to preserve the design.
+- Avoid small patches that preserve a wrong abstraction.
+- A simple design is preferred only when it is also the correct design.
+- Do not imitate Biliup's architecture. Use Biliup only as protocol reference
+  material when explicitly allowed by this plan.
+
 ## Non-Goals
 
 Version 1 must not grow these features:
@@ -91,7 +103,7 @@ src/
 
 The local coding agent must follow these rules:
 
-- Implement only the assigned phase.
+- Implement only the assigned phase or assigned fix.
 - Keep every phase compiling.
 - Run formatting, linting, and tests before reporting completion.
 - Do not import or copy large parts of Biliup.
@@ -107,6 +119,119 @@ The local coding agent must follow these rules:
 - Do not add future-phase code "just in case".
 - Do not add a dependency unless the current phase needs it.
 - Do not create global mutable state.
+- Do not touch unrelated modules while fixing a bounded issue.
+- Do not commit phase work until the user explicitly says `ACCEPT`.
+
+## Agent Workflow
+
+This project is implemented by a local coding agent in small reviewed phases.
+
+Workflow:
+
+1. The user starts a phase with a minimal prompt naming the phase.
+2. The agent must read `IMPLEMENTATION_PLAN.md` and follow the assigned phase
+   scope.
+3. The agent implements only the assigned phase or requested fix.
+4. The agent reports using the standard Phase Report format.
+5. The user and reviewer inspect the code.
+6. If changes are needed, the user sends a minimal fix prompt.
+7. Only after explicit `ACCEPT` may the agent commit and proceed.
+
+A phase is not complete until it is explicitly accepted.
+
+### Standard Phase Prompt
+
+```text
+Implement Phase X: <phase name> from `IMPLEMENTATION_PLAN.md`.
+
+Follow the scope, allowed files, out-of-scope rules, and acceptance criteria in `IMPLEMENTATION_PLAN.md`.
+Do not implement future phases.
+
+When done, provide the Phase Report:
+
+Implemented:
+Auto-verified:
+Needs user validation:
+Known limitations:
+Next step:
+```
+
+### Standard Fix Prompt
+
+```text
+Fix <specific issue> in <phase or slice>.
+
+Follow the original phase scope in `IMPLEMENTATION_PLAN.md`.
+Do not implement future phases.
+Do not touch unrelated modules.
+
+When done, provide the Phase Report:
+
+Implemented:
+Auto-verified:
+Needs user validation:
+Known limitations:
+Next step:
+```
+
+### Review Verdicts
+
+The reviewer may return one of:
+
+- `ACCEPT`: the phase or fix is accepted and may be committed.
+- `NEEDS FIX`: the implementation is close but requires a bounded follow-up.
+- `DESIGN BLOCKER`: the implementation violates project philosophy, phase
+  boundaries, or long-term design integrity and may require redesign.
+
+Do not proceed to the next phase until the current phase has been explicitly
+accepted.
+
+### Phase Report Format
+
+Every phase or fix report must use this format:
+
+```text
+Implemented:
+
+Auto-verified:
+
+Needs user validation:
+
+Known limitations:
+
+Next step:
+```
+
+Rules for the report:
+
+- `Implemented` should state what changed at a high level.
+- `Auto-verified` must list commands actually run, such as:
+  - `cargo fmt`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `cargo test`
+- `Needs user validation` should be honest. Do not write "none" if live API,
+  real upload, or real recording behavior still needs manual validation.
+- `Known limitations` must include intentional scope limits.
+- `Next step` must name the next planned phase or the recommended fix.
+
+## Small-Model Execution Contract
+
+The local agent is expected to be literal and conservative.
+
+For each task:
+
+- First list the exact files it plans to change.
+- Then implement only those files.
+- If it discovers a missing design decision, stop and ask instead of inventing
+  a large subsystem.
+- Keep public types minimal and serializable when they cross module boundaries.
+- Prefer compile-time stubs over speculative behavior.
+- Add tests for pure logic and state persistence.
+- Treat allowed-file lists as hard boundaries unless compilation requires a
+  tiny import-only adjustment.
+- Do not broaden a phase because the next phase seems obvious.
+- Do not turn implementation phases into architecture rewrites unless the
+  current design is wrong and the user has accepted the need for a redesign.
 
 ## Reference Project Protocol
 
@@ -151,7 +276,7 @@ Ignore:
 
 ### Reference Files for Phase 3
 
-Read these files only when starting the recorder:
+Read these files only when starting recorder implementation:
 
 ```text
 .temp/biliup/crates/biliup/src/downloader/httpflv.rs
@@ -174,6 +299,8 @@ Ignore:
 - Server event plumbing.
 - Python callback integration.
 - Non-Bilibili site support.
+- Bilibili network source resolution.
+- Upload integration.
 
 ### Reference Files for Phase 4
 
@@ -201,20 +328,6 @@ Ignore:
 - Progress bar implementation.
 - Checkpoint format from Biliup.
 - Server upload actor design.
-
-## Small-Model Execution Contract
-
-The local agent is expected to be literal and conservative.
-
-For each task:
-
-- First list the exact files it plans to change.
-- Then implement only those files.
-- If it discovers a missing design decision, stop and ask instead of inventing
-  a large subsystem.
-- Keep public types minimal and serializable when they cross module boundaries.
-- Prefer compile-time stubs over speculative behavior.
-- Add tests for pure logic and state persistence.
 
 ## Core Domain Model
 
@@ -723,6 +836,7 @@ Tasks:
 - Implement live status fetch.
 - Support `live.bilibili.com/{id}` first.
 - Add `b23.tv` redirect support only if it stays small.
+- Capture `special_type` from the room-info response.
 
 Out of scope:
 
@@ -746,6 +860,7 @@ Tasks:
 - Prefer FLV, AVC, configured qn, and configured CDN order.
 - Implement basic health check using HTTP status/header only.
 - Return a selected `StreamCandidate`.
+- Preserve observability for failed health checks with `tracing`.
 
 Out of scope:
 
@@ -815,10 +930,26 @@ Tasks:
 - Implement `.part` path and final path lifecycle helpers.
 - Add tests for file naming and size/time threshold logic.
 
+Expected design shape:
+
+- `SegmentPolicy` should hold the output directory and segment thresholds.
+- Path helpers should derive paths from `SegmentPolicy.output_dir`, not from a
+  second base directory argument.
+- `SegmentEvent` should carry enough identity for future persistence:
+  - `session_id`
+  - `index`
+  - relevant path
+  - size when finalized or filtered
+- Threshold helpers should remain pure logic:
+  - rotate by size
+  - rotate by elapsed time
+  - filter by final size
+
 Out of scope:
 
 - No FLV parsing.
 - No network stream reading.
+- No file writing beyond pure path/lifecycle helpers unless absolutely required.
 
 ### Phase 3B: Minimal FLV Reader/Writer
 
@@ -833,13 +964,29 @@ src/error.rs
 Tasks:
 
 - Implement FLV reader/parser enough for recording.
-- Implement segment writer.
+- Implement segment writer primitives.
 - Add tests with small synthetic FLV-like bytes where practical.
+- Keep the implementation local to FLV byte structure and writer behavior.
+
+Required FLV concepts:
+
+- FLV header validation.
+- FLV tag header parsing.
+- PreviousTagSize handling.
+- Tag type identification.
+- Minimal keyframe detection for AVC video tags.
+- Preservation of metadata and codec sequence headers needed for later segment
+  writing.
 
 Out of scope:
 
 - No Bilibili network integration.
+- No HTTP stream reader.
+- No `BiliClient` usage.
 - No upload integration.
+- No pipeline supervisor.
+- No live recording loop.
+- No HLS segment downloading.
 
 ### Phase 3C: Recording Loop
 
