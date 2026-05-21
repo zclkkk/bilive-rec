@@ -44,6 +44,69 @@ pub fn extract_room_id(input: &str) -> Option<u64> {
     last_segment.parse::<u64>().ok()
 }
 
+/// Checks if the input URL belongs to b23.tv shortlinks.
+pub fn is_b23_url(input: &str) -> bool {
+    let url_str = if input.starts_with("http://") || input.starts_with("https://") {
+        input.to_string()
+    } else {
+        format!("https://{}", input)
+    };
+    if let Ok(url) = reqwest::Url::parse(&url_str) {
+        return url
+            .host_str()
+            .is_some_and(|host| host == "b23.tv" || host.ends_with(".b23.tv"));
+    }
+    false
+}
+
+/// Resolves a room ID from an input string, following b23.tv redirects if necessary.
+pub async fn resolve_room_id(_client: &BiliClient, input: &str) -> AppResult<u64> {
+    if let Some(id) = extract_room_id(input) {
+        return Ok(id);
+    }
+
+    if is_b23_url(input) {
+        let url_str = if input.starts_with("http://") || input.starts_with("https://") {
+            input.to_string()
+        } else {
+            format!("https://{}", input)
+        };
+
+        // We use a local transient client to avoid altering the global BiliClient's behavior.
+        // It is configured to follow up to 5 redirects automatically.
+        let transient_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|e| {
+                AppError::Bilibili(format!(
+                    "Failed to build transient client for b23.tv: {}",
+                    e
+                ))
+            })?;
+
+        let resp =
+            transient_client.get(&url_str).send().await.map_err(|e| {
+                AppError::Bilibili(format!("Failed to resolve b23.tv redirect: {}", e))
+            })?;
+
+        let final_url = resp.url().as_str();
+        if let Some(id) = extract_room_id(final_url) {
+            return Ok(id);
+        } else {
+            return Err(AppError::Bilibili(format!(
+                "b23.tv link resolved to non-live URL: {}",
+                final_url
+            )));
+        }
+    }
+
+    Err(AppError::Config(format!(
+        "Failed to extract room ID from '{}'. Not a valid live.bilibili.com or b23.tv URL.",
+        input
+    )))
+}
+
 /// Fetches room details using `/xlive/web-room/v1/index/getInfoByRoom`.
 pub async fn fetch_room_info(client: &BiliClient, room_id: u64) -> AppResult<BiliRoomInfo> {
     let keys = client.fetch_wbi_keys().await?;
@@ -158,6 +221,17 @@ mod tests {
             extract_room_id("https://live.bilibili.com.evil.test/123456"),
             None
         );
+    }
+
+    #[test]
+    fn test_is_b23_url() {
+        assert!(is_b23_url("b23.tv/abc"));
+        assert!(is_b23_url("https://b23.tv/123456"));
+        assert!(is_b23_url("http://b23.tv/xyz"));
+        assert!(is_b23_url("https://www.b23.tv/abc"));
+        assert!(!is_b23_url("https://live.bilibili.com/123456"));
+        assert!(!is_b23_url("google.com/b23.tv"));
+        assert!(!is_b23_url("123456"));
     }
 
     #[test]

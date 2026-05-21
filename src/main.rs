@@ -4,7 +4,7 @@ use bilive_rec::bilibili;
 use bilive_rec::bilibili::client::BiliClient;
 use bilive_rec::cli::{Cli, Command, StateAction};
 use bilive_rec::config::{AppConfig, RecordConfig};
-use bilive_rec::error::{AppError, AppResult};
+use bilive_rec::error::AppResult;
 use bilive_rec::state;
 use bilive_rec::state::store::StateStore;
 use clap::Parser;
@@ -91,11 +91,8 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
         Some(path) => AppConfig::load(path)?.record,
     };
 
-    let room_id = bilibili::room::extract_room_id(room_url).ok_or_else(|| {
-        AppError::Config(format!("Failed to extract room ID from '{}'", room_url))
-    })?;
-
     let client = BiliClient::new(None)?;
+    let room_id = bilibili::room::resolve_room_id(&client, room_url).await?;
     let room_info = bilibili::room::fetch_room_info(&client, room_id).await?;
 
     if room_info.live_status.is_live() {
