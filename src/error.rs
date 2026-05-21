@@ -31,6 +31,12 @@ pub enum AppError {
     #[error("state store error: {0}")]
     State(String),
 
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("wbi error: {0}")]
+    Wbi(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 }
