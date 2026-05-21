@@ -31,6 +31,22 @@ impl FlvHeader {
                 "Invalid FLV signature",
             ));
         }
+        let version = buf[3];
+        if version != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported FLV version: {}", version),
+            ));
+        }
+
+        let offset = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
+        if offset != 9 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported FLV offset: {}", offset),
+            ));
+        }
+
         let flags = buf[4];
         Ok(Self {
             has_video: (flags & 1) != 0,
@@ -84,6 +100,19 @@ impl FlvTagHeader {
     }
 
     pub fn write<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        if self.data_size > 0x00FF_FFFF {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FLV tag data size exceeds 24 bits",
+            ));
+        }
+        if self.stream_id > 0x00FF_FFFF {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FLV tag stream ID exceeds 24 bits",
+            ));
+        }
+
         let mut buf = [0u8; 11];
         buf[0] = self.tag_type as u8;
         let size_bytes = self.data_size.to_be_bytes();
@@ -108,6 +137,36 @@ pub fn read_previous_tag_size<R: Read>(reader: &mut R) -> std::io::Result<u32> {
 
 pub fn write_previous_tag_size<W: Write>(writer: &mut W, size: u32) -> std::io::Result<()> {
     writer.write_all(&size.to_be_bytes())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlvTag {
+    pub header: FlvTagHeader,
+    pub data: Vec<u8>,
+}
+
+impl FlvTag {
+    pub fn read<R: Read>(reader: &mut R) -> std::io::Result<Self> {
+        let header = FlvTagHeader::read(reader)?;
+        let mut data = vec![0u8; header.data_size as usize];
+        reader.read_exact(&mut data)?;
+        let _previous_tag_size = read_previous_tag_size(reader)?;
+        Ok(Self { header, data })
+    }
+
+    pub fn write<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        if self.data.len() as u32 != self.header.data_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FLV tag data size mismatch",
+            ));
+        }
+        self.header.write(writer)?;
+        writer.write_all(&self.data)?;
+        let previous_tag_size = 11 + self.header.data_size;
+        write_previous_tag_size(writer, previous_tag_size)?;
+        Ok(())
+    }
 }
 
 pub fn is_avc_video_tag(data: &[u8]) -> bool {
@@ -163,6 +222,64 @@ mod tests {
 
         let read_header = FlvHeader::read(&mut buf.as_slice()).unwrap();
         assert_eq!(read_header, header);
+    }
+
+    #[test]
+    fn test_flv_header_read_validation() {
+        // Invalid signature
+        let mut slice = &b"FLX\x01\x05\x00\x00\x00\x09"[..];
+        assert!(FlvHeader::read(&mut slice).is_err());
+
+        // Invalid version
+        let mut slice = &b"FLV\x02\x05\x00\x00\x00\x09"[..];
+        assert!(FlvHeader::read(&mut slice).is_err());
+
+        // Invalid offset
+        let mut slice = &b"FLV\x01\x05\x00\x00\x00\x0A"[..];
+        assert!(FlvHeader::read(&mut slice).is_err());
+    }
+
+    #[test]
+    fn test_flv_tag_header_write_validation() {
+        let mut buf = Vec::new();
+
+        let tag_header_size = FlvTagHeader {
+            tag_type: FlvTagType::Video,
+            data_size: 0x01_00_00_00, // 24 bits max
+            timestamp: 0,
+            stream_id: 0,
+        };
+        assert!(tag_header_size.write(&mut buf).is_err());
+
+        let tag_header_stream = FlvTagHeader {
+            tag_type: FlvTagType::Video,
+            data_size: 100,
+            timestamp: 0,
+            stream_id: 0x01_00_00_00, // 24 bits max
+        };
+        assert!(tag_header_stream.write(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_flv_tag_roundtrip() {
+        let tag = FlvTag {
+            header: FlvTagHeader {
+                tag_type: FlvTagType::Video,
+                data_size: 5,
+                timestamp: 12345,
+                stream_id: 0,
+            },
+            data: vec![0x17, 0x01, 0x00, 0x00, 0x00],
+        };
+
+        let mut buf = Vec::new();
+        tag.write(&mut buf).unwrap();
+
+        // 11 bytes header + 5 bytes data + 4 bytes previous tag size = 20 bytes
+        assert_eq!(buf.len(), 20);
+
+        let read_tag = FlvTag::read(&mut buf.as_slice()).unwrap();
+        assert_eq!(read_tag, tag);
     }
 
     #[test]
