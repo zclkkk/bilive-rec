@@ -168,7 +168,12 @@ impl<'a> FlvRecorder<'a> {
     }
 
     async fn finalize_current_segment(&mut self) -> AppResult<()> {
-        if let Some(mut seg) = self.current_segment.take() {
+        let mut seg = match self.current_segment.take() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let res: AppResult<()> = async {
             seg.file.flush().await.map_err(|e| AppError::Io {
                 path: seg.part_path.clone(),
                 source: e,
@@ -178,12 +183,12 @@ impl<'a> FlvRecorder<'a> {
             let final_p = final_path(&self.policy, &self.session_id, seg.index);
 
             if should_filter_by_size(seg.size, &self.policy) {
-                if let Err(e) = tokio::fs::remove_file(&seg.part_path).await {
-                    return Err(AppError::Io {
+                tokio::fs::remove_file(&seg.part_path)
+                    .await
+                    .map_err(|e| AppError::Io {
                         path: seg.part_path.clone(),
                         source: e,
-                    });
-                }
+                    })?;
 
                 let db_seg = Segment {
                     session_id: self.session_id,
@@ -222,7 +227,22 @@ impl<'a> FlvRecorder<'a> {
                     size: seg.size,
                 });
             }
+            Ok(())
         }
+        .await;
+
+        if let Err(e) = res {
+            let db_seg = Segment {
+                session_id: self.session_id,
+                index: seg.index,
+                path: seg.part_path.clone(),
+                status: SegmentStatus::Failed,
+                error: Some(e.to_string()),
+            };
+            let _ = self.store.put_segment(&db_seg);
+            return Err(e);
+        }
+
         Ok(())
     }
 
