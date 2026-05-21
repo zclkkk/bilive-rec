@@ -120,7 +120,9 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
             );
         }
 
-        let selected = bilibili::stream::select_stream_candidate(&candidates, &record_config);
+        let selected =
+            bilibili::stream::select_healthy_stream_candidate(&candidates, &record_config, &client)
+                .await?;
         if let Some(ref sel) = selected {
             println!("selected = {}", sel.url);
         } else {

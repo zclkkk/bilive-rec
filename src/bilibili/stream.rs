@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::bilibili::cdn::check_stream_health;
 use crate::bilibili::client::BiliClient;
 use crate::bilibili::types::{Codec, PlayInfoResponse, Protocol, StreamCandidate};
 use crate::bilibili::wbi::{mix_wbi_keys, sign_wbi_query};
@@ -134,6 +135,46 @@ pub fn select_stream_candidate(
     let mut sorted = candidates.to_vec();
     sorted.sort_by(|a, b| compare_candidates(a, b, config));
     sorted.first().cloned()
+}
+
+/// Selects the best stream candidate from a list based on configured and fallback policies,
+/// and verifies its health. Returns the first healthy candidate.
+pub async fn select_healthy_stream_candidate(
+    candidates: &[StreamCandidate],
+    config: &RecordConfig,
+    client: &BiliClient,
+) -> AppResult<Option<StreamCandidate>> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut sorted = candidates.to_vec();
+    sorted.sort_by(|a, b| compare_candidates(a, b, config));
+
+    for candidate in sorted {
+        match check_stream_health(client.client(), &candidate.url).await {
+            Ok(true) => return Ok(Some(candidate)),
+            Ok(false) => {
+                tracing::debug!(
+                    protocol = candidate.protocol.as_str(),
+                    qn = candidate.qn,
+                    cdn = candidate.cdn_name.as_str(),
+                    url = candidate.url.as_str(),
+                    "Candidate failed health check (unhealthy status)"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    protocol = candidate.protocol.as_str(),
+                    qn = candidate.qn,
+                    cdn = candidate.cdn_name.as_str(),
+                    url = candidate.url.as_str(),
+                    error = %e,
+                    "Candidate failed health check (request error)"
+                );
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Compares two candidates. Returns `Ordering::Less` if `a` is better than `b` (sorting priority).
