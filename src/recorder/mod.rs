@@ -14,6 +14,7 @@ use crate::state::model::{Segment, SegmentStatus};
 use crate::state::store::StateStore;
 
 use reqwest::Response;
+use std::path::PathBuf;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -173,77 +174,119 @@ impl<'a> FlvRecorder<'a> {
             None => return Ok(()),
         };
 
-        let res: AppResult<()> = async {
-            seg.file.flush().await.map_err(|e| AppError::Io {
-                path: seg.part_path.clone(),
-                source: e,
-            })?;
-            drop(seg.file);
-
-            let final_p = final_path(&self.policy, &self.session_id, seg.index);
-
-            if should_filter_by_size(seg.size, &self.policy) {
-                tokio::fs::remove_file(&seg.part_path)
-                    .await
-                    .map_err(|e| AppError::Io {
-                        path: seg.part_path.clone(),
-                        source: e,
-                    })?;
-
-                let db_seg = Segment {
-                    session_id: self.session_id,
-                    index: seg.index,
-                    path: final_p.clone(),
-                    status: SegmentStatus::Filtered,
-                    error: None,
-                };
-                self.store.put_segment(&db_seg)?;
-                let _ = self.event_tx.send(SegmentEvent::Filtered {
-                    session_id: self.session_id,
-                    index: seg.index,
-                    path: final_p,
-                    size: seg.size,
-                });
-            } else {
-                tokio::fs::rename(&seg.part_path, &final_p)
-                    .await
-                    .map_err(|e| AppError::Io {
-                        path: final_p.clone(),
-                        source: e,
-                    })?;
-
-                let db_seg = Segment {
-                    session_id: self.session_id,
-                    index: seg.index,
-                    path: final_p.clone(),
-                    status: SegmentStatus::Finalized,
-                    error: None,
-                };
-                self.store.put_segment(&db_seg)?;
-                let _ = self.event_tx.send(SegmentEvent::Finalized {
-                    session_id: self.session_id,
-                    index: seg.index,
-                    path: final_p,
-                    size: seg.size,
-                });
-            }
-            Ok(())
+        if let Err(e) = seg.file.flush().await.map_err(|e| AppError::Io {
+            path: seg.part_path.clone(),
+            source: e,
+        }) {
+            return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
         }
-        .await;
+        drop(seg.file);
 
-        if let Err(e) = res {
+        let final_p = final_path(&self.policy, &self.session_id, seg.index);
+
+        if should_filter_by_size(seg.size, &self.policy) {
             let db_seg = Segment {
                 session_id: self.session_id,
                 index: seg.index,
-                path: seg.part_path.clone(),
-                status: SegmentStatus::Failed,
-                error: Some(e.to_string()),
+                path: final_p.clone(),
+                status: SegmentStatus::Filtered,
+                error: None,
             };
-            let _ = self.store.put_segment(&db_seg);
-            return Err(e);
+            if let Err(e) = self.store.put_segment(&db_seg) {
+                return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+            }
+
+            if let Err(e) = tokio::fs::remove_file(&seg.part_path)
+                .await
+                .map_err(|e| AppError::Io {
+                    path: seg.part_path.clone(),
+                    source: e,
+                })
+            {
+                return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+            }
+
+            let _ = self.event_tx.send(SegmentEvent::Filtered {
+                session_id: self.session_id,
+                index: seg.index,
+                path: final_p,
+                size: seg.size,
+            });
+            return Ok(());
         }
 
+        if let Err(e) = tokio::fs::rename(&seg.part_path, &final_p)
+            .await
+            .map_err(|e| AppError::Io {
+                path: final_p.clone(),
+                source: e,
+            })
+        {
+            return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+        }
+
+        let db_seg = Segment {
+            session_id: self.session_id,
+            index: seg.index,
+            path: final_p.clone(),
+            status: SegmentStatus::Finalized,
+            error: None,
+        };
+        if let Err(e) = self.store.put_segment(&db_seg) {
+            let rollback_res =
+                tokio::fs::rename(&final_p, &seg.part_path)
+                    .await
+                    .map_err(|rollback_err| AppError::Io {
+                        path: seg.part_path.clone(),
+                        source: rollback_err,
+                    });
+
+            let failure_path = if rollback_res.is_ok() {
+                seg.part_path.clone()
+            } else {
+                final_p.clone()
+            };
+            let mut error = e.to_string();
+            if let Err(rollback_err) = rollback_res {
+                error = format!(
+                    "{error}; additionally failed to roll back finalized file from {} to {}: {rollback_err}",
+                    final_p.display(),
+                    seg.part_path.display()
+                );
+            }
+            return self.persist_failed_segment(seg.index, failure_path, AppError::State(error));
+        }
+
+        let _ = self.event_tx.send(SegmentEvent::Finalized {
+            session_id: self.session_id,
+            index: seg.index,
+            path: final_p,
+            size: seg.size,
+        });
+
         Ok(())
+    }
+
+    fn persist_failed_segment(
+        &self,
+        index: u32,
+        path: PathBuf,
+        original: AppError,
+    ) -> AppResult<()> {
+        let original_msg = original.to_string();
+        let db_seg = Segment {
+            session_id: self.session_id,
+            index,
+            path,
+            status: SegmentStatus::Failed,
+            error: Some(original_msg.clone()),
+        };
+        self.store.put_segment(&db_seg).map_err(|persist_err| {
+            AppError::State(format!(
+                "{original_msg}; additionally failed to persist failed segment state: {persist_err}"
+            ))
+        })?;
+        Err(original)
     }
 
     async fn open_new_segment(&mut self) -> AppResult<()> {
@@ -337,7 +380,7 @@ impl<'a> FlvRecorder<'a> {
         Ok(())
     }
 
-    pub fn mark_failed(&mut self, err_msg: &str) {
+    pub fn mark_failed(&mut self, err_msg: &str) -> AppResult<()> {
         if let Some(seg) = self.current_segment.take() {
             let db_seg = Segment {
                 session_id: self.session_id,
@@ -346,8 +389,9 @@ impl<'a> FlvRecorder<'a> {
                 status: SegmentStatus::Failed,
                 error: Some(err_msg.to_string()),
             };
-            let _ = self.store.put_segment(&db_seg);
+            self.store.put_segment(&db_seg)?;
         }
+        Ok(())
     }
 }
 
@@ -378,7 +422,12 @@ pub async fn record_flv(
     .await;
 
     if let Err(e) = result {
-        recorder.mark_failed(&e.to_string());
+        let err_msg = e.to_string();
+        recorder.mark_failed(&err_msg).map_err(|persist_err| {
+            AppError::State(format!(
+                "{err_msg}; additionally failed to persist failed segment state: {persist_err}"
+            ))
+        })?;
         return Err(e);
     }
 
@@ -645,7 +694,7 @@ mod tests {
         let err = recorder.finalize().await.unwrap_err();
         assert!(err.to_string().contains("incomplete tag"));
 
-        recorder.mark_failed(&err.to_string());
+        recorder.mark_failed(&err.to_string()).unwrap();
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
@@ -657,5 +706,55 @@ mod tests {
                 .unwrap()
                 .contains("incomplete tag")
         );
+    }
+
+    #[tokio::test]
+    async fn test_flv_recorder_marks_failed_when_final_rename_fails() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let store = StateStore::open(&db_path).unwrap();
+
+        let policy = SegmentPolicy {
+            output_dir: dir.path().to_path_buf(),
+            segment_size: None,
+            segment_time: None,
+            min_segment_size: 0,
+        };
+
+        let session_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx)
+            .await
+            .unwrap();
+
+        let header_bytes = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00";
+        recorder.push_chunk(header_bytes).await.unwrap();
+
+        let mut tag_buf = Vec::new();
+        let tag = FlvTag {
+            header: FlvTagHeader {
+                tag_type: FlvTagType::Video,
+                data_size: 5,
+                timestamp: 0,
+                stream_id: 0,
+            },
+            data: vec![0x17, 0x01, 0, 0, 0],
+        };
+        tag.write(&mut tag_buf).unwrap();
+        recorder.push_chunk(&tag_buf).await.unwrap();
+
+        let part_p = part_path(&policy, &session_id, 1);
+        let final_p = final_path(&policy, &session_id, 1);
+        std::fs::create_dir(&final_p).unwrap();
+
+        let err = recorder.finalize().await.unwrap_err();
+        assert!(err.to_string().contains(&final_p.display().to_string()));
+
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].status, SegmentStatus::Failed);
+        assert_eq!(segments[0].path, part_p);
+        assert!(segments[0].error.as_ref().unwrap().contains("io error"));
+        assert!(part_p.exists(), ".part file should remain recoverable");
     }
 }
