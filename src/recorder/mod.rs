@@ -316,6 +316,19 @@ impl<'a> FlvRecorder<'a> {
         self.finalize_current_segment().await?;
         Ok(())
     }
+
+    pub fn mark_failed(&mut self, err_msg: &str) {
+        if let Some(seg) = self.current_segment.take() {
+            let db_seg = Segment {
+                session_id: self.session_id,
+                index: seg.index,
+                path: seg.part_path.clone(),
+                status: SegmentStatus::Failed,
+                error: Some(err_msg.to_string()),
+            };
+            let _ = self.store.put_segment(&db_seg);
+        }
+    }
 }
 
 /// A thin wrapper that reads from an HTTP response and drives the FlvRecorder.
@@ -326,13 +339,28 @@ pub async fn record_flv(
     store: &StateStore,
     event_tx: mpsc::UnboundedSender<SegmentEvent>,
 ) -> AppResult<()> {
-    let mut recorder = FlvRecorder::new(session_id, policy, store, event_tx).await?;
-
-    while let Some(chunk) = resp.chunk().await? {
-        recorder.push_chunk(&chunk).await?;
+    if !resp.status().is_success() {
+        return Err(AppError::Bilibili(format!(
+            "Non-success HTTP status: {}",
+            resp.status()
+        )));
     }
 
-    recorder.finalize().await?;
+    let mut recorder = FlvRecorder::new(session_id, policy, store, event_tx).await?;
+
+    let result: AppResult<()> = async {
+        while let Some(chunk) = resp.chunk().await? {
+            recorder.push_chunk(&chunk).await?;
+        }
+        recorder.finalize().await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        recorder.mark_failed(&e.to_string());
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -565,6 +593,20 @@ mod tests {
         let header_bytes = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00";
         recorder.push_chunk(header_bytes).await.unwrap();
 
+        // Push a complete tag to open a segment
+        let mut valid_tag_buf = Vec::new();
+        let valid_tag = FlvTag {
+            header: FlvTagHeader {
+                tag_type: FlvTagType::Video,
+                data_size: 5,
+                timestamp: 0,
+                stream_id: 0,
+            },
+            data: vec![0, 0, 0, 0, 0],
+        };
+        valid_tag.write(&mut valid_tag_buf).unwrap();
+        recorder.push_chunk(&valid_tag_buf).await.unwrap();
+
         // Push an incomplete tag (missing data)
         let mut tag_buf = Vec::new();
         let tag = FlvTag {
@@ -582,5 +624,18 @@ mod tests {
 
         let err = recorder.finalize().await.unwrap_err();
         assert!(err.to_string().contains("incomplete tag"));
+
+        recorder.mark_failed(&err.to_string());
+
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].status, SegmentStatus::Failed);
+        assert!(
+            segments[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("incomplete tag")
+        );
     }
 }
