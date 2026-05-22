@@ -4,6 +4,7 @@ use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::pipeline::state_machine::PipelineState;
 use crate::state::model::{LiveSession, Segment, Submission, UploadedPart};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -11,6 +12,7 @@ const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
 const SEGMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("segments");
 const UPLOADED_PARTS: TableDefinition<&str, &[u8]> = TableDefinition::new("uploaded_parts");
 const SUBMISSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("submissions");
+const PIPELINE_STATES: TableDefinition<u64, &[u8]> = TableDefinition::new("pipeline_states");
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -52,6 +54,7 @@ impl StateStore {
             write_txn.open_table(SEGMENTS)?;
             write_txn.open_table(UPLOADED_PARTS)?;
             write_txn.open_table(SUBMISSIONS)?;
+            write_txn.open_table(PIPELINE_STATES)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -83,6 +86,30 @@ impl StateStore {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    pub fn put_pipeline_state(&self, room_id: u64, state: PipelineState) -> AppResult<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(PIPELINE_STATES)?;
+            let value = serde_json::to_vec(&state).map_err(|e| AppError::State(e.to_string()))?;
+            table.insert(room_id, value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_pipeline_state(&self, room_id: u64) -> AppResult<Option<PipelineState>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(PIPELINE_STATES)?;
+        match table.get(room_id)? {
+            Some(v) => {
+                let state: PipelineState = serde_json::from_slice(v.value())
+                    .map_err(|e| AppError::State(e.to_string()))?;
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn get_session(&self, id: Uuid) -> AppResult<Option<LiveSession>> {

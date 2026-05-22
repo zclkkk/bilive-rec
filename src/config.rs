@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub record: RecordConfig,
     pub upload: UploadConfig,
     #[serde(default)]
+    pub pipeline: PipelineConfig,
+    #[serde(default)]
     pub rooms: Vec<RoomConfig>,
 }
 
@@ -143,6 +145,36 @@ fn default_copyright() -> u8 {
 
 fn default_source() -> String {
     "直播录像".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PipelineConfig {
+    #[serde(default = "default_poll_interval_s")]
+    pub poll_interval_s: u64,
+    #[serde(default = "default_offline_grace_s")]
+    pub offline_grace_s: u64,
+    #[serde(default = "default_backoff_s")]
+    pub backoff_s: u64,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_s: default_poll_interval_s(),
+            offline_grace_s: default_offline_grace_s(),
+            backoff_s: default_backoff_s(),
+        }
+    }
+}
+
+fn default_poll_interval_s() -> u64 {
+    60
+}
+fn default_offline_grace_s() -> u64 {
+    60
+}
+fn default_backoff_s() -> u64 {
+    15
 }
 
 impl AppConfig {
