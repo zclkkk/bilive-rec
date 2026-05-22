@@ -102,22 +102,33 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             #[allow(clippy::collapsible_if)]
             if let Some(state) = store.get_pipeline_state(room_id)? {
                 supervisor.session.state = state;
-                
+
                 match state {
-                    PipelineState::Recording | PipelineState::WaitingReconnect | PipelineState::ReResolving | PipelineState::Uploading | PipelineState::Submitting => {
+                    PipelineState::Recording
+                    | PipelineState::WaitingReconnect
+                    | PipelineState::ReResolving
+                    | PipelineState::Uploading
+                    | PipelineState::Submitting => {
                         if let Some(session) = store.get_latest_session_for_room(room_id)? {
                             supervisor.active_session_id = Some(session.id);
                         } else {
-                            return Err(AppError::State(format!("Persisted pipeline state {:?} requires an active session, but none was found.", state)));
+                            return Err(AppError::State(format!(
+                                "Persisted pipeline state {:?} requires an active session, but none was found.",
+                                state
+                            )));
                         }
-                    },
-                    PipelineState::Idle | PipelineState::Resolving | PipelineState::Offline | PipelineState::Submitted | PipelineState::Failed => {
+                    }
+                    PipelineState::Idle
+                    | PipelineState::Resolving
+                    | PipelineState::Offline
+                    | PipelineState::Submitted
+                    | PipelineState::Failed => {
                         // no active session required, or explicit reset expected
                     }
                 }
             }
         }
-        
+
         Ok(supervisor)
     }
 
@@ -159,19 +170,30 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                     let session_id = Uuid::new_v4();
                                     self.active_session_id = Some(session_id);
 
+                                    let live_session = LiveSession {
+                                        id: session_id,
+                                        room_key: self.room_id.to_string(),
+                                        title: info.title.clone(),
+                                        started_at: jiff::Timestamp::now(),
+                                        status: SessionStatus::Recording,
+                                    };
+
                                     if let Some(store) = &self.store {
-                                        let live_session = LiveSession {
-                                            id: session_id,
-                                            room_key: self.room_id.to_string(),
-                                            title: info.title.clone(),
-                                            started_at: jiff::Timestamp::now(),
-                                            status: SessionStatus::Recording,
-                                        };
-                                        store.put_session(&live_session)?;
+                                        store.put_session_and_pipeline_state(
+                                            &live_session,
+                                            self.room_id,
+                                            PipelineState::Recording,
+                                        )?;
                                     }
+
+                                    let prev = self.session.state;
+                                    self.session.state = PipelineState::Recording;
+                                    info!(room_id = self.room_id, from = ?prev, to = ?PipelineState::Recording, "Pipeline state transition");
+                                    self.offline_since = None;
+                                } else {
+                                    self.offline_since = None;
+                                    self.transition(PipelineState::Recording)?;
                                 }
-                                self.offline_since = None;
-                                self.transition(PipelineState::Recording)?;
                             } else {
                                 // Room is not live
                                 if self.session.state == PipelineState::Resolving {
@@ -474,16 +496,17 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                     // Final check by re-reading
                     let final_parts = store.list_uploaded_parts(active_session)?;
-                    let final_indices: std::collections::HashSet<u32> = final_parts
-                        .into_iter()
-                        .map(|p| p.segment_index)
-                        .collect();
+                    let final_indices: std::collections::HashSet<u32> =
+                        final_parts.into_iter().map(|p| p.segment_index).collect();
 
                     for seg in &segments {
                         if seg.status == SegmentStatus::Finalized
                             && !final_indices.contains(&seg.index)
                         {
-                            error!("Segment {} is finalized but still lacks UploadedPart after reconciliation", seg.index);
+                            error!(
+                                "Segment {} is finalized but still lacks UploadedPart after reconciliation",
+                                seg.index
+                            );
                             reconciliation_failed = true;
                         }
                     }
@@ -572,7 +595,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         bvid: None,
                         error: None,
                     });
-                    
+
                     if sub.status != SubmissionStatus::Pending {
                         sub.status = SubmissionStatus::Pending;
                         sub.error = None;
@@ -602,7 +625,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 self.transition(PipelineState::Idle)?;
             }
             PipelineState::Failed => {
-                return Err(AppError::State("Room is in Failed state and requires Phase 6 recovery or manual intervention.".into()));
+                return Err(AppError::State(
+                    "Room is in Failed state and requires Phase 6 recovery or manual intervention."
+                        .into(),
+                ));
             }
         }
         Ok(())
@@ -625,7 +651,7 @@ mod tests {
                 submit_count: std::sync::atomic::AtomicUsize::new(0),
             }
         }
-        
+
         fn get_submit_count(&self) -> usize {
             self.submit_count.load(std::sync::atomic::Ordering::SeqCst)
         }
@@ -644,7 +670,8 @@ mod tests {
             })
         }
         async fn submit(&self, _req: SubmissionRequest) -> AppResult<SubmissionResult> {
-            self.submit_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.submit_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(SubmissionResult {
                 aid: Some(1),
                 bvid: Some("bv1".to_string()),
@@ -725,7 +752,8 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Setup session
         let session_id = uuid::Uuid::new_v4();
@@ -772,7 +800,8 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
-        ).unwrap();
+        )
+        .unwrap();
 
         let session_id = uuid::Uuid::new_v4();
         supervisor.active_session_id = Some(session_id);
@@ -842,7 +871,8 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config.clone())),
-        ).unwrap();
+        )
+        .unwrap();
 
         supervisor.session.state = PipelineState::Recording;
         supervisor.active_session_id = Some(uuid::Uuid::new_v4());
@@ -860,7 +890,8 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
-        ).unwrap();
+        )
+        .unwrap();
         supervisor2.session.state = PipelineState::Recording;
         supervisor2.active_session_id = Some(uuid::Uuid::new_v4());
         supervisor2.client = Some(std::sync::Arc::new(BiliClient::new(None).unwrap()));
@@ -871,9 +902,12 @@ mod tests {
     #[tokio::test]
     async fn test_submitting_idempotent_submitted() {
         let db_dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let store =
+            std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config = AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"").unwrap();
+        let mut config =
+            AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
+                .unwrap();
         config.upload.tid = 123;
 
         let mut supervisor = RoomSupervisor::new(
@@ -883,19 +917,22 @@ mod tests {
             None,
             Some(uploader.clone()),
             Some(std::sync::Arc::new(config)),
-        ).unwrap();
+        )
+        .unwrap();
 
         let session_id = uuid::Uuid::new_v4();
         supervisor.active_session_id = Some(session_id);
         supervisor.session.state = PipelineState::Submitting;
 
-        store.put_submission(&Submission {
-            session_id,
-            status: SubmissionStatus::Submitted,
-            aid: Some(1),
-            bvid: Some("bv1".into()),
-            error: None,
-        }).unwrap();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Submitted,
+                aid: Some(1),
+                bvid: Some("bv1".into()),
+                error: None,
+            })
+            .unwrap();
 
         supervisor.run_step().await.unwrap();
 
@@ -906,9 +943,12 @@ mod tests {
     #[tokio::test]
     async fn test_submitting_idempotent_failed() {
         let db_dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let store =
+            std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config = AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"").unwrap();
+        let mut config =
+            AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
+                .unwrap();
         config.upload.tid = 123;
 
         let mut supervisor = RoomSupervisor::new(
@@ -918,19 +958,22 @@ mod tests {
             None,
             Some(uploader.clone()),
             Some(std::sync::Arc::new(config)),
-        ).unwrap();
+        )
+        .unwrap();
 
         let session_id = uuid::Uuid::new_v4();
         supervisor.active_session_id = Some(session_id);
         supervisor.session.state = PipelineState::Submitting;
 
-        store.put_submission(&Submission {
-            session_id,
-            status: SubmissionStatus::Failed,
-            aid: None,
-            bvid: None,
-            error: Some("mock err".into()),
-        }).unwrap();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Failed,
+                aid: None,
+                bvid: None,
+                error: Some("mock err".into()),
+            })
+            .unwrap();
 
         let err = supervisor.run_step().await.unwrap_err();
         assert!(matches!(err, AppError::State(_)));
@@ -942,9 +985,12 @@ mod tests {
     #[tokio::test]
     async fn test_submitting_idempotent_pending() {
         let db_dir = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let store =
+            std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config = AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"").unwrap();
+        let mut config =
+            AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
+                .unwrap();
         config.upload.tid = 123;
 
         let mut supervisor = RoomSupervisor::new(
@@ -954,26 +1000,31 @@ mod tests {
             None,
             Some(uploader.clone()),
             Some(std::sync::Arc::new(config)),
-        ).unwrap();
+        )
+        .unwrap();
 
         let session_id = uuid::Uuid::new_v4();
         supervisor.active_session_id = Some(session_id);
         supervisor.session.state = PipelineState::Submitting;
 
-        store.put_submission(&Submission {
-            session_id,
-            status: SubmissionStatus::Pending,
-            aid: None,
-            bvid: None,
-            error: None,
-        }).unwrap();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Pending,
+                aid: None,
+                bvid: None,
+                error: None,
+            })
+            .unwrap();
 
-        store.put_uploaded_part(&UploadedPart {
-            session_id,
-            segment_index: 0,
-            bili_filename: "fake_file".into(),
-            part_title: "part 0".into(),
-        }).unwrap();
+        store
+            .put_uploaded_part(&UploadedPart {
+                session_id,
+                segment_index: 0,
+                bili_filename: "fake_file".into(),
+                part_title: "part 0".into(),
+            })
+            .unwrap();
 
         let err = supervisor.run_step().await.unwrap_err();
         assert!(matches!(err, AppError::State(_)));

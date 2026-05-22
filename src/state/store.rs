@@ -88,6 +88,29 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn put_session_and_pipeline_state(
+        &self,
+        session: &LiveSession,
+        room_id: u64,
+        state: PipelineState,
+    ) -> AppResult<()> {
+        let key = session.id.to_string();
+        let session_value = serde_json::to_vec(session)
+            .map_err(|e| AppError::State(format!("serialize session: {e}")))?;
+        let state_value = serde_json::to_vec(&state).map_err(|e| AppError::State(e.to_string()))?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut sessions_table = write_txn.open_table(SESSIONS)?;
+            sessions_table.insert(key.as_str(), session_value.as_slice())?;
+
+            let mut states_table = write_txn.open_table(PIPELINE_STATES)?;
+            states_table.insert(room_id, state_value.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn put_pipeline_state(&self, room_id: u64, state: PipelineState) -> AppResult<()> {
         let write_txn = self.db.begin_write()?;
         {
