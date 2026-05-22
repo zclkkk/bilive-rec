@@ -36,6 +36,9 @@ pub enum AppError {
 
     #[error("bilibili error: {0}")]
     Bilibili(String),
+
+    #[error("graceful shutdown")]
+    GracefulShutdown,
 }
 
 impl From<redb::TransactionError> for AppError {

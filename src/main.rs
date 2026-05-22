@@ -121,6 +121,8 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let client = Arc::new(BiliClient::new(None)?);
     let app_config = Arc::new(config.clone());
 
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     let mut handles = futures::stream::FuturesUnordered::new();
 
     for room in &config.rooms {
@@ -129,6 +131,7 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
         let uploader = uploader.clone();
         let client = client.clone();
         let app_config = app_config.clone();
+        let shutdown_rx = shutdown_rx.clone();
 
         let handle = tokio::spawn(async move {
             let room_id =
@@ -142,6 +145,7 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                     }
                 };
 
+            let mut loop_shutdown_rx = shutdown_rx.clone();
             let mut supervisor = RoomSupervisor::new(
                 room_id,
                 app_config.pipeline.clone(),
@@ -149,14 +153,28 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                 Some(client),
                 Some(uploader),
                 Some(app_config.clone()),
+                shutdown_rx,
             )?;
 
             tracing::info!("Started supervisor for room {}", room_id);
 
             loop {
-                if let Err(e) = supervisor.run_step().await {
-                    tracing::error!("Fatal supervisor error for room {}: {}", room_id, e);
-                    return Err(e);
+                // Check shutdown before each step
+                if *loop_shutdown_rx.borrow() {
+                    tracing::info!("Room {} shutting down (signal received)", room_id);
+                    return Ok::<(), bilive_rec::error::AppError>(());
+                }
+
+                match supervisor.run_step().await {
+                    Ok(()) => {}
+                    Err(bilive_rec::error::AppError::GracefulShutdown) => {
+                        tracing::info!("Room {} interrupted by graceful shutdown", room_id);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::error!("Fatal supervisor error for room {}: {}", room_id, e);
+                        return Err(e);
+                    }
                 }
 
                 let state = supervisor.session.state;
@@ -174,7 +192,13 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                 };
 
                 if let Some(d) = sleep_duration {
-                    tokio::time::sleep(d).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(d) => {}
+                        _ = loop_shutdown_rx.changed() => {
+                            tracing::info!("Room {} shutting down (signal during sleep)", room_id);
+                            return Ok(());
+                        }
+                    }
                 }
             }
             #[allow(unreachable_code)]
@@ -187,7 +211,26 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     use futures::StreamExt;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl-C received, shutting down supervisors...");
+            tracing::info!("Ctrl-C received, signaling graceful shutdown...");
+            let _ = shutdown_tx.send(true);
+            // Wait for all room tasks to finish their current operation
+            while let Some(res) = handles.next().await {
+                match res {
+                    Ok(Ok(())) => {
+                        tracing::info!("Room task shut down cleanly");
+                    }
+                    Ok(Err(bilive_rec::error::AppError::GracefulShutdown)) => {
+                        tracing::info!("Room task interrupted by shutdown");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Room task error during shutdown: {}", e);
+                    }
+                    Err(join_err) => {
+                        tracing::warn!("Room task panicked during shutdown: {}", join_err);
+                    }
+                }
+            }
+            tracing::info!("All room tasks stopped.");
         }
         res = handles.next() => {
             match res {

@@ -74,6 +74,7 @@ pub struct RoomSupervisor<U: Uploader + Send + Sync + 'static> {
     pub upload_tasks: Vec<JoinHandle<AppResult<()>>>,
     pub offline_since: Option<Instant>,
     pub app_config: Option<Arc<AppConfig>>,
+    pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
@@ -84,6 +85,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         client: Option<Arc<BiliClient>>,
         uploader: Option<Arc<U>>,
         app_config: Option<Arc<AppConfig>>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> AppResult<Self> {
         let mut supervisor = Self {
             room_id,
@@ -96,6 +98,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             upload_tasks: Vec::new(),
             offline_since: None,
             app_config,
+            shutdown_rx,
         };
 
         if let Some(store) = store {
@@ -384,12 +387,40 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     self.upload_tasks.push(handle);
 
                     info!("Starting record_flv from index {}", start_index);
-                    match record_flv(resp, active_session, policy, store, event_tx, start_index)
-                        .await
+                    match record_flv(
+                        resp,
+                        active_session,
+                        policy,
+                        store,
+                        event_tx,
+                        start_index,
+                        self.shutdown_rx.clone(),
+                    )
+                    .await
                     {
                         Ok(_) => {
                             info!("record_flv completed gracefully");
                             self.transition(PipelineState::WaitingReconnect)?;
+                        }
+                        Err(AppError::GracefulShutdown) => {
+                            info!("record_flv interrupted by graceful shutdown");
+                            // event_tx was moved into record_flv and dropped on return,
+                            // closing the channel. Await the upload task to let it finish
+                            // any in-flight upload before we exit.
+                            let tasks = std::mem::take(&mut self.upload_tasks);
+                            for task in tasks {
+                                match task.await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        warn!("Upload task error during shutdown: {}", e);
+                                    }
+                                    Err(e) => {
+                                        warn!("Upload task panicked during shutdown: {}", e);
+                                    }
+                                }
+                            }
+                            // Do not transition — leave persisted state as-is
+                            return Err(AppError::GracefulShutdown);
                         }
                         Err(e) => match e {
                             AppError::Io { .. }
@@ -687,7 +718,8 @@ mod tests {
     }
 
     fn mock_supervisor() -> RoomSupervisor<FakeUploader> {
-        RoomSupervisor::new(1, PipelineConfig::default(), None, None, None, None).unwrap()
+        let (_, rx) = tokio::sync::watch::channel(false);
+        RoomSupervisor::new(1, PipelineConfig::default(), None, None, None, None, rx).unwrap()
     }
 
     #[test]
@@ -752,6 +784,7 @@ mod tests {
             pipeline: Default::default(),
             rooms: vec![],
         };
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut supervisor = RoomSupervisor::new(
             1,
             PipelineConfig::default(),
@@ -759,6 +792,7 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
+            shutdown_rx,
         )
         .unwrap();
 
@@ -800,6 +834,7 @@ mod tests {
             pipeline: Default::default(),
             rooms: vec![],
         };
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut supervisor = RoomSupervisor::new(
             1,
             PipelineConfig::default(),
@@ -807,6 +842,7 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
+            shutdown_rx,
         )
         .unwrap();
 
@@ -871,6 +907,7 @@ mod tests {
 
         config.record.segment_time = Some("invalid_time".into());
 
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut supervisor = RoomSupervisor::new(
             1,
             PipelineConfig::default(),
@@ -878,6 +915,7 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config.clone())),
+            shutdown_rx,
         )
         .unwrap();
 
@@ -890,6 +928,7 @@ mod tests {
 
         config.record.segment_time = None;
         config.record.segment_size = Some("invalid_size".into());
+        let (_, shutdown_rx2) = tokio::sync::watch::channel(false);
         let mut supervisor2 = RoomSupervisor::new(
             1,
             PipelineConfig::default(),
@@ -897,6 +936,7 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
+            shutdown_rx2,
         )
         .unwrap();
         supervisor2.session.state = PipelineState::Recording;
@@ -917,6 +957,7 @@ mod tests {
                 .unwrap();
         config.upload.tid = 123;
 
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut supervisor = RoomSupervisor::new(
             1,
             PipelineConfig::default(),
@@ -924,6 +965,7 @@ mod tests {
             None,
             Some(uploader.clone()),
             Some(std::sync::Arc::new(config)),
+            shutdown_rx,
         )
         .unwrap();
 
@@ -958,6 +1000,7 @@ mod tests {
                 .unwrap();
         config.upload.tid = 123;
 
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut supervisor = RoomSupervisor::new(
             1,
             PipelineConfig::default(),
@@ -965,6 +1008,7 @@ mod tests {
             None,
             Some(uploader.clone()),
             Some(std::sync::Arc::new(config)),
+            shutdown_rx,
         )
         .unwrap();
 
@@ -1000,6 +1044,7 @@ mod tests {
                 .unwrap();
         config.upload.tid = 123;
 
+        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut supervisor = RoomSupervisor::new(
             1,
             PipelineConfig::default(),
@@ -1007,6 +1052,7 @@ mod tests {
             None,
             Some(uploader.clone()),
             Some(std::sync::Arc::new(config)),
+            shutdown_rx,
         )
         .unwrap();
 

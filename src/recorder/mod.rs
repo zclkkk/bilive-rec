@@ -404,6 +404,7 @@ pub async fn record_flv(
     store: &StateStore,
     event_tx: mpsc::UnboundedSender<SegmentEvent>,
     start_index: u32,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> AppResult<()> {
     if !resp.status().is_success() {
         return Err(AppError::Bilibili(format!(
@@ -415,8 +416,19 @@ pub async fn record_flv(
     let mut recorder = FlvRecorder::new(session_id, policy, store, event_tx, start_index).await?;
 
     let result: AppResult<()> = async {
-        while let Some(chunk) = resp.chunk().await? {
-            recorder.push_chunk(&chunk).await?;
+        loop {
+            tokio::select! {
+                chunk = resp.chunk() => {
+                    match chunk? {
+                        Some(data) => recorder.push_chunk(&data).await?,
+                        None => break,
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    recorder.mark_failed("Graceful shutdown")?;
+                    return Err(AppError::GracefulShutdown);
+                }
+            }
         }
         recorder.finalize().await?;
         Ok(())
@@ -424,6 +436,9 @@ pub async fn record_flv(
     .await;
 
     if let Err(e) = result {
+        if matches!(e, AppError::GracefulShutdown) {
+            return Err(e);
+        }
         let err_msg = e.to_string();
         recorder.mark_failed(&err_msg).map_err(|persist_err| {
             AppError::State(format!(
