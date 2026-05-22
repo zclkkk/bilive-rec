@@ -525,10 +525,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             }
                             SubmissionStatus::Failed => {
                                 self.transition(PipelineState::Failed)?;
-                                return Ok(());
+                                return Err(AppError::State("Submission previously failed. Requires Phase 6 recovery or manual intervention.".into()));
                             }
                             SubmissionStatus::Pending => {
-                                // Will retry submit using persisted parts
+                                return Err(AppError::State("Pending submission is unknown/in-flight and requires Phase 6 recovery/manual verification.".into()));
                             }
                         }
                     } else {
@@ -602,7 +602,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 self.transition(PipelineState::Idle)?;
             }
             PipelineState::Failed => {
-                // Leave Failed for Phase 6 manual intervention / recovery
+                return Err(AppError::State("Room is in Failed state and requires Phase 6 recovery or manual intervention.".into()));
             }
         }
         Ok(())
@@ -932,7 +932,8 @@ mod tests {
             error: Some("mock err".into()),
         }).unwrap();
 
-        supervisor.run_step().await.unwrap();
+        let err = supervisor.run_step().await.unwrap_err();
+        assert!(matches!(err, AppError::State(_)));
 
         assert_eq!(supervisor.session.state, PipelineState::Failed);
         assert_eq!(uploader.get_submit_count(), 0);
@@ -974,12 +975,10 @@ mod tests {
             part_title: "part 0".into(),
         }).unwrap();
 
-        supervisor.run_step().await.unwrap();
+        let err = supervisor.run_step().await.unwrap_err();
+        assert!(matches!(err, AppError::State(_)));
 
-        assert_eq!(supervisor.session.state, PipelineState::Submitted);
-        assert_eq!(uploader.get_submit_count(), 1);
-        
-        let final_sub = store.get_submission(session_id).unwrap().unwrap();
-        assert_eq!(final_sub.status, SubmissionStatus::Submitted);
+        assert_eq!(supervisor.session.state, PipelineState::Submitting);
+        assert_eq!(uploader.get_submit_count(), 0);
     }
 }

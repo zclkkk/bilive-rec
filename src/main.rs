@@ -75,6 +75,12 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
         ));
     }
 
+    if config.rooms.is_empty() {
+        return Err(bilive_rec::error::AppError::Config(
+            "run requires at least one room".into(),
+        ));
+    }
+
     use bilive_rec::pipeline::state_machine::PipelineState;
     use bilive_rec::pipeline::supervisor::RoomSupervisor;
     use bilive_rec::uploader::biliup_adapter::BiliupUploader;
@@ -424,4 +430,23 @@ async fn upload_cmd(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_run_cmd_empty_rooms() {
+        use std::io::Write;
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let toml_str = "[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"\n";
+        temp_file.write_all(toml_str.as_bytes()).unwrap();
+
+        let res = run_cmd(temp_file.path()).await;
+        assert!(res.is_err());
+        if let Err(e) = res {
+            assert!(matches!(e, bilive_rec::error::AppError::Config(_)));
+        }
+    }
 }
