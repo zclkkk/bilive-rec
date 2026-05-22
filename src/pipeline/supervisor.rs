@@ -346,7 +346,14 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             self.transition(PipelineState::WaitingReconnect)?;
                         }
                         Err(e) => match e {
-                            AppError::Io { .. } | AppError::State(_) | AppError::Config(_) => {
+                            AppError::Io { .. }
+                            | AppError::State(_)
+                            | AppError::Config(_)
+                            | AppError::Database(_)
+                            | AppError::Table(_)
+                            | AppError::Transaction(_)
+                            | AppError::Storage(_)
+                            | AppError::Commit(_) => {
                                 error!("record_flv fatal error: {}", e);
                                 return Err(e);
                             }
