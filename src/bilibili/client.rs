@@ -10,6 +10,7 @@ const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct BiliClient {
     client: reqwest::Client,
+    stream_client: reqwest::Client,
 }
 
 impl BiliClient {
@@ -29,11 +30,19 @@ impl BiliClient {
         }
 
         let client = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .timeout(DEFAULT_HTTP_TIMEOUT)
             .build()?;
 
-        Ok(Self { client })
+        let stream_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(10))
+            .build()?;
+
+        Ok(Self {
+            client,
+            stream_client,
+        })
     }
 
     pub async fn fetch_wbi_keys(&self) -> AppResult<WbiKeys> {
@@ -50,6 +59,10 @@ impl BiliClient {
 
     pub fn client(&self) -> &reqwest::Client {
         &self.client
+    }
+
+    pub fn stream_client(&self) -> &reqwest::Client {
+        &self.stream_client
     }
 
     pub fn from_cookie_file(path: &Path) -> AppResult<Self> {

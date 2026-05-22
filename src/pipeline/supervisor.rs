@@ -337,7 +337,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                 let req = self
                     .client
-                    .client()
+                    .stream_client()
                     .get(&cand.url)
                     .header("User-Agent", "Mozilla/5.0")
                     .header("Referer", "https://live.bilibili.com/");

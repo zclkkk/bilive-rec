@@ -448,22 +448,35 @@ pub async fn record_flv(
 
     let mut recorder = FlvRecorder::new(session_id, policy, store, event_tx, start_index).await?;
 
+    let mut graceful_shutdown = false;
     let result: AppResult<()> = async {
         loop {
             tokio::select! {
-                chunk = resp.chunk() => {
-                    match chunk? {
-                        Some(data) => recorder.push_chunk(&data).await?,
-                        None => break,
+                chunk_res = tokio::time::timeout(std::time::Duration::from_secs(30), resp.chunk()) => {
+                    match chunk_res {
+                        Ok(Ok(Some(data))) => recorder.push_chunk(&data).await?,
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => {
+                            tracing::warn!("Stream connection dropped: {}", e);
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::warn!("Stream idle timeout: no data received for 30s");
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    recorder.mark_failed("Graceful shutdown")?;
-                    return Err(AppError::GracefulShutdown);
+                    tracing::info!("Graceful shutdown requested, finalizing segment");
+                    graceful_shutdown = true;
+                    break;
                 }
             }
         }
         recorder.finalize().await?;
+        if graceful_shutdown {
+            return Err(AppError::GracefulShutdown);
+        }
         Ok(())
     }
     .await;
