@@ -68,6 +68,14 @@ pub enum StateAction {
     /// Print a summary of persisted state
     Inspect,
 
-    /// Run crash recovery
-    Recover,
+    /// Run crash recovery (dry-run by default)
+    Recover {
+        /// Apply safe recovery mutations instead of just printing the plan
+        #[arg(long)]
+        apply: bool,
+
+        /// Reset a specific room's pipeline from Failed to Idle
+        #[arg(long)]
+        reset_room: Option<u64>,
+    },
 }

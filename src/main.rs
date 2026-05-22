@@ -32,7 +32,9 @@ async fn main() {
         Command::Run { config } => run_cmd(&config).await,
         Command::State { config, action } => match action {
             StateAction::Inspect => state_inspect_cmd(&config),
-            StateAction::Recover => state_recover_cmd(&config),
+            StateAction::Recover { apply, reset_room } => {
+                state_recover_cmd(&config, apply, reset_room)
+            }
         },
     };
 
@@ -351,14 +353,29 @@ fn state_inspect_cmd(config_path: &std::path::Path) -> AppResult<()> {
     Ok(())
 }
 
-fn state_recover_cmd(config_path: &std::path::Path) -> AppResult<()> {
+fn state_recover_cmd(
+    config_path: &std::path::Path,
+    apply: bool,
+    _reset_room: Option<u64>,
+) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
     let db_path = config.data.dir.join("state.redb");
     let store = StateStore::open(&db_path)?;
-    let actions = state::recovery::recover(&store)?;
-    for action in &actions {
-        println!("{action}");
+
+    let plan = state::recovery::plan_recovery(&store)?;
+
+    if apply {
+        eprintln!("recovery apply is not implemented yet (Phase 6C)");
+        eprintln!("dry-run plan shown below:");
+        eprintln!();
     }
+
+    if plan.is_empty() {
+        println!("No recovery actions needed.");
+    } else {
+        println!("{}", plan);
+    }
+
     Ok(())
 }
 
