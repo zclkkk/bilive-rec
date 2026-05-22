@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,8 @@ pub struct AppConfig {
     pub data: DataConfig,
     #[serde(default)]
     pub record: RecordConfig,
-    pub upload: UploadConfig,
+    #[serde(default)]
+    pub upload: Option<UploadConfig>,
     #[serde(default)]
     pub pipeline: PipelineConfig,
     #[serde(default)]
@@ -34,6 +35,8 @@ impl Default for DataConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecordConfig {
+    #[serde(default)]
+    pub cookie_file: Option<PathBuf>,
     #[serde(default = "default_output_dir")]
     pub output_dir: PathBuf,
     #[serde(default)]
@@ -53,6 +56,7 @@ pub struct RecordConfig {
 impl Default for RecordConfig {
     fn default() -> Self {
         Self {
+            cookie_file: None,
             output_dir: PathBuf::from("./data/recordings"),
             segment_time: None,
             segment_size: None,
@@ -197,28 +201,39 @@ impl AppConfig {
         }
         self.pipeline.validate()?;
         self.record.validate()?;
-        self.upload.validate()?;
-        self.upload.validate_cookie_file()
+        let upload = self.upload_config()?;
+        upload.validate()?;
+        upload.validate_cookie_file()
     }
 
     pub fn validate_for_upload(&self) -> AppResult<()> {
-        self.upload.validate()?;
-        self.upload.validate_cookie_file()
+        let upload = self.upload_config()?;
+        upload.validate()?;
+        upload.validate_cookie_file()
     }
 
     pub fn validate_for_upload_recovery(&self) -> AppResult<()> {
-        self.upload.validate()?;
-        self.upload.validate_cookie_file()
+        let upload = self.upload_config()?;
+        upload.validate()?;
+        upload.validate_cookie_file()
     }
 
     pub fn validate_for_check(&self) -> AppResult<()> {
-        self.record.validate()?;
-        self.upload.validate_cookie_file()
+        self.record.validate()
+    }
+
+    pub fn upload_config(&self) -> AppResult<&UploadConfig> {
+        self.upload
+            .as_ref()
+            .ok_or_else(|| AppError::Config("[upload] config is required for this command".into()))
     }
 }
 
 impl RecordConfig {
     pub fn validate(&self) -> AppResult<()> {
+        if let Some(path) = &self.cookie_file {
+            validate_cookie_file_path(path, "record.cookie_file")?;
+        }
         self.min_segment_size_bytes()?;
         self.segment_time_duration()?;
         self.segment_size_bytes()?;
@@ -274,20 +289,24 @@ impl UploadConfig {
     }
 
     pub fn validate_cookie_file(&self) -> AppResult<()> {
-        if !self.cookie_file.exists() {
-            return Err(AppError::Config(format!(
-                "Cookie file does not exist: {}",
-                self.cookie_file.display()
-            )));
-        }
-        if !self.cookie_file.is_file() {
-            return Err(AppError::Config(format!(
-                "Cookie file path is not a regular file: {}",
-                self.cookie_file.display()
-            )));
-        }
-        Ok(())
+        validate_cookie_file_path(&self.cookie_file, "upload.cookie_file")
     }
+}
+
+fn validate_cookie_file_path(path: &Path, label: &str) -> AppResult<()> {
+    if !path.exists() {
+        return Err(AppError::Config(format!(
+            "{label} does not exist: {}",
+            path.display()
+        )));
+    }
+    if !path.is_file() {
+        return Err(AppError::Config(format!(
+            "{label} is not a regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 impl PipelineConfig {
@@ -360,6 +379,7 @@ mod tests {
 dir = "./data"
 
 [record]
+cookie_file = "./data/cookies.json"
 output_dir = "./data/recordings"
 segment_time = "01:00:00"
 segment_size = "2GiB"
@@ -392,15 +412,24 @@ description = "{streamer} 直播录像\n原直播间：{url}"
             config.record.output_dir,
             std::path::PathBuf::from("./data/recordings")
         );
+        assert_eq!(
+            config.record.cookie_file.as_deref(),
+            Some(std::path::Path::new("./data/cookies.json"))
+        );
         assert_eq!(config.record.segment_time.as_deref(), Some("01:00:00"));
         assert_eq!(config.record.segment_size.as_deref(), Some("2GiB"));
         assert_eq!(config.record.min_segment_size, "20MiB");
         assert_eq!(config.record.qn, 10000);
         assert!(config.record.cdn.is_empty());
-        assert_eq!(config.upload.threads, 3);
-        assert_eq!(config.upload.tid, 171);
-        assert_eq!(config.upload.copyright, 2);
-        assert_eq!(config.upload.tags, vec!["直播录像"]);
+        let upload = config.upload_config().unwrap();
+        assert_eq!(
+            upload.cookie_file,
+            std::path::PathBuf::from("./data/cookies.json")
+        );
+        assert_eq!(upload.threads, 3);
+        assert_eq!(upload.tid, 171);
+        assert_eq!(upload.copyright, 2);
+        assert_eq!(upload.tags, vec!["直播录像"]);
         assert_eq!(config.rooms.len(), 1);
         assert_eq!(config.rooms[0].name, "example");
     }
@@ -415,19 +444,25 @@ dir = "./data"
 output_dir = "./rec"
 
 [upload]
-cookie_file = "./cookies.json"
+cookie_file = "./data/cookies.json"
 
 [[rooms]]
 name = "test"
 url = "https://live.bilibili.com/1"
 "#;
         let config = AppConfig::parse(toml).unwrap();
+        assert!(config.record.cookie_file.is_none());
         assert_eq!(config.record.min_segment_size, "20MiB");
         assert_eq!(config.record.qn, 10000);
-        assert_eq!(config.upload.line, "auto");
-        assert_eq!(config.upload.threads, 3);
-        assert_eq!(config.upload.tid, 171);
-        assert_eq!(config.upload.copyright, 2);
+        let upload = config.upload_config().unwrap();
+        assert_eq!(
+            upload.cookie_file,
+            std::path::PathBuf::from("./data/cookies.json")
+        );
+        assert_eq!(upload.line, "auto");
+        assert_eq!(upload.threads, 3);
+        assert_eq!(upload.tid, 171);
+        assert_eq!(upload.copyright, 2);
     }
 
     #[test]
@@ -445,14 +480,74 @@ cookie_file = "./data/cookies.json"
             std::path::PathBuf::from("./data/recordings")
         );
         assert!(config.rooms.is_empty());
+        assert!(config.record.cookie_file.is_none());
 
-        assert_eq!(config.upload.source, "直播录像");
+        assert_eq!(
+            config.upload_config().unwrap().cookie_file,
+            std::path::PathBuf::from("./data/cookies.json")
+        );
+        assert_eq!(config.upload_config().unwrap().source, "直播录像");
+    }
+
+    #[test]
+    fn parse_record_only_config() {
+        let toml = r#"
+[record]
+"#;
+        let config = AppConfig::parse(toml).unwrap();
+
+        assert!(config.record.cookie_file.is_none());
+        assert!(config.upload.is_none());
+    }
+
+    #[test]
+    fn check_validation_does_not_require_upload_config() {
+        let config = AppConfig::parse("").unwrap();
+        config.validate_for_check().unwrap();
+    }
+
+    #[test]
+    fn run_validation_requires_upload_config_when_rooms_exist() {
+        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[record]
+cookie_file = "{}"
+
+[[rooms]]
+name = "test"
+url = "https://live.bilibili.com/1"
+"#,
+            cookie.path().display()
+        );
+        let config = AppConfig::parse(&toml).unwrap();
+
+        let err = config.validate_for_run().unwrap_err();
+        assert!(err.to_string().contains("[upload]"));
+    }
+
+    #[test]
+    fn record_validation_rejects_missing_cookie_file() {
+        let config = AppConfig::parse(
+            r#"
+[record]
+cookie_file = "./definitely-missing-live-cookie.json"
+"#,
+        )
+        .unwrap();
+
+        let err = config.validate_for_check().unwrap_err();
+        assert!(err.to_string().contains("record.cookie_file"));
     }
 
     #[test]
     fn record_config_default_matches_schema_defaults() {
         let config = RecordConfig::default();
-        assert_eq!(config.output_dir, std::path::PathBuf::from("./data/recordings"));
+        assert!(config.cookie_file.is_none());
+        assert_eq!(
+            config.output_dir,
+            std::path::PathBuf::from("./data/recordings")
+        );
         assert_eq!(config.segment_time, None);
         assert_eq!(config.segment_size, None);
         assert_eq!(config.min_segment_size, "20MiB");
@@ -516,5 +611,11 @@ cookie_file = "./data/cookies.json"
 
         let err = upload.validate().unwrap_err();
         assert!(err.to_string().contains("upload.threads"));
+    }
+
+    #[test]
+    fn upload_config_requires_cookie_file() {
+        let err = AppConfig::parse("[upload]\n").unwrap_err();
+        assert!(err.to_string().contains("cookie_file"));
     }
 }

@@ -788,14 +788,15 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         )
                     })
                     .unwrap_or_default();
+                let upload_config = self.app_config.upload_config()?;
 
                 let req = SubmissionRequest {
                     title,
                     description,
-                    tid: self.app_config.upload.tid,
-                    copyright: self.app_config.upload.copyright,
-                    tags: self.app_config.upload.tags.clone(),
-                    source: self.app_config.upload.source.clone(),
+                    tid: upload_config.tid,
+                    copyright: upload_config.copyright,
+                    tags: upload_config.tags.clone(),
+                    source: upload_config.source.clone(),
                     parts,
                 };
 
@@ -1033,7 +1034,7 @@ mod tests {
         let config = crate::config::AppConfig {
             data: Default::default(),
             record: Default::default(),
-            upload: crate::config::UploadConfig {
+            upload: Some(crate::config::UploadConfig {
                 cookie_file: "test".into(),
                 line: "auto".into(),
                 threads: 1,
@@ -1042,7 +1043,7 @@ mod tests {
                 copyright: 2,
                 source: "source".into(),
                 tags: vec![],
-            },
+            }),
             pipeline: Default::default(),
             rooms: vec![],
         };
@@ -1075,7 +1076,7 @@ mod tests {
         let config = crate::config::AppConfig {
             data: Default::default(),
             record: Default::default(),
-            upload: crate::config::UploadConfig {
+            upload: Some(crate::config::UploadConfig {
                 cookie_file: "test".into(),
                 line: "auto".into(),
                 threads: 1,
@@ -1084,7 +1085,7 @@ mod tests {
                 copyright: 2,
                 source: "source".into(),
                 tags: vec![],
-            },
+            }),
             pipeline: Default::default(),
             rooms: vec![],
         };
@@ -1259,7 +1260,7 @@ mod tests {
         let mut config = crate::config::AppConfig {
             data: Default::default(),
             record: Default::default(),
-            upload: crate::config::UploadConfig {
+            upload: Some(crate::config::UploadConfig {
                 cookie_file: "test".into(),
                 line: "auto".into(),
                 threads: 1,
@@ -1268,7 +1269,7 @@ mod tests {
                 copyright: 2,
                 source: "source".into(),
                 tags: vec![],
-            },
+            }),
             pipeline: Default::default(),
             rooms: vec![],
         };
@@ -1302,7 +1303,7 @@ mod tests {
         let mut config =
             AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
                 .unwrap();
-        config.upload.tid = 123;
+        config.upload.as_mut().unwrap().tid = 123;
 
         let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
 
@@ -1406,7 +1407,7 @@ mod tests {
         let mut config =
             AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
                 .unwrap();
-        config.upload.tid = 123;
+        config.upload.as_mut().unwrap().tid = 123;
 
         let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
 
@@ -1440,7 +1441,7 @@ mod tests {
         let mut config =
             AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
                 .unwrap();
-        config.upload.tid = 123;
+        config.upload.as_mut().unwrap().tid = 123;
 
         let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
 

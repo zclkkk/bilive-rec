@@ -56,6 +56,13 @@ impl BiliClient {
         let cookie = cookie_header_from_file(path)?;
         Self::new(Some(cookie))
     }
+
+    pub fn from_optional_cookie_file(path: Option<&Path>) -> AppResult<Self> {
+        match path {
+            Some(path) => Self::from_cookie_file(path),
+            None => Self::new(None),
+        }
+    }
 }
 
 pub fn cookie_header_from_file(path: &Path) -> AppResult<String> {

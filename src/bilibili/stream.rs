@@ -340,6 +340,7 @@ mod tests {
 
     fn default_config() -> RecordConfig {
         RecordConfig {
+            cookie_file: None,
             output_dir: PathBuf::from("rec"),
             segment_time: None,
             segment_size: None,

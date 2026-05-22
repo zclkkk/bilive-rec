@@ -70,18 +70,21 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let db_path = config.data.dir.join("state.redb");
     let store = Arc::new(StateStore::open(&db_path)?);
     let store_clone = store.clone();
+    let upload_config = config.upload_config()?.clone();
 
     // Check login right at the start
     let uploader = Arc::new(BiliupUploader::new(
-        config.upload.cookie_file.clone(),
-        config.upload.line.clone(),
-        config.upload.threads,
+        upload_config.cookie_file.clone(),
+        upload_config.line.clone(),
+        upload_config.threads,
     ));
     use bilive_rec::uploader::types::Uploader;
     tracing::info!("Checking uploader login...");
     uploader.check_login().await?;
 
-    let client = Arc::new(BiliClient::from_cookie_file(&config.upload.cookie_file)?);
+    let client = Arc::new(BiliClient::from_optional_cookie_file(
+        config.record.cookie_file.as_deref(),
+    )?);
     let app_config = Arc::new(config.clone());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -390,11 +393,12 @@ async fn state_recover_cmd(
     if apply {
         if state::recovery::plan_has_upload_actions(&plan) {
             config.validate_for_upload_recovery()?;
+            let upload_config = config.upload_config()?.clone();
 
             let uploader = bilive_rec::uploader::biliup_adapter::BiliupUploader::new(
-                config.upload.cookie_file.clone(),
-                config.upload.line.clone(),
-                config.upload.threads,
+                upload_config.cookie_file.clone(),
+                upload_config.line.clone(),
+                upload_config.threads,
             );
             use bilive_rec::uploader::types::Uploader;
             uploader.check_login().await?;
@@ -444,7 +448,7 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
 
     let (record_config, client) = if let Some(config) = config {
         config.validate_for_check()?;
-        let client = BiliClient::from_cookie_file(&config.upload.cookie_file)?;
+        let client = BiliClient::from_optional_cookie_file(config.record.cookie_file.as_deref())?;
         (config.record, client)
     } else {
         (RecordConfig::default(), BiliClient::new(None)?)
@@ -517,7 +521,7 @@ async fn upload_cmd(
         Some(path) => AppConfig::load(path)?,
     };
     config.validate_for_upload()?;
-    let upload_config = config.upload.clone();
+    let upload_config = config.upload_config()?.clone();
 
     if files.is_empty() {
         return Err(bilive_rec::error::AppError::Config(
