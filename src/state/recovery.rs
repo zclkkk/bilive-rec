@@ -4,6 +4,7 @@ use crate::error::AppResult;
 use crate::pipeline::state_machine::PipelineState;
 use crate::state::model::{SegmentStatus, SessionStatus, SubmissionStatus};
 use crate::state::store::StateStore;
+use crate::uploader::types::{UploadRequest, Uploader};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnomalyKind {
@@ -292,12 +293,29 @@ impl std::fmt::Display for RecoveryPlan {
     }
 }
 
+/// Check if the plan contains any ScheduleUploadReconciliation actions.
+pub fn plan_has_upload_actions(plan: &RecoveryPlan) -> bool {
+    plan.actions
+        .iter()
+        .any(|a| matches!(a, RecoveryAction::ScheduleUploadReconciliation { .. }))
+}
+
 /// Build a recovery plan from persisted state.
 ///
 /// This function is read-only and does not mutate any state.
 /// It produces a plan of safe, idempotent recovery actions that can be
 /// applied with `apply_recovery` when the user passes `--apply`.
-pub fn plan_recovery(store: &StateStore) -> AppResult<RecoveryPlan> {
+///
+/// `reset_rooms` is the set of room IDs the user explicitly requested
+/// to reset from Failed to Idle via `--reset-room`.
+///
+/// `retry_upload_sessions` is the set of session IDs the user explicitly
+/// requested to re-upload finalized segments for via `--retry-upload`.
+pub fn plan_recovery(
+    store: &StateStore,
+    reset_rooms: &HashSet<u64>,
+    retry_upload_sessions: &HashSet<uuid::Uuid>,
+) -> AppResult<RecoveryPlan> {
     let mut actions = Vec::new();
 
     let sessions = store.list_all_sessions()?;
@@ -342,7 +360,7 @@ pub fn plan_recovery(store: &StateStore) -> AppResult<RecoveryPlan> {
         }
     }
 
-    // 2. Finalized segments missing upload (only if file exists and is .flv)
+    // 2. Finalized segments missing upload
     for segment in &segments {
         if segment.status == SegmentStatus::Finalized {
             let has_upload = uploaded_by_session
@@ -351,34 +369,45 @@ pub fn plan_recovery(store: &StateStore) -> AppResult<RecoveryPlan> {
                 .unwrap_or(false);
 
             if !has_upload {
-                // Only schedule upload if the file exists on disk and is not a .part
-                if segment.path.exists()
-                    && segment
-                        .path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
-                {
-                    actions.push(RecoveryAction::ScheduleUploadReconciliation {
-                        session_id: segment.session_id,
-                        segment_index: segment.index,
-                        path: segment.path.clone(),
-                    });
-                } else if !segment.path.exists() {
-                    actions.push(RecoveryAction::LeaveAsIs {
-                        reason: format!(
-                            "Finalized segment {}/{} missing upload, but file does not exist: {}",
-                            segment.session_id,
-                            segment.index,
-                            segment.path.display()
-                        ),
-                    });
+                let session_requested = retry_upload_sessions.contains(&segment.session_id);
+
+                if session_requested {
+                    // Only schedule upload if the file exists on disk and is .flv
+                    if segment.path.exists()
+                        && segment
+                            .path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
+                    {
+                        actions.push(RecoveryAction::ScheduleUploadReconciliation {
+                            session_id: segment.session_id,
+                            segment_index: segment.index,
+                            path: segment.path.clone(),
+                        });
+                    } else if !segment.path.exists() {
+                        actions.push(RecoveryAction::LeaveAsIs {
+                            reason: format!(
+                                "Finalized segment {}/{} missing upload, but file does not exist: {}",
+                                segment.session_id,
+                                segment.index,
+                                segment.path.display()
+                            ),
+                        });
+                    } else {
+                        actions.push(RecoveryAction::LeaveAsIs {
+                            reason: format!(
+                                "Finalized segment {}/{} missing upload, but file is not a .flv: {}",
+                                segment.session_id,
+                                segment.index,
+                                segment.path.display()
+                            ),
+                        });
+                    }
                 } else {
                     actions.push(RecoveryAction::LeaveAsIs {
                         reason: format!(
-                            "Finalized segment {}/{} missing upload, but file is not a .flv: {}",
-                            segment.session_id,
-                            segment.index,
-                            segment.path.display()
+                            "Finalized segment {}/{} missing upload — use --retry-upload {} --apply to upload",
+                            segment.session_id, segment.index, segment.session_id
                         ),
                     });
                 }
@@ -413,16 +442,173 @@ pub fn plan_recovery(store: &StateStore) -> AppResult<RecoveryPlan> {
     // 5. Failed pipeline states — require explicit --reset-room
     for (room_id, state) in &pipeline_by_room {
         if *state == PipelineState::Failed {
-            actions.push(RecoveryAction::LeaveAsIs {
-                reason: format!(
-                    "Room {} pipeline stuck in Failed — use --reset-room {} to reset",
-                    room_id, room_id
-                ),
-            });
+            if reset_rooms.contains(room_id) {
+                actions.push(RecoveryAction::ResetRoomPipeline { room_id: *room_id });
+            } else {
+                actions.push(RecoveryAction::LeaveAsIs {
+                    reason: format!(
+                        "Room {} pipeline stuck in Failed — use --reset-room {} to reset",
+                        room_id, room_id
+                    ),
+                });
+            }
         }
     }
 
     Ok(RecoveryPlan { actions })
+}
+
+/// Result of applying a single recovery action.
+#[derive(Debug)]
+pub enum ApplyResult {
+    /// Action was applied successfully.
+    Applied(String),
+    /// Action was skipped (LeaveAsIs or preconditions not met).
+    Skipped(String),
+}
+
+/// Apply a recovery plan by executing each action against the store.
+///
+/// Safety rules:
+/// - MarkInterruptedSegment: only if segment is still Recording.
+/// - ResetRoomPipeline: only if pipeline is still Failed.
+/// - ScheduleUploadReconciliation: only if segment is Finalized, path exists,
+///   path is .flv, and no UploadedPart exists.
+/// - LeaveAsIs: always skipped.
+///
+/// Returns a list of results for each action in the plan.
+pub async fn apply_recovery<U: Uploader>(
+    store: &StateStore,
+    plan: &RecoveryPlan,
+    uploader: Option<&U>,
+) -> AppResult<Vec<ApplyResult>> {
+    let mut results = Vec::new();
+
+    for action in &plan.actions {
+        let result = match action {
+            RecoveryAction::MarkInterruptedSegment { session_id, index } => {
+                // Verify segment is still Recording (idempotency)
+                let segments = store.list_segments(*session_id)?;
+                let segment = segments.iter().find(|s| s.index == *index);
+
+                match segment {
+                    Some(seg) if seg.status == SegmentStatus::Recording => {
+                        let mut updated = seg.clone();
+                        updated.status = SegmentStatus::Failed;
+                        updated.error = Some("Interrupted by hard crash".to_string());
+                        store.put_segment(&updated)?;
+                        ApplyResult::Applied(format!(
+                            "Marked segment {}/{} as Failed",
+                            session_id, index
+                        ))
+                    }
+                    Some(seg) => ApplyResult::Skipped(format!(
+                        "Segment {}/{} is {:?}, not Recording — skipping",
+                        session_id, index, seg.status
+                    )),
+                    None => ApplyResult::Skipped(format!(
+                        "Segment {}/{} not found — skipping",
+                        session_id, index
+                    )),
+                }
+            }
+            RecoveryAction::ResetRoomPipeline { room_id } => {
+                // Verify pipeline is still Failed (idempotency)
+                let current = store.get_pipeline_state(*room_id)?;
+                match current {
+                    Some(PipelineState::Failed) => {
+                        store.put_pipeline_state(*room_id, PipelineState::Idle)?;
+                        ApplyResult::Applied(format!(
+                            "Reset room {} pipeline from Failed to Idle",
+                            room_id
+                        ))
+                    }
+                    Some(other) => ApplyResult::Skipped(format!(
+                        "Room {} pipeline is {:?}, not Failed — skipping",
+                        room_id, other
+                    )),
+                    None => ApplyResult::Skipped(format!(
+                        "Room {} has no pipeline state — skipping",
+                        room_id
+                    )),
+                }
+            }
+            RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index,
+                path,
+            } => {
+                // Re-verify preconditions
+                let segments = store.list_segments(*session_id)?;
+                let segment = segments.iter().find(|s| s.index == *segment_index);
+
+                let skip_reason = if let Some(seg) = segment {
+                    if seg.status != SegmentStatus::Finalized {
+                        Some(format!(
+                            "Segment {}/{} is {:?}, not Finalized",
+                            session_id, segment_index, seg.status
+                        ))
+                    } else if !path.exists() {
+                        Some(format!("File does not exist: {}", path.display()))
+                    } else if !path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
+                    {
+                        Some(format!("File is not a .flv: {}", path.display()))
+                    } else {
+                        // Check if UploadedPart already exists
+                        let parts = store.list_uploaded_parts(*session_id)?;
+                        if parts.iter().any(|p| p.segment_index == *segment_index) {
+                            Some(format!(
+                                "Segment {}/{} already has an UploadedPart",
+                                session_id, segment_index
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    Some(format!(
+                        "Segment {}/{} not found",
+                        session_id, segment_index
+                    ))
+                };
+
+                if let Some(reason) = skip_reason {
+                    ApplyResult::Skipped(reason)
+                } else if let Some(uploader) = uploader {
+                    let req = UploadRequest {
+                        session_id: *session_id,
+                        segment_index: *segment_index,
+                        path: path.clone(),
+                        part_title: format!("Part {}", segment_index),
+                    };
+                    match uploader.upload_segment(req).await {
+                        Ok(part) => {
+                            store.put_uploaded_part(&part)?;
+                            ApplyResult::Applied(format!(
+                                "Uploaded segment {}/{}: {}",
+                                session_id, segment_index, part.bili_filename
+                            ))
+                        }
+                        Err(e) => ApplyResult::Skipped(format!(
+                            "Upload failed for segment {}/{}: {}",
+                            session_id, segment_index, e
+                        )),
+                    }
+                } else {
+                    ApplyResult::Skipped(format!(
+                        "Upload skipped for segment {}/{}: no uploader configured",
+                        session_id, segment_index
+                    ))
+                }
+            }
+            RecoveryAction::LeaveAsIs { reason } => ApplyResult::Skipped(reason.clone()),
+        };
+        results.push(result);
+    }
+
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -896,10 +1082,18 @@ mod tests {
 
     // --- plan_recovery tests ---
 
+    fn empty_reset_rooms() -> HashSet<u64> {
+        HashSet::new()
+    }
+
+    fn empty_retry_uploads() -> HashSet<Uuid> {
+        HashSet::new()
+    }
+
     #[test]
     fn plan_empty_state() {
         let (store, _dir) = test_store();
-        let plan = plan_recovery(&store).unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert!(plan.is_empty());
     }
 
@@ -929,7 +1123,7 @@ mod tests {
             })
             .unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(
             plan.actions[0],
@@ -970,12 +1164,37 @@ mod tests {
             .put_pipeline_state(333, PipelineState::Recording)
             .unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert!(plan.actions.is_empty());
     }
 
     #[test]
-    fn plan_finalized_missing_upload_file_exists() {
+    fn plan_finalized_missing_upload_without_retry_is_leave_as_is() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake flv data").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path,
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert_eq!(plan.actions.len(), 1);
+        assert!(matches!(plan.actions[0], RecoveryAction::LeaveAsIs { .. }));
+        if let RecoveryAction::LeaveAsIs { reason } = &plan.actions[0] {
+            assert!(reason.contains("--retry-upload"));
+        }
+    }
+
+    #[test]
+    fn plan_finalized_missing_upload_with_retry_schedules_upload() {
         let (store, dir) = test_store();
         let session_id = Uuid::new_v4();
         let flv_path = dir.path().join("seg.flv");
@@ -991,7 +1210,9 @@ mod tests {
             })
             .unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let mut retry_uploads = HashSet::new();
+        retry_uploads.insert(session_id);
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &retry_uploads).unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert_eq!(
             plan.actions[0],
@@ -1004,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_finalized_missing_upload_file_missing() {
+    fn plan_finalized_missing_upload_file_missing_with_retry() {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
 
@@ -1018,7 +1239,9 @@ mod tests {
             })
             .unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let mut retry_uploads = HashSet::new();
+        retry_uploads.insert(session_id);
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &retry_uploads).unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert!(matches!(plan.actions[0], RecoveryAction::LeaveAsIs { .. }));
         if let RecoveryAction::LeaveAsIs { reason } = &plan.actions[0] {
@@ -1027,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_finalized_missing_upload_part_file() {
+    fn plan_finalized_missing_upload_part_file_with_retry() {
         let (store, dir) = test_store();
         let session_id = Uuid::new_v4();
         let part_path = dir.path().join("seg.part");
@@ -1043,7 +1266,9 @@ mod tests {
             })
             .unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let mut retry_uploads = HashSet::new();
+        retry_uploads.insert(session_id);
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &retry_uploads).unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert!(matches!(plan.actions[0], RecoveryAction::LeaveAsIs { .. }));
         if let RecoveryAction::LeaveAsIs { reason } = &plan.actions[0] {
@@ -1077,7 +1302,7 @@ mod tests {
             })
             .unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert!(plan.actions.is_empty());
     }
 
@@ -1096,7 +1321,7 @@ mod tests {
             })
             .unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert!(matches!(plan.actions[0], RecoveryAction::LeaveAsIs { .. }));
         if let RecoveryAction::LeaveAsIs { reason } = &plan.actions[0] {
@@ -1119,7 +1344,7 @@ mod tests {
             })
             .unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert!(matches!(plan.actions[0], RecoveryAction::LeaveAsIs { .. }));
         if let RecoveryAction::LeaveAsIs { reason } = &plan.actions[0] {
@@ -1128,17 +1353,33 @@ mod tests {
     }
 
     #[test]
-    fn plan_failed_pipeline_leave_as_is() {
+    fn plan_failed_pipeline_leave_as_is_without_reset() {
         let (store, _dir) = test_store();
 
         store.put_pipeline_state(42, PipelineState::Failed).unwrap();
 
-        let plan = plan_recovery(&store).unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert_eq!(plan.actions.len(), 1);
         assert!(matches!(plan.actions[0], RecoveryAction::LeaveAsIs { .. }));
         if let RecoveryAction::LeaveAsIs { reason } = &plan.actions[0] {
             assert!(reason.contains("--reset-room 42"));
         }
+    }
+
+    #[test]
+    fn plan_failed_pipeline_with_reset_room() {
+        let (store, _dir) = test_store();
+
+        store.put_pipeline_state(42, PipelineState::Failed).unwrap();
+
+        let mut reset_rooms = HashSet::new();
+        reset_rooms.insert(42);
+        let plan = plan_recovery(&store, &reset_rooms, &empty_retry_uploads()).unwrap();
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(
+            plan.actions[0],
+            RecoveryAction::ResetRoomPipeline { room_id: 42 }
+        );
     }
 
     #[test]
@@ -1163,5 +1404,366 @@ mod tests {
     fn plan_display_empty() {
         let plan = RecoveryPlan { actions: vec![] };
         assert_eq!(format!("{}", plan), "No recovery actions needed.");
+    }
+
+    // --- apply_recovery tests ---
+
+    struct FakeUploader;
+
+    impl Uploader for FakeUploader {
+        async fn check_login(&self) -> AppResult<()> {
+            Ok(())
+        }
+        async fn upload_segment(&self, req: UploadRequest) -> AppResult<UploadedPart> {
+            Ok(UploadedPart {
+                session_id: req.session_id,
+                segment_index: req.segment_index,
+                bili_filename: format!("uploaded_{}.flv", req.segment_index),
+                part_title: req.part_title,
+            })
+        }
+        async fn submit(
+            &self,
+            _req: crate::uploader::types::SubmissionRequest,
+        ) -> AppResult<crate::uploader::types::SubmissionResult> {
+            Ok(crate::uploader::types::SubmissionResult {
+                aid: None,
+                bvid: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_mark_interrupted_segment() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let part_path = dir.path().join("test.part");
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: part_path,
+                status: SegmentStatus::Recording,
+                error: None,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::MarkInterruptedSegment {
+                session_id,
+                index: 0,
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Applied(_)));
+
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments[0].status, SegmentStatus::Failed);
+        assert_eq!(
+            segments[0].error.as_deref(),
+            Some("Interrupted by hard crash")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_mark_interrupted_segment_idempotent_already_failed() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let part_path = dir.path().join("test.part");
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: part_path,
+                status: SegmentStatus::Failed,
+                error: Some("already failed".to_string()),
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::MarkInterruptedSegment {
+                session_id,
+                index: 0,
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+
+        // Segment unchanged
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments[0].error.as_deref(), Some("already failed"));
+    }
+
+    #[tokio::test]
+    async fn apply_reset_room_pipeline() {
+        let (store, _dir) = test_store();
+
+        store.put_pipeline_state(42, PipelineState::Failed).unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ResetRoomPipeline { room_id: 42 }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Applied(_)));
+
+        let state = store.get_pipeline_state(42).unwrap();
+        assert_eq!(state, Some(PipelineState::Idle));
+    }
+
+    #[tokio::test]
+    async fn apply_reset_room_pipeline_idempotent_already_idle() {
+        let (store, _dir) = test_store();
+
+        store.put_pipeline_state(42, PipelineState::Idle).unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ResetRoomPipeline { room_id: 42 }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_schedule_upload_reconciliation() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake flv").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path.clone(),
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index: 1,
+                path: flv_path,
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Applied(_)));
+
+        let parts = store.list_uploaded_parts(session_id).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].segment_index, 1);
+        assert_eq!(parts[0].bili_filename, "uploaded_1.flv");
+    }
+
+    #[tokio::test]
+    async fn apply_upload_reconciliation_idempotent_already_uploaded() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake flv").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path.clone(),
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        store
+            .put_uploaded_part(&UploadedPart {
+                session_id,
+                segment_index: 1,
+                bili_filename: "existing.flv".to_string(),
+                part_title: "Part 1".to_string(),
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index: 1,
+                path: flv_path,
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+
+        // UploadedPart unchanged
+        let parts = store.list_uploaded_parts(session_id).unwrap();
+        assert_eq!(parts[0].bili_filename, "existing.flv");
+    }
+
+    #[tokio::test]
+    async fn apply_upload_reconciliation_skips_non_finalized() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let part_path = dir.path().join("seg.part");
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: part_path,
+                status: SegmentStatus::Recording,
+                error: None,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index: 0,
+                path: PathBuf::from("/fake/seg.flv"),
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_leave_as_is_always_skipped() {
+        let (store, _dir) = test_store();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::LeaveAsIs {
+                reason: "test reason".to_string(),
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_empty_plan() {
+        let (store, _dir) = test_store();
+
+        let plan = RecoveryPlan { actions: vec![] };
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_mark_interrupted_without_uploader() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let part_path = dir.path().join("test.part");
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: part_path,
+                status: SegmentStatus::Recording,
+                error: None,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::MarkInterruptedSegment {
+                session_id,
+                index: 0,
+            }],
+        };
+
+        let results = apply_recovery::<FakeUploader>(&store, &plan, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Applied(_)));
+
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments[0].status, SegmentStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn apply_reset_room_without_uploader() {
+        let (store, _dir) = test_store();
+
+        store.put_pipeline_state(42, PipelineState::Failed).unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ResetRoomPipeline { room_id: 42 }],
+        };
+
+        let results = apply_recovery::<FakeUploader>(&store, &plan, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Applied(_)));
+
+        let state = store.get_pipeline_state(42).unwrap();
+        assert_eq!(state, Some(PipelineState::Idle));
+    }
+
+    #[tokio::test]
+    async fn apply_upload_without_uploader_skips() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake flv").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path.clone(),
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index: 1,
+                path: flv_path,
+            }],
+        };
+
+        let results = apply_recovery::<FakeUploader>(&store, &plan, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
     }
 }

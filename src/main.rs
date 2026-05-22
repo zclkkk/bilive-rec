@@ -32,9 +32,11 @@ async fn main() {
         Command::Run { config } => run_cmd(&config).await,
         Command::State { config, action } => match action {
             StateAction::Inspect => state_inspect_cmd(&config),
-            StateAction::Recover { apply, reset_room } => {
-                state_recover_cmd(&config, apply, reset_room)
-            }
+            StateAction::Recover {
+                apply,
+                reset_room,
+                retry_upload,
+            } => state_recover_cmd(&config, apply, reset_room, retry_upload).await,
         },
     };
 
@@ -353,27 +355,94 @@ fn state_inspect_cmd(config_path: &std::path::Path) -> AppResult<()> {
     Ok(())
 }
 
-fn state_recover_cmd(
+async fn state_recover_cmd(
     config_path: &std::path::Path,
     apply: bool,
-    _reset_room: Option<u64>,
+    reset_room: Option<u64>,
+    retry_upload: Option<uuid::Uuid>,
 ) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
     let db_path = config.data.dir.join("state.redb");
     let store = StateStore::open(&db_path)?;
 
-    let plan = state::recovery::plan_recovery(&store)?;
-
-    if apply {
-        eprintln!("recovery apply is not implemented yet (Phase 6C)");
-        eprintln!("dry-run plan shown below:");
-        eprintln!();
+    let mut reset_rooms = std::collections::HashSet::new();
+    if let Some(room) = reset_room {
+        reset_rooms.insert(room);
     }
 
-    if plan.is_empty() {
-        println!("No recovery actions needed.");
+    let mut retry_upload_sessions = std::collections::HashSet::new();
+    if let Some(session) = retry_upload {
+        retry_upload_sessions.insert(session);
+    }
+
+    let plan = state::recovery::plan_recovery(&store, &reset_rooms, &retry_upload_sessions)?;
+
+    if apply {
+        if state::recovery::plan_has_upload_actions(&plan) {
+            // Validate upload config before constructing uploader
+            use bilive_rec::config::SubmitApi;
+            if !matches!(config.upload.submit_api, SubmitApi::App) {
+                return Err(bilive_rec::error::AppError::Config(
+                    "Only 'app' submit API is supported for upload recovery.".into(),
+                ));
+            }
+            if config.upload.threads == 0 {
+                return Err(bilive_rec::error::AppError::Config(
+                    "upload.threads must be greater than 0".into(),
+                ));
+            }
+            if config.upload.line != "auto" && config.upload.line != "bda2" {
+                return Err(bilive_rec::error::AppError::Config(format!(
+                    "Unsupported upload line '{}'. Only 'auto' and 'bda2' are supported.",
+                    config.upload.line
+                )));
+            }
+            if !config.upload.cookie_file.exists() {
+                return Err(bilive_rec::error::AppError::Config(format!(
+                    "Cookie file does not exist: {}",
+                    config.upload.cookie_file.display()
+                )));
+            }
+            if !config.upload.cookie_file.is_file() {
+                return Err(bilive_rec::error::AppError::Config(format!(
+                    "Cookie file path is not a regular file: {}",
+                    config.upload.cookie_file.display()
+                )));
+            }
+
+            let uploader = bilive_rec::uploader::biliup_adapter::BiliupUploader::new(
+                config.upload.cookie_file.clone(),
+                config.upload.line.clone(),
+                config.upload.threads,
+            );
+            use bilive_rec::uploader::types::Uploader;
+            uploader.check_login().await?;
+
+            let results = state::recovery::apply_recovery(&store, &plan, Some(&uploader)).await?;
+            for result in &results {
+                match result {
+                    state::recovery::ApplyResult::Applied(msg) => println!("[applied] {}", msg),
+                    state::recovery::ApplyResult::Skipped(msg) => println!("[skipped] {}", msg),
+                }
+            }
+        } else {
+            // Local-only apply — no uploader needed
+            use bilive_rec::uploader::biliup_adapter::BiliupUploader;
+            let results =
+                state::recovery::apply_recovery::<BiliupUploader>(&store, &plan, None).await?;
+            for result in &results {
+                match result {
+                    state::recovery::ApplyResult::Applied(msg) => println!("[applied] {}", msg),
+                    state::recovery::ApplyResult::Skipped(msg) => println!("[skipped] {}", msg),
+                }
+            }
+        }
     } else {
-        println!("{}", plan);
+        if plan.is_empty() {
+            println!("No recovery actions needed.");
+        } else {
+            println!("{}", plan);
+        }
     }
 
     Ok(())

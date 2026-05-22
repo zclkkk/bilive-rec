@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "bilive-rec", version, about = "Bilibili live stream recorder")]
@@ -77,5 +78,9 @@ pub enum StateAction {
         /// Reset a specific room's pipeline from Failed to Idle
         #[arg(long)]
         reset_room: Option<u64>,
+
+        /// Re-upload finalized segments missing UploadedPart for a specific session
+        #[arg(long)]
+        retry_upload: Option<Uuid>,
     },
 }
