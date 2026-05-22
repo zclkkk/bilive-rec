@@ -75,11 +75,11 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
         ));
     }
 
-    use std::sync::Arc;
-    use tokio::time::Duration;
+    use bilive_rec::pipeline::state_machine::PipelineState;
     use bilive_rec::pipeline::supervisor::RoomSupervisor;
     use bilive_rec::uploader::biliup_adapter::BiliupUploader;
-    use bilive_rec::pipeline::state_machine::PipelineState;
+    use std::sync::Arc;
+    use tokio::time::Duration;
 
     let db_path = config.data.dir.join("state.redb");
     let store = Arc::new(StateStore::open(&db_path)?);
@@ -106,16 +106,17 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
         let uploader = uploader.clone();
         let client = client.clone();
         let app_config = app_config.clone();
-        
+
         let handle = tokio::spawn(async move {
-            let room_id = match bilive_rec::bilibili::room::resolve_room_id(&client, &room_url).await {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::error!("Failed to resolve room URL {}: {}", room_url, e);
-                    return;
-                }
-            };
-            
+            let room_id =
+                match bilive_rec::bilibili::room::resolve_room_id(&client, &room_url).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!("Failed to resolve room URL {}: {}", room_url, e);
+                        return;
+                    }
+                };
+
             let mut supervisor = RoomSupervisor::new(
                 room_id,
                 app_config.pipeline.clone(),
@@ -126,17 +127,24 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
             );
 
             tracing::info!("Started supervisor for room {}", room_id);
-            
+
             loop {
                 if let Err(e) = supervisor.run_step().await {
-                    tracing::error!("Supervisor error for room {}: {}", room_id, e);
+                    tracing::error!("Fatal supervisor error for room {}: {}", room_id, e);
+                    break;
                 }
 
                 let state = supervisor.session.state;
                 let sleep_duration = match state {
-                    PipelineState::Idle => Some(Duration::from_secs(app_config.pipeline.poll_interval_s)),
-                    PipelineState::Failed | PipelineState::Offline => Some(Duration::from_secs(app_config.pipeline.poll_interval_s)),
-                    PipelineState::WaitingReconnect | PipelineState::ReResolving => Some(Duration::from_secs(app_config.pipeline.backoff_s)),
+                    PipelineState::Idle => {
+                        Some(Duration::from_secs(app_config.pipeline.poll_interval_s))
+                    }
+                    PipelineState::Failed | PipelineState::Offline => {
+                        Some(Duration::from_secs(app_config.pipeline.poll_interval_s))
+                    }
+                    PipelineState::WaitingReconnect | PipelineState::ReResolving => {
+                        Some(Duration::from_secs(app_config.pipeline.backoff_s))
+                    }
                     _ => None, // Recording, Uploading blocks/pumps immediately
                 };
 
@@ -145,7 +153,7 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                 }
             }
         });
-        
+
         handles.push(handle);
     }
 

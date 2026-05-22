@@ -1,23 +1,27 @@
 use std::sync::Arc;
-use tokio::task::JoinHandle;
 use std::time::Instant;
-use tracing::{info, error, warn};
-use uuid::Uuid;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::bilibili::client::BiliClient;
 use crate::bilibili::room::fetch_room_info;
-use crate::bilibili::stream::{fetch_play_info, parse_stream_candidates, select_healthy_stream_candidate};
+use crate::bilibili::stream::{
+    fetch_play_info, parse_stream_candidates, select_healthy_stream_candidate,
+};
 use crate::bilibili::types::LiveStatus;
-use crate::config::{PipelineConfig, AppConfig};
-use crate::recorder::segment::SegmentPolicy;
-use crate::error::{AppResult, AppError};
+use crate::config::{AppConfig, PipelineConfig};
+use crate::error::{AppError, AppResult};
 use crate::pipeline::session::PipelineSession;
 use crate::pipeline::state_machine::PipelineState;
-use crate::state::store::StateStore;
-use crate::state::model::{LiveSession, SessionStatus, SegmentStatus, SubmissionStatus, Submission};
-use crate::uploader::types::{Uploader, UploadRequest, SubmissionRequest};
+use crate::recorder::segment::SegmentPolicy;
 use crate::recorder::{record_flv, segment::SegmentEvent};
+use crate::state::model::{
+    LiveSession, SegmentStatus, SessionStatus, Submission, SubmissionStatus,
+};
+use crate::state::store::StateStore;
+use crate::uploader::types::{SubmissionRequest, UploadRequest, Uploader};
 
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim().to_uppercase();
@@ -74,8 +78,8 @@ pub struct RoomSupervisor<U: Uploader + Send + Sync + 'static> {
 
 impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
     pub fn new(
-        room_id: u64, 
-        config: PipelineConfig, 
+        room_id: u64,
+        config: PipelineConfig,
         store: Option<Arc<StateStore>>,
         client: Option<Arc<BiliClient>>,
         uploader: Option<Arc<U>>,
@@ -111,7 +115,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         }
 
         self.session.state = next;
-        
+
         info!(room_id = self.room_id, from = ?prev, to = ?next, "Pipeline state transition");
         Ok(())
     }
@@ -132,7 +136,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                     // Start a brand new session
                                     let session_id = Uuid::new_v4();
                                     self.active_session_id = Some(session_id);
-                                    
+
                                     if let Some(store) = &self.store {
                                         let live_session = LiveSession {
                                             id: session_id,
@@ -178,17 +182,28 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 self.transition(PipelineState::Idle)?;
             }
             PipelineState::Recording => {
-                if let (Some(client), Some(store), Some(active_session), Some(app_config), Some(uploader)) = 
-                    (&self.client, &self.store, self.active_session_id, &self.app_config, &self.uploader) {
-                    
-                    let play_info = match fetch_play_info(client, self.room_id, app_config.record.qn).await {
-                        Ok(info) => info,
-                        Err(e) => {
-                            warn!("fetch_play_info failed: {}", e);
-                            self.transition(PipelineState::WaitingReconnect)?;
-                            return Ok(());
-                        }
-                    };
+                if let (
+                    Some(client),
+                    Some(store),
+                    Some(active_session),
+                    Some(app_config),
+                    Some(uploader),
+                ) = (
+                    &self.client,
+                    &self.store,
+                    self.active_session_id,
+                    &self.app_config,
+                    &self.uploader,
+                ) {
+                    let play_info =
+                        match fetch_play_info(client, self.room_id, app_config.record.qn).await {
+                            Ok(info) => info,
+                            Err(e) => {
+                                warn!("fetch_play_info failed: {}", e);
+                                self.transition(PipelineState::WaitingReconnect)?;
+                                return Ok(());
+                            }
+                        };
 
                     let candidates = match parse_stream_candidates(&play_info) {
                         Ok(c) => c,
@@ -199,7 +214,13 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         }
                     };
 
-                    let cand_opt = match select_healthy_stream_candidate(&candidates, &app_config.record, client).await {
+                    let cand_opt = match select_healthy_stream_candidate(
+                        &candidates,
+                        &app_config.record,
+                        client,
+                    )
+                    .await
+                    {
                         Ok(c) => c,
                         Err(e) => {
                             warn!("No healthy stream candidates: {}", e);
@@ -217,7 +238,11 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         }
                     };
 
-                    let req = client.client().get(&cand.url).header("User-Agent", "Mozilla/5.0").header("Referer", "https://live.bilibili.com/");
+                    let req = client
+                        .client()
+                        .get(&cand.url)
+                        .header("User-Agent", "Mozilla/5.0")
+                        .header("Referer", "https://live.bilibili.com/");
                     let resp = match req.send().await {
                         Ok(r) => r,
                         Err(e) => {
@@ -237,11 +262,16 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SegmentEvent>();
                     let uploader_clone = uploader.clone();
                     let store_clone = store.clone();
-                    
+
                     let handle = tokio::spawn(async move {
                         while let Some(event) = event_rx.recv().await {
                             match event {
-                                SegmentEvent::Finalized { session_id, index, path, size: _ } => {
+                                SegmentEvent::Finalized {
+                                    session_id,
+                                    index,
+                                    path,
+                                    size: _,
+                                } => {
                                     info!("Segment finalized: idx={}, path={:?}", index, path);
                                     let req = UploadRequest {
                                         session_id,
@@ -252,13 +282,18 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                     match uploader_clone.upload_segment(req).await {
                                         Ok(uploaded_part) => {
                                             info!("Upload success for idx={}", index);
-                                            if let Err(e) = store_clone.put_uploaded_part(&uploaded_part) {
+                                            if let Err(e) =
+                                                store_clone.put_uploaded_part(&uploaded_part)
+                                            {
                                                 error!("Failed to persist UploadedPart: {}", e);
                                                 return Err(e);
                                             }
                                         }
                                         Err(e) => {
-                                            error!("Upload segment failed for idx={}: {}", index, e);
+                                            error!(
+                                                "Upload segment failed for idx={}: {}",
+                                                index, e
+                                            );
                                             return Err(e);
                                         }
                                     }
@@ -270,21 +305,36 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         }
                         Ok(())
                     });
-                    
+
                     self.upload_tasks.push(handle);
-                    
+
                     let min_segment_size = parse_size(&app_config.record.min_segment_size)
-                        .ok_or_else(|| AppError::Config(format!("Invalid min_segment_size: {}", app_config.record.min_segment_size)))?;
-                    
+                        .ok_or_else(|| {
+                            AppError::Config(format!(
+                                "Invalid min_segment_size: {}",
+                                app_config.record.min_segment_size
+                            ))
+                        })?;
+
                     let policy = SegmentPolicy {
                         output_dir: app_config.record.output_dir.clone(),
-                        segment_time: app_config.record.segment_time.as_ref().and_then(|s| parse_duration(s)),
-                        segment_size: app_config.record.segment_size.as_ref().and_then(|s| parse_size(s)),
+                        segment_time: app_config
+                            .record
+                            .segment_time
+                            .as_ref()
+                            .and_then(|s| parse_duration(s)),
+                        segment_size: app_config
+                            .record
+                            .segment_size
+                            .as_ref()
+                            .and_then(|s| parse_size(s)),
                         min_segment_size,
                     };
 
                     info!("Starting record_flv from index {}", start_index);
-                    match record_flv(resp, active_session, policy, store, event_tx, start_index).await {
+                    match record_flv(resp, active_session, policy, store, event_tx, start_index)
+                        .await
+                    {
                         Ok(_) => {
                             info!("record_flv completed gracefully");
                             self.transition(PipelineState::WaitingReconnect)?;
@@ -294,10 +344,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             self.transition(PipelineState::WaitingReconnect)?;
                         }
                     }
-
                 } else {
-                    // Test stub behavior
-                    self.transition(PipelineState::WaitingReconnect)?;
+                    return Err(AppError::State(
+                        "Missing required components for Recording".into(),
+                    ));
                 }
             }
             PipelineState::WaitingReconnect => {
@@ -318,17 +368,22 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
             }
             PipelineState::Uploading => {
-                if self.store.is_none() || self.active_session_id.is_none() || self.uploader.is_none() {
-                    return Err(AppError::State("Missing required components for Uploading".into()));
+                if self.store.is_none()
+                    || self.active_session_id.is_none()
+                    || self.uploader.is_none()
+                {
+                    return Err(AppError::State(
+                        "Missing required components for Uploading".into(),
+                    ));
                 }
 
                 // Join all tasks and verify success
                 let tasks = std::mem::take(&mut self.upload_tasks);
                 let mut has_upload_errors = false;
-                
+
                 for task in tasks {
                     match task.await {
-                        Ok(Ok(())) => {},
+                        Ok(Ok(())) => {}
                         Ok(Err(e)) => {
                             error!("Background upload task failed: {}", e);
                             has_upload_errors = true;
@@ -341,14 +396,21 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
 
                 // Reconcile missing uploads from store
-                if let (Some(store), Some(active_session), Some(uploader)) = (&self.store, self.active_session_id, &self.uploader) {
+                if let (Some(store), Some(active_session), Some(uploader)) =
+                    (&self.store, self.active_session_id, &self.uploader)
+                {
                     let segments = store.list_segments(active_session)?;
                     let uploaded_parts = store.list_uploaded_parts(active_session)?;
-                    
-                    let uploaded_indices: std::collections::HashSet<u32> = uploaded_parts.into_iter().map(|p| p.segment_index).collect();
-                    
+
+                    let uploaded_indices: std::collections::HashSet<u32> = uploaded_parts
+                        .into_iter()
+                        .map(|p| p.segment_index)
+                        .collect();
+
                     for seg in segments {
-                        if seg.status == SegmentStatus::Finalized && !uploaded_indices.contains(&seg.index) {
+                        if seg.status == SegmentStatus::Finalized
+                            && !uploaded_indices.contains(&seg.index)
+                        {
                             info!("Reconciling upload for segment index {}", seg.index);
                             let req = UploadRequest {
                                 session_id: active_session,
@@ -364,7 +426,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Reconciled upload failed for index {}: {}", seg.index, e);
+                                    error!(
+                                        "Reconciled upload failed for index {}: {}",
+                                        seg.index, e
+                                    );
                                     has_upload_errors = true;
                                 }
                             }
@@ -379,12 +444,22 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
             }
             PipelineState::Submitting => {
-                if self.store.is_none() || self.active_session_id.is_none() || self.app_config.is_none() || self.uploader.is_none() {
-                    return Err(AppError::State("Missing required components for Submitting".into()));
+                if self.store.is_none()
+                    || self.active_session_id.is_none()
+                    || self.app_config.is_none()
+                    || self.uploader.is_none()
+                {
+                    return Err(AppError::State(
+                        "Missing required components for Submitting".into(),
+                    ));
                 }
 
-                if let (Some(store), Some(active_session), Some(app_config), Some(uploader)) = (&self.store, self.active_session_id, &self.app_config, &self.uploader) {
-                    
+                if let (Some(store), Some(active_session), Some(app_config), Some(uploader)) = (
+                    &self.store,
+                    self.active_session_id,
+                    &self.app_config,
+                    &self.uploader,
+                ) {
                     // Mark LiveSession as finalized
                     if let Some(mut session) = store.get_session(active_session)? {
                         session.status = SessionStatus::Finalized;
@@ -461,8 +536,8 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uploader::types::SubmissionResult;
     use crate::state::model::UploadedPart;
+    use crate::uploader::types::SubmissionResult;
 
     struct FakeUploader;
     impl Uploader for FakeUploader {
@@ -478,7 +553,10 @@ mod tests {
             })
         }
         async fn submit(&self, _req: SubmissionRequest) -> AppResult<SubmissionResult> {
-            Ok(SubmissionResult { aid: Some(1), bvid: Some("bv1".to_string()) })
+            Ok(SubmissionResult {
+                aid: Some(1),
+                bvid: Some("bv1".to_string()),
+            })
         }
     }
 
@@ -513,10 +591,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_submitting_with_empty_parts() {
-        use crate::state::store::StateStore;
         use crate::config::PipelineConfig;
-        
-        let store = std::sync::Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
+        use crate::state::store::StateStore;
+
+        let store = std::sync::Arc::new(
+            StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
+        );
         let config = crate::config::AppConfig {
             data: Default::default(),
             record: Default::default(),
@@ -533,28 +613,37 @@ mod tests {
             pipeline: Default::default(),
             rooms: vec![],
         };
-        let mut supervisor = RoomSupervisor::new(1, PipelineConfig::default(), Some(store.clone()), None, Some(std::sync::Arc::new(FakeUploader)), Some(std::sync::Arc::new(config)));
-        
+        let mut supervisor = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            Some(store.clone()),
+            None,
+            Some(std::sync::Arc::new(FakeUploader)),
+            Some(std::sync::Arc::new(config)),
+        );
+
         // Setup session
         let session_id = uuid::Uuid::new_v4();
         supervisor.active_session_id = Some(session_id);
         supervisor.session.state = PipelineState::Submitting;
-        
+
         let err = supervisor.run_step().await.unwrap_err();
         assert!(matches!(err, AppError::State(_)));
         assert_eq!(supervisor.session.state, PipelineState::Failed);
-        
+
         let sub = store.get_submission(session_id).unwrap().unwrap();
         assert_eq!(sub.status, crate::state::model::SubmissionStatus::Failed);
     }
-    
+
     #[tokio::test]
     async fn test_uploading_reconciles_missing_parts() {
-        use crate::state::store::StateStore;
         use crate::config::PipelineConfig;
-        use crate::state::model::{SegmentStatus, Segment};
-        
-        let store = std::sync::Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
+        use crate::state::model::{Segment, SegmentStatus};
+        use crate::state::store::StateStore;
+
+        let store = std::sync::Arc::new(
+            StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
+        );
         let config = crate::config::AppConfig {
             data: Default::default(),
             record: Default::default(),
@@ -571,27 +660,46 @@ mod tests {
             pipeline: Default::default(),
             rooms: vec![],
         };
-        let mut supervisor = RoomSupervisor::new(1, PipelineConfig::default(), Some(store.clone()), None, Some(std::sync::Arc::new(FakeUploader)), Some(std::sync::Arc::new(config)));
-        
+        let mut supervisor = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            Some(store.clone()),
+            None,
+            Some(std::sync::Arc::new(FakeUploader)),
+            Some(std::sync::Arc::new(config)),
+        );
+
         let session_id = uuid::Uuid::new_v4();
         supervisor.active_session_id = Some(session_id);
         supervisor.session.state = PipelineState::Uploading;
-        
+
         // Add a finalized segment with no uploaded part
-        store.put_segment(&Segment {
-            session_id,
-            index: 1,
-            path: std::path::PathBuf::from("test.flv"),
-            status: SegmentStatus::Finalized,
-            error: None,
-        }).unwrap();
-        
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: std::path::PathBuf::from("test.flv"),
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
         supervisor.run_step().await.unwrap();
-        
+
         // Should have transitioned to Submitting and added uploaded part
         assert_eq!(supervisor.session.state, PipelineState::Submitting);
         let parts = store.list_uploaded_parts(session_id).unwrap();
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].segment_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_recording_missing_components() {
+        let mut supervisor = mock_supervisor();
+        supervisor.session.state = PipelineState::Recording;
+
+        let err = supervisor.run_step().await.unwrap_err();
+        assert!(matches!(err, AppError::State(_)));
+        assert_eq!(supervisor.session.state, PipelineState::Recording);
     }
 }
