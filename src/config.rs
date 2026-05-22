@@ -53,7 +53,7 @@ pub struct RecordConfig {
 impl Default for RecordConfig {
     fn default() -> Self {
         Self {
-            output_dir: PathBuf::from("./recordings"),
+            output_dir: PathBuf::from("./data/recordings"),
             segment_time: None,
             segment_size: None,
             min_segment_size: default_min_segment_size(),
@@ -117,7 +117,7 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn default_output_dir() -> PathBuf {
-    PathBuf::from("./recordings")
+    PathBuf::from("./data/recordings")
 }
 
 fn default_min_segment_size() -> String {
@@ -360,7 +360,7 @@ mod tests {
 dir = "./data"
 
 [record]
-output_dir = "./recordings"
+output_dir = "./data/recordings"
 segment_time = "01:00:00"
 segment_size = "2GiB"
 min_segment_size = "20MiB"
@@ -390,7 +390,7 @@ description = "{streamer} 直播录像\n原直播间：{url}"
         assert_eq!(config.data.dir, std::path::PathBuf::from("./data"));
         assert_eq!(
             config.record.output_dir,
-            std::path::PathBuf::from("./recordings")
+            std::path::PathBuf::from("./data/recordings")
         );
         assert_eq!(config.record.segment_time.as_deref(), Some("01:00:00"));
         assert_eq!(config.record.segment_size.as_deref(), Some("2GiB"));
@@ -442,7 +442,7 @@ cookie_file = "./data/cookies.json"
         assert_eq!(config.data.dir, std::path::PathBuf::from("./data"));
         assert_eq!(
             config.record.output_dir,
-            std::path::PathBuf::from("./recordings")
+            std::path::PathBuf::from("./data/recordings")
         );
         assert!(config.rooms.is_empty());
 
@@ -452,7 +452,7 @@ cookie_file = "./data/cookies.json"
     #[test]
     fn record_config_default_matches_schema_defaults() {
         let config = RecordConfig::default();
-        assert_eq!(config.output_dir, std::path::PathBuf::from("./recordings"));
+        assert_eq!(config.output_dir, std::path::PathBuf::from("./data/recordings"));
         assert_eq!(config.segment_time, None);
         assert_eq!(config.segment_size, None);
         assert_eq!(config.min_segment_size, "20MiB");
