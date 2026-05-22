@@ -204,6 +204,72 @@ impl StateStore {
         Ok(segments)
     }
 
+    pub fn list_all_sessions(&self) -> AppResult<Vec<LiveSession>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SESSIONS)?;
+        let mut sessions = Vec::new();
+        for entry in table.iter()? {
+            let (_, v) = entry?;
+            let session: LiveSession = serde_json::from_slice(v.value())
+                .map_err(|e| AppError::State(format!("deserialize session: {e}")))?;
+            sessions.push(session);
+        }
+        Ok(sessions)
+    }
+
+    pub fn list_all_segments(&self) -> AppResult<Vec<Segment>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SEGMENTS)?;
+        let mut segments = Vec::new();
+        for entry in table.iter()? {
+            let (_, v) = entry?;
+            let segment: Segment = serde_json::from_slice(v.value())
+                .map_err(|e| AppError::State(format!("deserialize segment: {e}")))?;
+            segments.push(segment);
+        }
+        Ok(segments)
+    }
+
+    pub fn list_all_uploaded_parts(&self) -> AppResult<Vec<UploadedPart>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(UPLOADED_PARTS)?;
+        let mut parts = Vec::new();
+        for entry in table.iter()? {
+            let (_, v) = entry?;
+            let part: UploadedPart = serde_json::from_slice(v.value())
+                .map_err(|e| AppError::State(format!("deserialize uploaded part: {e}")))?;
+            parts.push(part);
+        }
+        Ok(parts)
+    }
+
+    pub fn list_all_submissions(&self) -> AppResult<Vec<Submission>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SUBMISSIONS)?;
+        let mut submissions = Vec::new();
+        for entry in table.iter()? {
+            let (_, v) = entry?;
+            let submission: Submission = serde_json::from_slice(v.value())
+                .map_err(|e| AppError::State(format!("deserialize submission: {e}")))?;
+            submissions.push(submission);
+        }
+        Ok(submissions)
+    }
+
+    pub fn list_all_pipeline_states(&self) -> AppResult<Vec<(u64, PipelineState)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(PIPELINE_STATES)?;
+        let mut states = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            let room_id = k.value();
+            let state: PipelineState = serde_json::from_slice(v.value())
+                .map_err(|e| AppError::State(format!("deserialize pipeline state: {e}")))?;
+            states.push((room_id, state));
+        }
+        Ok(states)
+    }
+
     pub fn summary(&self) -> AppResult<StateSummary> {
         let read_txn = self.db.begin_read()?;
         let session_count = {

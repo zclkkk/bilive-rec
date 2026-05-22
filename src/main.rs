@@ -210,11 +210,144 @@ fn state_inspect_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
     let db_path = config.data.dir.join("state.redb");
     let store = StateStore::open(&db_path)?;
+
+    // Schema version
+    let schema_version = store.schema_version()?;
+    println!("=== State Inspection ===");
+    println!("Schema version: {}", schema_version);
+    println!();
+
+    // Summary counts
     let summary = store.summary()?;
-    println!("sessions: {}", summary.session_count);
-    println!("segments: {}", summary.segment_count);
-    println!("uploaded_parts: {}", summary.uploaded_parts_count);
-    println!("submissions: {}", summary.submission_count);
+    println!("Summary:");
+    println!("  sessions: {}", summary.session_count);
+    println!("  segments: {}", summary.segment_count);
+    println!("  uploaded_parts: {}", summary.uploaded_parts_count);
+    println!("  submissions: {}", summary.submission_count);
+    println!();
+
+    // Pipeline states
+    let pipeline_states = store.list_all_pipeline_states()?;
+    if !pipeline_states.is_empty() {
+        println!("Pipeline states:");
+        for (room_id, state) in &pipeline_states {
+            println!("  room {}: {:?}", room_id, state);
+        }
+        println!();
+    }
+
+    // Sessions
+    let sessions = store.list_all_sessions()?;
+    if !sessions.is_empty() {
+        println!("Sessions:");
+        for session in &sessions {
+            println!("  id: {}", session.id);
+            println!("    room_key: {}", session.room_key);
+            println!("    title: {}", session.title);
+            println!("    started_at: {}", session.started_at);
+            println!("    status: {:?}", session.status);
+        }
+        println!();
+    }
+
+    // Segments grouped by session
+    let all_segments = store.list_all_segments()?;
+    if !all_segments.is_empty() {
+        // Group by session_id
+        let mut segments_by_session: std::collections::HashMap<uuid::Uuid, Vec<_>> =
+            std::collections::HashMap::new();
+        for seg in &all_segments {
+            segments_by_session
+                .entry(seg.session_id)
+                .or_default()
+                .push(seg);
+        }
+
+        println!("Segments:");
+        for (session_id, segs) in &segments_by_session {
+            println!("  session {}:", session_id);
+            // Sort by index
+            let mut sorted_segs = segs.clone();
+            sorted_segs.sort_by_key(|s| s.index);
+            for seg in &sorted_segs {
+                print!(
+                    "    index={}: status={:?}, path={}",
+                    seg.index,
+                    seg.status,
+                    seg.path.display()
+                );
+                if let Some(ref err) = seg.error {
+                    print!(", error={}", err);
+                }
+                println!();
+            }
+        }
+        println!();
+    }
+
+    // Uploaded parts grouped by session
+    let all_parts = store.list_all_uploaded_parts()?;
+    if !all_parts.is_empty() {
+        let mut parts_by_session: std::collections::HashMap<uuid::Uuid, Vec<_>> =
+            std::collections::HashMap::new();
+        for part in &all_parts {
+            parts_by_session
+                .entry(part.session_id)
+                .or_default()
+                .push(part);
+        }
+
+        println!("Uploaded parts:");
+        for (session_id, parts) in &parts_by_session {
+            println!("  session {}:", session_id);
+            let mut sorted_parts = parts.clone();
+            sorted_parts.sort_by_key(|p| p.segment_index);
+            for part in &sorted_parts {
+                println!(
+                    "    segment_index={}, bili_filename={}, part_title={}",
+                    part.segment_index, part.bili_filename, part.part_title
+                );
+            }
+        }
+        println!();
+    }
+
+    // Submissions
+    let all_submissions = store.list_all_submissions()?;
+    if !all_submissions.is_empty() {
+        println!("Submissions:");
+        for sub in &all_submissions {
+            print!("  session {}: status={:?}", sub.session_id, sub.status);
+            if let Some(aid) = sub.aid {
+                print!(", aid={}", aid);
+            }
+            if let Some(ref bvid) = sub.bvid {
+                print!(", bvid={}", bvid);
+            }
+            if let Some(ref err) = sub.error {
+                print!(", error={}", err);
+            }
+            println!();
+        }
+        println!();
+    }
+
+    // Anomalies
+    let anomalies = bilive_rec::state::recovery::detect_anomalies(&store)?;
+    if anomalies.is_empty() {
+        println!("No anomalies detected.");
+    } else {
+        println!("Anomalies ({}):", anomalies.len());
+        for anomaly in &anomalies {
+            println!();
+            println!(
+                "  [{}] {}",
+                format!("{:?}", anomaly.kind).to_lowercase(),
+                anomaly.description
+            );
+        }
+    }
+
     Ok(())
 }
 
