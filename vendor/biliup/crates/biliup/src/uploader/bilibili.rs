@@ -146,6 +146,7 @@ pub struct Studio {
     pub extra_fields: Option<HashMap<String, Value>>,
 }
 
+#[cfg(feature = "cli")]
 fn parse_extra_fields(s: &str) -> std::result::Result<HashMap<String, Value>, String> {
     serde_json::from_str(s).map_err(|e| e.to_string())
 }

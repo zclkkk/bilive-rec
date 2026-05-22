@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::pipeline::state_machine::PipelineState;
-use crate::state::model::{LiveSession, Segment, Submission, UploadedPart};
+use crate::state::model::{LiveSession, RoomPipelineState, Segment, Submission, UploadedPart};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
@@ -97,7 +97,12 @@ impl StateStore {
         let key = session.id.to_string();
         let session_value = serde_json::to_vec(session)
             .map_err(|e| AppError::State(format!("serialize session: {e}")))?;
-        let state_value = serde_json::to_vec(&state).map_err(|e| AppError::State(e.to_string()))?;
+        let room_state = RoomPipelineState {
+            state,
+            active_session_id: Some(session.id),
+        };
+        let state_value =
+            serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
 
         let write_txn = self.db.begin_write()?;
         {
@@ -112,10 +117,24 @@ impl StateStore {
     }
 
     pub fn put_pipeline_state(&self, room_id: u64, state: PipelineState) -> AppResult<()> {
+        self.put_room_pipeline_state(room_id, state, None)
+    }
+
+    pub fn put_room_pipeline_state(
+        &self,
+        room_id: u64,
+        state: PipelineState,
+        active_session_id: Option<Uuid>,
+    ) -> AppResult<()> {
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(PIPELINE_STATES)?;
-            let value = serde_json::to_vec(&state).map_err(|e| AppError::State(e.to_string()))?;
+            let room_state = RoomPipelineState {
+                state,
+                active_session_id,
+            };
+            let value =
+                serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
             table.insert(room_id, value.as_slice())?;
         }
         write_txn.commit()?;
@@ -123,39 +142,21 @@ impl StateStore {
     }
 
     pub fn get_pipeline_state(&self, room_id: u64) -> AppResult<Option<PipelineState>> {
+        Ok(self
+            .get_room_pipeline_state(room_id)?
+            .map(|room_state| room_state.state))
+    }
+
+    pub fn get_room_pipeline_state(&self, room_id: u64) -> AppResult<Option<RoomPipelineState>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PIPELINE_STATES)?;
         match table.get(room_id)? {
             Some(v) => {
-                let state: PipelineState = serde_json::from_slice(v.value())
-                    .map_err(|e| AppError::State(e.to_string()))?;
+                let state = decode_room_pipeline_state(v.value())?;
                 Ok(Some(state))
             }
             None => Ok(None),
         }
-    }
-
-    pub fn get_latest_session_for_room(&self, room_id: u64) -> AppResult<Option<LiveSession>> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SESSIONS)?;
-        let mut latest_session: Option<LiveSession> = None;
-        let room_key = room_id.to_string();
-
-        for result in table.iter()? {
-            let (_, v) = result?;
-            let session: LiveSession = serde_json::from_slice(v.value())
-                .map_err(|e| AppError::State(format!("deserialize session: {}", e)))?;
-            if session.room_key == room_key {
-                if let Some(ref current_latest) = latest_session {
-                    if session.started_at > current_latest.started_at {
-                        latest_session = Some(session);
-                    }
-                } else {
-                    latest_session = Some(session);
-                }
-            }
-        }
-        Ok(latest_session)
     }
 
     pub fn get_session(&self, id: Uuid) -> AppResult<Option<LiveSession>> {
@@ -257,14 +258,21 @@ impl StateStore {
     }
 
     pub fn list_all_pipeline_states(&self) -> AppResult<Vec<(u64, PipelineState)>> {
+        Ok(self
+            .list_all_room_pipeline_states()?
+            .into_iter()
+            .map(|(room_id, state)| (room_id, state.state))
+            .collect())
+    }
+
+    pub fn list_all_room_pipeline_states(&self) -> AppResult<Vec<(u64, RoomPipelineState)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(PIPELINE_STATES)?;
         let mut states = Vec::new();
         for entry in table.iter()? {
             let (k, v) = entry?;
             let room_id = k.value();
-            let state: PipelineState = serde_json::from_slice(v.value())
-                .map_err(|e| AppError::State(format!("deserialize pipeline state: {e}")))?;
+            let state = decode_room_pipeline_state(v.value())?;
             states.push((room_id, state));
         }
         Ok(states)
@@ -354,6 +362,19 @@ impl StateStore {
             None => Ok(None),
         }
     }
+}
+
+fn decode_room_pipeline_state(bytes: &[u8]) -> AppResult<RoomPipelineState> {
+    if let Ok(state) = serde_json::from_slice::<RoomPipelineState>(bytes) {
+        return Ok(state);
+    }
+
+    let legacy_state: PipelineState = serde_json::from_slice(bytes)
+        .map_err(|e| AppError::State(format!("deserialize pipeline state: {e}")))?;
+    Ok(RoomPipelineState {
+        state: legacy_state,
+        active_session_id: None,
+    })
 }
 
 #[cfg(test)]
@@ -548,5 +569,19 @@ mod tests {
         store.put_submission(&sub).unwrap();
         let loaded = store.get_submission(session_id).unwrap().unwrap();
         assert_eq!(loaded.aid, Some(123));
+    }
+
+    #[test]
+    fn room_pipeline_state_preserves_active_session_id() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+
+        store
+            .put_room_pipeline_state(42, PipelineState::Recording, Some(session_id))
+            .unwrap();
+
+        let loaded = store.get_room_pipeline_state(42).unwrap().unwrap();
+        assert_eq!(loaded.state, PipelineState::Recording);
+        assert_eq!(loaded.active_session_id, Some(session_id));
     }
 }

@@ -2,9 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::AppResult;
 use crate::pipeline::state_machine::PipelineState;
-use crate::state::model::{SegmentStatus, SessionStatus, SubmissionStatus};
+use crate::state::model::{RoomPipelineState, SegmentStatus, SessionStatus, SubmissionStatus};
 use crate::state::store::StateStore;
-use crate::uploader::types::{UploadRequest, Uploader};
+use crate::uploader::types::Uploader;
+use crate::uploader::validation::{
+    PersistedUploadFailure, upload_and_persist_segment, validate_finalized_segment_for_upload,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnomalyKind {
@@ -24,6 +27,8 @@ pub enum AnomalyKind {
     InterruptedSession,
     /// A pipeline is persisted in an active state after process exit
     ActivePipeline,
+    /// A segment was marked Uploading, so a remote upload may have started
+    AmbiguousUpload,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +58,26 @@ fn is_recording_pipeline_state(state: &PipelineState) -> bool {
     )
 }
 
+fn pipeline_marks_session_active(
+    room_pipeline: Option<&RoomPipelineState>,
+    session_id: uuid::Uuid,
+) -> bool {
+    room_pipeline.is_some_and(|room_pipeline| {
+        is_active_pipeline_state(&room_pipeline.state)
+            && room_pipeline.active_session_id == Some(session_id)
+    })
+}
+
+fn pipeline_marks_session_recording(
+    room_pipeline: Option<&RoomPipelineState>,
+    session_id: uuid::Uuid,
+) -> bool {
+    room_pipeline.is_some_and(|room_pipeline| {
+        is_recording_pipeline_state(&room_pipeline.state)
+            && room_pipeline.active_session_id == Some(session_id)
+    })
+}
+
 /// Detect anomalies in the persisted state.
 ///
 /// This function is read-only and does not mutate any state.
@@ -65,10 +90,10 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
     let segments = store.list_all_segments()?;
     let uploaded_parts = store.list_all_uploaded_parts()?;
     let submissions = store.list_all_submissions()?;
-    let pipeline_states = store.list_all_pipeline_states()?;
+    let pipeline_states = store.list_all_room_pipeline_states()?;
 
     // Build lookup: room_id -> PipelineState
-    let pipeline_by_room: HashMap<u64, PipelineState> = pipeline_states.into_iter().collect();
+    let pipeline_by_room: HashMap<u64, RoomPipelineState> = pipeline_states.into_iter().collect();
 
     // Build lookup: session_id -> set of uploaded segment indices
     let mut uploaded_by_session: HashMap<uuid::Uuid, HashSet<u32>> = HashMap::new();
@@ -94,7 +119,7 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                 .parse::<u64>()
                 .ok()
                 .and_then(|room_id| pipeline_by_room.get(&room_id))
-                .is_some_and(is_active_pipeline_state);
+                .is_some_and(|state| pipeline_marks_session_active(Some(state), session.id));
 
             if !room_active {
                 anomalies.push(Anomaly {
@@ -117,7 +142,9 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                     .get(&segment.session_id)
                     .and_then(|room_key| room_key.parse::<u64>().ok())
                     .and_then(|room_id| pipeline_by_room.get(&room_id))
-                    .is_some_and(is_recording_pipeline_state);
+                    .is_some_and(|state| {
+                        pipeline_marks_session_recording(Some(state), segment.session_id)
+                    });
 
                 if !room_recording {
                     anomalies.push(Anomaly {
@@ -165,8 +192,30 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
             SegmentStatus::Filtered => {
                 // Filtered segments are not anomalies — they were intentionally filtered
             }
-            SegmentStatus::Uploading | SegmentStatus::Uploaded => {
-                // These are in-progress or completed states, not anomalies
+            SegmentStatus::Uploading => {
+                anomalies.push(Anomaly {
+                    kind: AnomalyKind::AmbiguousUpload,
+                    description: format!(
+                        "Segment {}/{} is Uploading — remote upload outcome is unknown, refusing automatic retry",
+                        segment.session_id, segment.index
+                    ),
+                });
+            }
+            SegmentStatus::Uploaded => {
+                let has_upload = uploaded_by_session
+                    .get(&segment.session_id)
+                    .map(|indices| indices.contains(&segment.index))
+                    .unwrap_or(false);
+
+                if !has_upload {
+                    anomalies.push(Anomaly {
+                        kind: AnomalyKind::AmbiguousUpload,
+                        description: format!(
+                            "Segment {}/{} is Uploaded but has no UploadedPart — remote filename is missing",
+                            segment.session_id, segment.index
+                        ),
+                    });
+                }
             }
         }
     }
@@ -200,8 +249,8 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
     }
 
     // Check pipeline states
-    for (room_id, state) in &pipeline_by_room {
-        match state {
+    for (room_id, room_pipeline) in &pipeline_by_room {
+        match room_pipeline.state {
             PipelineState::Failed => {
                 anomalies.push(Anomaly {
                     kind: AnomalyKind::FailedPipeline,
@@ -220,7 +269,7 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                     kind: AnomalyKind::ActivePipeline,
                     description: format!(
                         "Room {} pipeline persisted in {:?} state — likely interrupted by process exit, resumable on restart",
-                        room_id, state
+                        room_id, room_pipeline.state
                     ),
                 });
             }
@@ -353,10 +402,10 @@ pub fn plan_recovery(
     let segments = store.list_all_segments()?;
     let uploaded_parts = store.list_all_uploaded_parts()?;
     let submissions = store.list_all_submissions()?;
-    let pipeline_states = store.list_all_pipeline_states()?;
+    let pipeline_states = store.list_all_room_pipeline_states()?;
 
     // Build lookup: room_id -> PipelineState
-    let pipeline_by_room: HashMap<u64, PipelineState> = pipeline_states.into_iter().collect();
+    let pipeline_by_room: HashMap<u64, RoomPipelineState> = pipeline_states.into_iter().collect();
 
     // Build lookup: session_id -> set of uploaded segment indices
     let mut uploaded_by_session: HashMap<uuid::Uuid, HashSet<u32>> = HashMap::new();
@@ -385,7 +434,7 @@ pub fn plan_recovery(
                 .parse::<u64>()
                 .ok()
                 .and_then(|room_id| pipeline_by_room.get(&room_id))
-                .is_some_and(is_active_pipeline_state);
+                .is_some_and(|state| pipeline_marks_session_active(Some(state), session.id));
 
             if !room_active {
                 actions.push(RecoveryAction::MarkInterruptedSession {
@@ -402,7 +451,9 @@ pub fn plan_recovery(
                 .get(&segment.session_id)
                 .and_then(|room_key| room_key.parse::<u64>().ok())
                 .and_then(|room_id| pipeline_by_room.get(&room_id))
-                .is_some_and(is_recording_pipeline_state);
+                .is_some_and(|state| {
+                    pipeline_marks_session_recording(Some(state), segment.session_id)
+                });
 
             if !room_recording {
                 actions.push(RecoveryAction::MarkInterruptedSegment {
@@ -485,6 +536,29 @@ pub fn plan_recovery(
     }
 
     // 3. Pending submissions — ambiguous, must not auto-retry
+    for segment in &segments {
+        if matches!(
+            segment.status,
+            SegmentStatus::Uploading | SegmentStatus::Uploaded
+        ) {
+            let has_upload = uploaded_by_session
+                .get(&segment.session_id)
+                .map(|indices| indices.contains(&segment.index))
+                .unwrap_or(false);
+            if segment.status == SegmentStatus::Uploading
+                || (segment.status == SegmentStatus::Uploaded && !has_upload)
+            {
+                actions.push(RecoveryAction::LeaveAsIs {
+                    reason: format!(
+                        "Segment {}/{} is {:?} with ambiguous upload state — requires manual verification",
+                        segment.session_id, segment.index, segment.status
+                    ),
+                });
+            }
+        }
+    }
+
+    // 4. Pending submissions — ambiguous, must not auto-retry
     for submission in &submissions {
         if submission.status == SubmissionStatus::Pending {
             actions.push(RecoveryAction::LeaveAsIs {
@@ -496,7 +570,7 @@ pub fn plan_recovery(
         }
     }
 
-    // 4. Failed submissions — must not auto-retry
+    // 5. Failed submissions — must not auto-retry
     for submission in &submissions {
         if submission.status == SubmissionStatus::Failed {
             actions.push(RecoveryAction::LeaveAsIs {
@@ -508,9 +582,9 @@ pub fn plan_recovery(
         }
     }
 
-    // 5. Failed pipeline states — require explicit --reset-room
-    for (room_id, state) in &pipeline_by_room {
-        if *state == PipelineState::Failed {
+    // 6. Failed pipeline states — require explicit --reset-room
+    for (room_id, room_pipeline) in &pipeline_by_room {
+        if room_pipeline.state == PipelineState::Failed {
             if reset_rooms.contains(room_id) {
                 actions.push(RecoveryAction::ResetRoomPipeline { room_id: *room_id });
             } else {
@@ -524,13 +598,13 @@ pub fn plan_recovery(
         }
     }
 
-    // 6. Active pipeline states — informational, may be resumed by run
-    for (room_id, state) in &pipeline_by_room {
-        if is_active_pipeline_state(state) {
+    // 7. Active pipeline states — informational, may be resumed by run
+    for (room_id, room_pipeline) in &pipeline_by_room {
+        if is_active_pipeline_state(&room_pipeline.state) {
             actions.push(RecoveryAction::LeaveAsIs {
                 reason: format!(
                     "Room {} pipeline persisted in {:?} — may be resumed by `bilive-rec run`, no automatic recovery performed",
-                    room_id, state
+                    room_id, room_pipeline.state
                 ),
             });
         }
@@ -553,8 +627,9 @@ pub enum ApplyResult {
 /// Safety rules:
 /// - MarkInterruptedSegment: only if segment is still Recording.
 /// - ResetRoomPipeline: only if pipeline is still Failed.
-/// - ScheduleUploadReconciliation: only if segment is Finalized, path exists,
-///   path is .flv, and no UploadedPart exists.
+/// - ScheduleUploadReconciliation: only if no submission boundary has been crossed,
+///   the persisted segment still matches the action, the file is a regular `.flv`,
+///   and no UploadedPart exists.
 /// - LeaveAsIs: always skipped.
 ///
 /// Returns a list of results for each action in the plan.
@@ -637,92 +712,59 @@ pub async fn apply_recovery<U: Uploader>(
                 segment_index,
                 path,
             } => {
-                // Re-verify submission boundary at apply time
-                if let Some(sub) = store.get_submission(*session_id)? {
-                    let status_word = match sub.status {
-                        SubmissionStatus::Submitted => "Submitted",
-                        SubmissionStatus::Pending => "Pending",
-                        SubmissionStatus::Failed => "Failed",
-                    };
-                    ApplyResult::Skipped(format!(
-                        "Segment {}/{}: session has a {} submission — skipping upload",
-                        session_id, segment_index, status_word
-                    ))
-                } else {
-                    // Re-verify preconditions
-                    let segments = store.list_segments(*session_id)?;
-                    let segment = segments.iter().find(|s| s.index == *segment_index);
-
-                    let skip_reason = if let Some(seg) = segment {
-                        if seg.status != SegmentStatus::Finalized {
-                            Some(format!(
-                                "Segment {}/{} is {:?}, not Finalized",
-                                session_id, segment_index, seg.status
-                            ))
-                        } else if seg.path != *path {
-                            // Fix 3: action path doesn't match persisted path
-                            Some(format!(
-                                "Segment {}/{} path mismatch: action has {}, store has {}",
-                                session_id,
-                                segment_index,
-                                path.display(),
-                                seg.path.display()
-                            ))
-                        } else if !path.exists() {
-                            Some(format!("File does not exist: {}", path.display()))
-                        } else if !path
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
-                        {
-                            Some(format!("File is not a .flv: {}", path.display()))
-                        } else {
-                            // Check if UploadedPart already exists
-                            let parts = store.list_uploaded_parts(*session_id)?;
-                            if parts.iter().any(|p| p.segment_index == *segment_index) {
-                                Some(format!(
-                                    "Segment {}/{} already has an UploadedPart",
-                                    session_id, segment_index
-                                ))
-                            } else {
-                                None
-                            }
-                        }
-                    } else {
-                        Some(format!(
-                            "Segment {}/{} not found",
-                            session_id, segment_index
-                        ))
-                    };
-
-                    if let Some(reason) = skip_reason {
-                        ApplyResult::Skipped(reason)
-                    } else if let Some(uploader) = uploader {
-                        let req = UploadRequest {
-                            session_id: *session_id,
-                            segment_index: *segment_index,
-                            path: path.clone(),
-                            part_title: format!("Part {}", segment_index),
-                        };
-                        match uploader.upload_segment(req).await {
-                            Ok(part) => {
-                                store.put_uploaded_part(&part)?;
-                                ApplyResult::Applied(format!(
+                match validate_finalized_segment_for_upload(
+                    store,
+                    *session_id,
+                    *segment_index,
+                    Some(path),
+                )? {
+                    Err(reason) => ApplyResult::Skipped(format!(
+                        "Segment {}/{}: {}",
+                        session_id, segment_index, reason
+                    )),
+                    Ok(segment) => {
+                        if let Some(uploader) = uploader {
+                            match upload_and_persist_segment(
+                                uploader,
+                                store,
+                                segment,
+                                format!("Part {}", segment_index),
+                            )
+                            .await
+                            {
+                                Ok(part) => ApplyResult::Applied(format!(
                                     "Uploaded segment {}/{}: {}",
                                     session_id, segment_index, part.bili_filename
-                                ))
+                                )),
+                                Err(PersistedUploadFailure::Remote { error, .. }) => {
+                                    ApplyResult::Skipped(format!(
+                                        "Upload failed for segment {}/{}: {}",
+                                        session_id, segment_index, error
+                                    ))
+                                }
+                                Err(PersistedUploadFailure::StateBeforeRemote {
+                                    error, ..
+                                }) => {
+                                    return Err(crate::error::AppError::State(format!(
+                                        "Failed to persist pre-upload state for segment {}/{}: {}",
+                                        session_id, segment_index, error
+                                    )));
+                                }
+                                Err(PersistedUploadFailure::StateAfterRemote { error, .. }) => {
+                                    return Err(crate::error::AppError::State(format!(
+                                        "Remote upload for segment {}/{} may have succeeded, but state persistence failed: {}",
+                                        session_id, segment_index, error
+                                    )));
+                                }
                             }
-                            Err(e) => ApplyResult::Skipped(format!(
-                                "Upload failed for segment {}/{}: {}",
-                                session_id, segment_index, e
-                            )),
+                        } else {
+                            ApplyResult::Skipped(format!(
+                                "Upload skipped for segment {}/{}: no uploader configured",
+                                session_id, segment_index
+                            ))
                         }
-                    } else {
-                        ApplyResult::Skipped(format!(
-                            "Upload skipped for segment {}/{}: no uploader configured",
-                            session_id, segment_index
-                        ))
                     }
-                } // end else (no submission)
+                }
             }
             RecoveryAction::LeaveAsIs { reason } => ApplyResult::Skipped(reason.clone()),
         };
@@ -739,6 +781,7 @@ mod tests {
         LiveSession, Segment, SegmentStatus, SessionStatus, Submission, SubmissionStatus,
         UploadedPart,
     };
+    use crate::uploader::types::UploadRequest;
     use jiff::Timestamp;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -793,7 +836,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_pipeline_state(456, PipelineState::Recording)
+            .put_room_pipeline_state(456, PipelineState::Recording, Some(session_id))
             .unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
@@ -820,7 +863,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_pipeline_state(789, PipelineState::ReResolving)
+            .put_room_pipeline_state(789, PipelineState::ReResolving, Some(session_id))
             .unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
@@ -944,7 +987,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_pipeline_state(333, PipelineState::Recording)
+            .put_room_pipeline_state(333, PipelineState::Recording, Some(session_id))
             .unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
@@ -1201,6 +1244,28 @@ mod tests {
         assert!(anomalies.is_empty());
     }
 
+    #[test]
+    fn detect_uploading_segment_is_ambiguous_upload() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: dir.path().join("segment.flv"),
+                status: SegmentStatus::Uploading,
+                error: None,
+            })
+            .unwrap();
+
+        let anomalies = detect_anomalies(&store).unwrap();
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| a.kind == AnomalyKind::AmbiguousUpload)
+        );
+    }
+
     // --- plan_recovery tests ---
 
     fn empty_reset_rooms() -> HashSet<u64> {
@@ -1283,7 +1348,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_pipeline_state(333, PipelineState::Recording)
+            .put_room_pipeline_state(333, PipelineState::Recording, Some(session_id))
             .unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
@@ -1444,6 +1509,30 @@ mod tests {
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert!(plan.actions.is_empty());
+    }
+
+    #[test]
+    fn plan_uploading_segment_is_left_for_manual_verification() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: dir.path().join("segment.flv"),
+                status: SegmentStatus::Uploading,
+                error: None,
+            })
+            .unwrap();
+
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(plan.actions.iter().any(|action| {
+            matches!(
+                action,
+                RecoveryAction::LeaveAsIs { reason }
+                    if reason.contains("ambiguous upload state")
+            )
+        }));
     }
 
     #[test]
@@ -1944,7 +2033,7 @@ mod tests {
             })
             .unwrap();
         store
-            .put_pipeline_state(456, PipelineState::Recording)
+            .put_room_pipeline_state(456, PipelineState::Recording, Some(session_id))
             .unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::pipeline::state_machine::PipelineState;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSession {
     pub id: Uuid,
@@ -38,6 +40,13 @@ pub struct Submission {
     pub bvid: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomPipelineState {
+    pub state: PipelineState,
+    #[serde(default)]
+    pub active_session_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

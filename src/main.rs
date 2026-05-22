@@ -58,48 +58,11 @@ fn init_tracing() {
 async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     init_tracing();
     let config = AppConfig::load(config_path)?;
+    config.validate_for_run()?;
     tracing::info!("config loaded from {}", config_path.display());
 
-    use bilive_rec::config::SubmitApi;
-    if !matches!(config.upload.submit_api, SubmitApi::App) {
-        return Err(bilive_rec::error::AppError::Config(
-            "Only 'app' submit API is supported for now.".into(),
-        ));
-    }
-
-    if config.upload.line != "auto" && config.upload.line != "bda2" {
-        return Err(bilive_rec::error::AppError::Config(format!(
-            "Unsupported upload line '{}'. Only 'auto' and 'bda2' are supported for now.",
-            config.upload.line
-        )));
-    }
-
-    if config.upload.threads == 0 {
-        return Err(bilive_rec::error::AppError::Config(
-            "upload.threads must be greater than 0".into(),
-        ));
-    }
-
-    if config.rooms.is_empty() {
-        return Err(bilive_rec::error::AppError::Config(
-            "run requires at least one room".into(),
-        ));
-    }
-
-    if config.pipeline.poll_interval_s == 0 {
-        return Err(bilive_rec::error::AppError::Config(
-            "pipeline.poll_interval_s must be greater than 0".into(),
-        ));
-    }
-
-    if config.pipeline.backoff_s == 0 {
-        return Err(bilive_rec::error::AppError::Config(
-            "pipeline.backoff_s must be greater than 0".into(),
-        ));
-    }
-
     use bilive_rec::pipeline::state_machine::PipelineState;
-    use bilive_rec::pipeline::supervisor::RoomSupervisor;
+    use bilive_rec::pipeline::supervisor::{RoomSupervisor, RoomSupervisorDeps};
     use bilive_rec::uploader::biliup_adapter::BiliupUploader;
     use std::sync::Arc;
     use tokio::time::Duration;
@@ -118,7 +81,7 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     tracing::info!("Checking uploader login...");
     uploader.check_login().await?;
 
-    let client = Arc::new(BiliClient::new(None)?);
+    let client = Arc::new(BiliClient::from_cookie_file(&config.upload.cookie_file)?);
     let app_config = Arc::new(config.clone());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -126,7 +89,8 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let mut handles = futures::stream::FuturesUnordered::new();
 
     for room in &config.rooms {
-        let room_url = room.url.clone();
+        let room_config = room.clone();
+        let room_url = room_config.url.clone();
         let store = store_clone.clone();
         let uploader = uploader.clone();
         let client = client.clone();
@@ -149,10 +113,13 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
             let mut supervisor = RoomSupervisor::new(
                 room_id,
                 app_config.pipeline.clone(),
-                Some(store),
-                Some(client),
-                Some(uploader),
-                Some(app_config.clone()),
+                room_config,
+                RoomSupervisorDeps {
+                    store,
+                    client,
+                    uploader,
+                    app_config: app_config.clone(),
+                },
                 shutdown_rx,
             )?;
 
@@ -422,36 +389,7 @@ async fn state_recover_cmd(
 
     if apply {
         if state::recovery::plan_has_upload_actions(&plan) {
-            // Validate upload config before constructing uploader
-            use bilive_rec::config::SubmitApi;
-            if !matches!(config.upload.submit_api, SubmitApi::App) {
-                return Err(bilive_rec::error::AppError::Config(
-                    "Only 'app' submit API is supported for upload recovery.".into(),
-                ));
-            }
-            if config.upload.threads == 0 {
-                return Err(bilive_rec::error::AppError::Config(
-                    "upload.threads must be greater than 0".into(),
-                ));
-            }
-            if config.upload.line != "auto" && config.upload.line != "bda2" {
-                return Err(bilive_rec::error::AppError::Config(format!(
-                    "Unsupported upload line '{}'. Only 'auto' and 'bda2' are supported.",
-                    config.upload.line
-                )));
-            }
-            if !config.upload.cookie_file.exists() {
-                return Err(bilive_rec::error::AppError::Config(format!(
-                    "Cookie file does not exist: {}",
-                    config.upload.cookie_file.display()
-                )));
-            }
-            if !config.upload.cookie_file.is_file() {
-                return Err(bilive_rec::error::AppError::Config(format!(
-                    "Cookie file path is not a regular file: {}",
-                    config.upload.cookie_file.display()
-                )));
-            }
+            config.validate_for_upload_recovery()?;
 
             let uploader = bilive_rec::uploader::biliup_adapter::BiliupUploader::new(
                 config.upload.cookie_file.clone(),
@@ -492,19 +430,26 @@ async fn state_recover_cmd(
 }
 
 async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> AppResult<()> {
-    let record_config = match config_path {
+    let config = match config_path {
         None => {
             let default_path = std::path::Path::new("config.toml");
             if default_path.exists() {
-                AppConfig::load(default_path)?.record
+                Some(AppConfig::load(default_path)?)
             } else {
-                RecordConfig::default()
+                None
             }
         }
-        Some(path) => AppConfig::load(path)?.record,
+        Some(path) => Some(AppConfig::load(path)?),
     };
 
-    let client = BiliClient::new(None)?;
+    let (record_config, client) = if let Some(config) = config {
+        config.validate_for_check()?;
+        let client = BiliClient::from_cookie_file(&config.upload.cookie_file)?;
+        (config.record, client)
+    } else {
+        (RecordConfig::default(), BiliClient::new(None)?)
+    };
+
     let room_id = bilibili::room::resolve_room_id(&client, room_url).await?;
     let room_info = bilibili::room::fetch_room_info(&client, room_id).await?;
 
@@ -558,39 +503,21 @@ async fn upload_cmd(
     use bilive_rec::uploader::types::{SubmissionRequest, UploadRequest, Uploader};
     use uuid::Uuid;
 
-    let upload_config = match config_path {
+    let config = match config_path {
         None => {
             let default_path = std::path::Path::new("config.toml");
             if default_path.exists() {
-                AppConfig::load(default_path)?.upload
+                AppConfig::load(default_path)?
             } else {
                 return Err(bilive_rec::error::AppError::Config(
                     "No config file provided for upload command".into(),
                 ));
             }
         }
-        Some(path) => AppConfig::load(path)?.upload,
+        Some(path) => AppConfig::load(path)?,
     };
-
-    use bilive_rec::config::SubmitApi;
-    if !matches!(upload_config.submit_api, SubmitApi::App) {
-        return Err(bilive_rec::error::AppError::Config(
-            "Only 'app' submit API is supported for now.".into(),
-        ));
-    }
-
-    if upload_config.line != "auto" && upload_config.line != "bda2" {
-        return Err(bilive_rec::error::AppError::Config(format!(
-            "Unsupported upload line '{}'. Only 'auto' and 'bda2' are supported for now.",
-            upload_config.line
-        )));
-    }
-
-    if upload_config.threads == 0 {
-        return Err(bilive_rec::error::AppError::Config(
-            "upload.threads must be greater than 0".into(),
-        ));
-    }
+    config.validate_for_upload()?;
+    let upload_config = config.upload.clone();
 
     if files.is_empty() {
         return Err(bilive_rec::error::AppError::Config(
@@ -611,6 +538,15 @@ async fn upload_cmd(
                 file.display()
             )));
         }
+        if !file
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
+        {
+            return Err(bilive_rec::error::AppError::Config(format!(
+                "Upload file is not a .flv: {}",
+                file.display()
+            )));
+        }
     }
 
     println!("Checking login...");
@@ -622,7 +558,6 @@ async fn upload_cmd(
     uploader.check_login().await?;
 
     // Open store
-    let config = AppConfig::load(config_path.unwrap_or(std::path::Path::new("config.toml")))?;
     let db_path = config.data.dir.join("state.redb");
     let store = StateStore::open(&db_path)?;
 

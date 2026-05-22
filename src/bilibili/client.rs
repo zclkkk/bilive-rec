@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use crate::bilibili::types::{NavResponse, WbiKeys};
@@ -50,6 +51,68 @@ impl BiliClient {
     pub fn client(&self) -> &reqwest::Client {
         &self.client
     }
+
+    pub fn from_cookie_file(path: &Path) -> AppResult<Self> {
+        let cookie = cookie_header_from_file(path)?;
+        Self::new(Some(cookie))
+    }
+}
+
+pub fn cookie_header_from_file(path: &Path) -> AppResult<String> {
+    let content = std::fs::read_to_string(path).map_err(|e| AppError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    let trimmed = content.trim();
+    if trimmed.contains('=') && !trimmed.starts_with('{') {
+        return Ok(trimmed.to_string());
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|e| AppError::Config(e.to_string()))?;
+    let cookies = value
+        .pointer("/cookie_info/cookies")
+        .or_else(|| value.pointer("/cookies"))
+        .and_then(|cookies| cookies.as_array())
+        .ok_or_else(|| {
+            AppError::Config(format!(
+                "cookie file {} does not contain cookie_info.cookies",
+                path.display()
+            ))
+        })?;
+
+    let mut pairs = Vec::new();
+    for cookie in cookies {
+        let name = cookie.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            AppError::Config(format!(
+                "cookie file {} has cookie without name",
+                path.display()
+            ))
+        })?;
+        let value = cookie
+            .get("value")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AppError::Config(format!(
+                    "cookie file {} has cookie {} without value",
+                    path.display(),
+                    name
+                ))
+            })?;
+        pairs.push(format!("{name}={value}"));
+    }
+
+    if pairs.is_empty() {
+        return Err(AppError::Config(format!(
+            "cookie file {} contains no cookies",
+            path.display()
+        )));
+    }
+
+    let header = pairs.join("; ");
+    HeaderValue::from_str(&header)
+        .map_err(|e| AppError::Config(format!("invalid cookie header value: {e}")))?;
+    Ok(header)
 }
 
 fn parse_wbi_keys(resp: &NavResponse) -> AppResult<WbiKeys> {
@@ -105,6 +168,35 @@ mod tests {
         // cookies with invalid ASCII values or control characters
         let client_res = BiliClient::new(Some("SESSDATA=\n".to_string()));
         assert!(client_res.is_err());
+    }
+
+    #[test]
+    fn test_cookie_header_from_biliup_cookie_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            r#"{
+                "cookie_info": {
+                    "cookies": [
+                        {"name": "SESSDATA", "value": "abc"},
+                        {"name": "bili_jct", "value": "def"}
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let header = cookie_header_from_file(file.path()).unwrap();
+        assert_eq!(header, "SESSDATA=abc; bili_jct=def");
+    }
+
+    #[test]
+    fn test_cookie_header_from_raw_cookie_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "SESSDATA=abc; bili_jct=def").unwrap();
+
+        let header = cookie_header_from_file(file.path()).unwrap();
+        assert_eq!(header, "SESSDATA=abc; bili_jct=def");
     }
 
     #[test]

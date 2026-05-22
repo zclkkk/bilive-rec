@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -189,6 +190,165 @@ impl AppConfig {
     pub fn parse(content: &str) -> AppResult<Self> {
         toml::from_str(content).map_err(|e| AppError::Config(e.to_string()))
     }
+
+    pub fn validate_for_run(&self) -> AppResult<()> {
+        if self.rooms.is_empty() {
+            return Err(AppError::Config("run requires at least one room".into()));
+        }
+        self.pipeline.validate()?;
+        self.record.validate()?;
+        self.upload.validate()?;
+        self.upload.validate_cookie_file()
+    }
+
+    pub fn validate_for_upload(&self) -> AppResult<()> {
+        self.upload.validate()?;
+        self.upload.validate_cookie_file()
+    }
+
+    pub fn validate_for_upload_recovery(&self) -> AppResult<()> {
+        self.upload.validate()?;
+        self.upload.validate_cookie_file()
+    }
+
+    pub fn validate_for_check(&self) -> AppResult<()> {
+        self.record.validate()?;
+        self.upload.validate_cookie_file()
+    }
+}
+
+impl RecordConfig {
+    pub fn validate(&self) -> AppResult<()> {
+        self.min_segment_size_bytes()?;
+        self.segment_time_duration()?;
+        self.segment_size_bytes()?;
+        Ok(())
+    }
+
+    pub fn min_segment_size_bytes(&self) -> AppResult<u64> {
+        parse_size_bytes(&self.min_segment_size).ok_or_else(|| {
+            AppError::Config(format!(
+                "Invalid min_segment_size: {}",
+                self.min_segment_size
+            ))
+        })
+    }
+
+    pub fn segment_time_duration(&self) -> AppResult<Option<Duration>> {
+        self.segment_time
+            .as_deref()
+            .map(parse_hms_duration)
+            .transpose()
+    }
+
+    pub fn segment_size_bytes(&self) -> AppResult<Option<u64>> {
+        self.segment_size
+            .as_deref()
+            .map(|value| {
+                parse_size_bytes(value)
+                    .ok_or_else(|| AppError::Config(format!("Invalid segment_size: {value}")))
+            })
+            .transpose()
+    }
+}
+
+impl UploadConfig {
+    pub fn validate(&self) -> AppResult<()> {
+        if !matches!(self.submit_api, SubmitApi::App) {
+            return Err(AppError::Config(
+                "Only 'app' submit API is supported for now.".into(),
+            ));
+        }
+        if self.line != "auto" && self.line != "bda2" {
+            return Err(AppError::Config(format!(
+                "Unsupported upload line '{}'. Only 'auto' and 'bda2' are supported for now.",
+                self.line
+            )));
+        }
+        if self.threads == 0 {
+            return Err(AppError::Config(
+                "upload.threads must be greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_cookie_file(&self) -> AppResult<()> {
+        if !self.cookie_file.exists() {
+            return Err(AppError::Config(format!(
+                "Cookie file does not exist: {}",
+                self.cookie_file.display()
+            )));
+        }
+        if !self.cookie_file.is_file() {
+            return Err(AppError::Config(format!(
+                "Cookie file path is not a regular file: {}",
+                self.cookie_file.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl PipelineConfig {
+    pub fn validate(&self) -> AppResult<()> {
+        if self.poll_interval_s == 0 {
+            return Err(AppError::Config(
+                "pipeline.poll_interval_s must be greater than 0".into(),
+            ));
+        }
+        if self.backoff_s == 0 {
+            return Err(AppError::Config(
+                "pipeline.backoff_s must be greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_size_bytes(value: &str) -> Option<u64> {
+    let s = value.trim().to_uppercase();
+    let mut num_str = s.clone();
+    let mut multiplier = 1;
+    if s.ends_with("GIB") {
+        num_str = s.trim_end_matches("GIB").to_string();
+        multiplier = 1024 * 1024 * 1024;
+    } else if s.ends_with("GB") {
+        num_str = s.trim_end_matches("GB").to_string();
+        multiplier = 1024 * 1024 * 1024;
+    } else if s.ends_with("MIB") {
+        num_str = s.trim_end_matches("MIB").to_string();
+        multiplier = 1024 * 1024;
+    } else if s.ends_with("MB") {
+        num_str = s.trim_end_matches("MB").to_string();
+        multiplier = 1024 * 1024;
+    } else if s.ends_with("KIB") {
+        num_str = s.trim_end_matches("KIB").to_string();
+        multiplier = 1024;
+    } else if s.ends_with("KB") {
+        num_str = s.trim_end_matches("KB").to_string();
+        multiplier = 1024;
+    } else if s.ends_with('B') {
+        num_str = s.trim_end_matches('B').to_string();
+    }
+    num_str.trim().parse::<u64>().ok().map(|n| n * multiplier)
+}
+
+pub fn parse_hms_duration(value: &str) -> AppResult<Duration> {
+    let parts: Vec<&str> = value.split(':').collect();
+    if parts.len() != 3 {
+        return Err(AppError::Config(format!("Invalid segment_time: {value}")));
+    }
+    let h: u64 = parts[0]
+        .parse()
+        .map_err(|_| AppError::Config(format!("Invalid segment_time: {value}")))?;
+    let m: u64 = parts[1]
+        .parse()
+        .map_err(|_| AppError::Config(format!("Invalid segment_time: {value}")))?;
+    let sec: u64 = parts[2]
+        .parse()
+        .map_err(|_| AppError::Config(format!("Invalid segment_time: {value}")))?;
+    Ok(Duration::from_secs(h * 3600 + m * 60 + sec))
 }
 
 #[cfg(test)]
@@ -326,5 +486,35 @@ cookie_file = "./data/cookies.json"
         assert_eq!(json, "\"app\"");
         let s: SubmitApi = serde_json::from_str("\"web\"").unwrap();
         assert!(matches!(s, SubmitApi::Web));
+    }
+
+    #[test]
+    fn record_validation_rejects_invalid_segment_limits() {
+        let mut record = RecordConfig {
+            segment_time: Some("bad".into()),
+            ..RecordConfig::default()
+        };
+        assert!(record.validate().is_err());
+
+        record.segment_time = None;
+        record.segment_size = Some("bad".into());
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn upload_validation_rejects_zero_threads() {
+        let upload = UploadConfig {
+            cookie_file: "cookies.json".into(),
+            line: "auto".into(),
+            threads: 0,
+            submit_api: SubmitApi::App,
+            tid: 171,
+            copyright: 2,
+            source: "source".into(),
+            tags: vec![],
+        };
+
+        let err = upload.validate().unwrap_err();
+        assert!(err.to_string().contains("upload.threads"));
     }
 }
