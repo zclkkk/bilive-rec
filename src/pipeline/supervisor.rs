@@ -166,9 +166,16 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             if info.live_status == LiveStatus::Live {
                                 // Stream is live
                                 if self.session.state == PipelineState::Resolving {
+                                    // Require store to exist
+                                    let store = self.store.as_ref().ok_or_else(|| {
+                                        AppError::State(
+                                            "Missing StateStore for starting recording session"
+                                                .into(),
+                                        )
+                                    })?;
+
                                     // Start a brand new session
                                     let session_id = Uuid::new_v4();
-                                    self.active_session_id = Some(session_id);
 
                                     let live_session = LiveSession {
                                         id: session_id,
@@ -178,13 +185,13 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                         status: SessionStatus::Recording,
                                     };
 
-                                    if let Some(store) = &self.store {
-                                        store.put_session_and_pipeline_state(
-                                            &live_session,
-                                            self.room_id,
-                                            PipelineState::Recording,
-                                        )?;
-                                    }
+                                    store.put_session_and_pipeline_state(
+                                        &live_session,
+                                        self.room_id,
+                                        PipelineState::Recording,
+                                    )?;
+
+                                    self.active_session_id = Some(session_id);
 
                                     let prev = self.session.state;
                                     self.session.state = PipelineState::Recording;
