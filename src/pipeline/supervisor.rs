@@ -15,7 +15,7 @@ use crate::error::{AppResult, AppError};
 use crate::pipeline::session::PipelineSession;
 use crate::pipeline::state_machine::PipelineState;
 use crate::state::store::StateStore;
-use crate::state::model::{LiveSession, SessionStatus, SegmentStatus, SubmissionStatus, Submission, UploadedPart};
+use crate::state::model::{LiveSession, SessionStatus, SegmentStatus, SubmissionStatus, Submission};
 use crate::uploader::types::{Uploader, UploadRequest, SubmissionRequest};
 use crate::recorder::{record_flv, segment::SegmentEvent};
 
@@ -23,12 +23,21 @@ fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim().to_uppercase();
     let mut num_str = s.clone();
     let mut multiplier = 1;
-    if s.ends_with("GB") {
+    if s.ends_with("GIB") {
+        num_str = s.trim_end_matches("GIB").to_string();
+        multiplier = 1024 * 1024 * 1024;
+    } else if s.ends_with("GB") {
         num_str = s.trim_end_matches("GB").to_string();
         multiplier = 1024 * 1024 * 1024;
+    } else if s.ends_with("MIB") {
+        num_str = s.trim_end_matches("MIB").to_string();
+        multiplier = 1024 * 1024;
     } else if s.ends_with("MB") {
         num_str = s.trim_end_matches("MB").to_string();
         multiplier = 1024 * 1024;
+    } else if s.ends_with("KIB") {
+        num_str = s.trim_end_matches("KIB").to_string();
+        multiplier = 1024;
     } else if s.ends_with("KB") {
         num_str = s.trim_end_matches("KB").to_string();
         multiplier = 1024;
@@ -220,8 +229,8 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                     // Compute start_index across all segments
                     let mut start_index = 1;
-                    if let Ok(segments) = store.list_segments(active_session) {
-                        let max_idx = segments.iter().map(|s| s.index).max().unwrap_or(0);
+                    let segments = store.list_segments(active_session)?;
+                    if let Some(max_idx) = segments.iter().map(|s| s.index).max() {
                         start_index = max_idx + 1;
                     }
 
@@ -264,11 +273,14 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     
                     self.upload_tasks.push(handle);
                     
+                    let min_segment_size = parse_size(&app_config.record.min_segment_size)
+                        .ok_or_else(|| AppError::Config(format!("Invalid min_segment_size: {}", app_config.record.min_segment_size)))?;
+                    
                     let policy = SegmentPolicy {
                         output_dir: app_config.record.output_dir.clone(),
                         segment_time: app_config.record.segment_time.as_ref().and_then(|s| parse_duration(s)),
                         segment_size: app_config.record.segment_size.as_ref().and_then(|s| parse_size(s)),
-                        min_segment_size: parse_size(&app_config.record.min_segment_size).unwrap_or(10 * 1024 * 1024),
+                        min_segment_size,
                     };
 
                     info!("Starting record_flv from index {}", start_index);
@@ -306,6 +318,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
             }
             PipelineState::Uploading => {
+                if self.store.is_none() || self.active_session_id.is_none() || self.uploader.is_none() {
+                    return Err(AppError::State("Missing required components for Uploading".into()));
+                }
+
                 // Join all tasks and verify success
                 let tasks = std::mem::take(&mut self.upload_tasks);
                 let mut has_upload_errors = false;
@@ -326,8 +342,8 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                 // Reconcile missing uploads from store
                 if let (Some(store), Some(active_session), Some(uploader)) = (&self.store, self.active_session_id, &self.uploader) {
-                    let segments = store.list_segments(active_session).unwrap_or_default();
-                    let uploaded_parts = store.list_uploaded_parts(active_session).unwrap_or_default();
+                    let segments = store.list_segments(active_session)?;
+                    let uploaded_parts = store.list_uploaded_parts(active_session)?;
                     
                     let uploaded_indices: std::collections::HashSet<u32> = uploaded_parts.into_iter().map(|p| p.segment_index).collect();
                     
@@ -363,16 +379,33 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
             }
             PipelineState::Submitting => {
+                if self.store.is_none() || self.active_session_id.is_none() || self.app_config.is_none() || self.uploader.is_none() {
+                    return Err(AppError::State("Missing required components for Submitting".into()));
+                }
+
                 if let (Some(store), Some(active_session), Some(app_config), Some(uploader)) = (&self.store, self.active_session_id, &self.app_config, &self.uploader) {
                     
                     // Mark LiveSession as finalized
-                    if let Ok(Some(mut session)) = store.get_session(active_session) {
+                    if let Some(mut session) = store.get_session(active_session)? {
                         session.status = SessionStatus::Finalized;
-                        let _ = store.put_session(&session);
+                        store.put_session(&session)?;
                     }
 
-                    let mut parts = store.list_uploaded_parts(active_session).unwrap_or_default();
+                    let mut parts = store.list_uploaded_parts(active_session)?;
                     parts.sort_by_key(|p| p.segment_index);
+
+                    if parts.is_empty() {
+                        let sub = Submission {
+                            session_id: active_session,
+                            status: SubmissionStatus::Failed,
+                            aid: None,
+                            bvid: None,
+                            error: Some("No parts to submit".into()),
+                        };
+                        store.put_submission(&sub)?;
+                        self.transition(PipelineState::Failed)?;
+                        return Err(AppError::State("No parts to submit".into()));
+                    }
 
                     let req = SubmissionRequest {
                         title: "直播录像".to_string(), // Need template in Phase 5C or later
@@ -384,32 +417,30 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         parts,
                     };
 
+                    let mut sub = Submission {
+                        session_id: active_session,
+                        status: SubmissionStatus::Pending,
+                        aid: None,
+                        bvid: None,
+                        error: None,
+                    };
+                    store.put_submission(&sub)?;
+
                     match uploader.submit(req).await {
                         Ok(res) => {
-                            let sub = Submission {
-                                session_id: active_session,
-                                status: SubmissionStatus::Submitted,
-                                aid: res.aid,
-                                bvid: res.bvid,
-                                error: None,
-                            };
-                            let _ = store.put_submission(&sub);
+                            sub.status = SubmissionStatus::Submitted;
+                            sub.aid = res.aid;
+                            sub.bvid = res.bvid;
+                            store.put_submission(&sub)?;
                             self.transition(PipelineState::Submitted)?;
                         }
                         Err(e) => {
-                            let sub = Submission {
-                                session_id: active_session,
-                                status: SubmissionStatus::Failed,
-                                aid: None,
-                                bvid: None,
-                                error: Some(e.to_string()),
-                            };
-                            let _ = store.put_submission(&sub);
+                            sub.status = SubmissionStatus::Failed;
+                            sub.error = Some(e.to_string());
+                            store.put_submission(&sub)?;
                             self.transition(PipelineState::Failed)?;
                         }
                     }
-                } else {
-                    self.transition(PipelineState::Submitted)?;
                 }
             }
             PipelineState::Submitted => {
@@ -430,27 +461,24 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::uploader::types::{SubmissionResult};
+    use crate::uploader::types::SubmissionResult;
+    use crate::state::model::UploadedPart;
 
     struct FakeUploader;
     impl Uploader for FakeUploader {
-        fn check_login(&self) -> impl std::future::Future<Output = AppResult<()>> + Send {
-            async { Ok(()) }
+        async fn check_login(&self) -> AppResult<()> {
+            Ok(())
         }
-        fn upload_segment(&self, req: UploadRequest) -> impl std::future::Future<Output = AppResult<UploadedPart>> + Send {
-            async move {
-                Ok(UploadedPart {
-                    session_id: req.session_id,
-                    segment_index: req.segment_index,
-                    bili_filename: "fake_file".to_string(),
-                    part_title: req.part_title,
-                })
-            }
+        async fn upload_segment(&self, req: UploadRequest) -> AppResult<UploadedPart> {
+            Ok(UploadedPart {
+                session_id: req.session_id,
+                segment_index: req.segment_index,
+                bili_filename: "fake_file".to_string(),
+                part_title: req.part_title,
+            })
         }
-        fn submit(&self, _req: SubmissionRequest) -> impl std::future::Future<Output = AppResult<SubmissionResult>> + Send {
-            async {
-                Ok(SubmissionResult { aid: Some(1), bvid: Some("bv1".to_string()) })
-            }
+        async fn submit(&self, _req: SubmissionRequest) -> AppResult<SubmissionResult> {
+            Ok(SubmissionResult { aid: Some(1), bvid: Some("bv1".to_string()) })
         }
     }
 
@@ -472,5 +500,98 @@ mod tests {
         // Go back to idle
         supervisor.transition(PipelineState::Idle).unwrap();
         assert_eq!(supervisor.session.state, PipelineState::Idle);
+    }
+
+    #[test]
+    fn test_parse_size_variations() {
+        assert_eq!(parse_size("20MiB"), Some(20 * 1024 * 1024));
+        assert_eq!(parse_size("2GiB"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size("10MB"), Some(10 * 1024 * 1024));
+        assert_eq!(parse_size("15KB"), Some(15 * 1024));
+        assert_eq!(parse_size("invalid"), None);
+    }
+
+    #[tokio::test]
+    async fn test_submitting_with_empty_parts() {
+        use crate::state::store::StateStore;
+        use crate::config::PipelineConfig;
+        
+        let store = std::sync::Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
+        let config = crate::config::AppConfig {
+            data: Default::default(),
+            record: Default::default(),
+            upload: crate::config::UploadConfig {
+                cookie_file: "test".into(),
+                line: "auto".into(),
+                threads: 1,
+                submit_api: Default::default(),
+                tid: 171,
+                copyright: 2,
+                source: "source".into(),
+                tags: vec![],
+            },
+            pipeline: Default::default(),
+            rooms: vec![],
+        };
+        let mut supervisor = RoomSupervisor::new(1, PipelineConfig::default(), Some(store.clone()), None, Some(std::sync::Arc::new(FakeUploader)), Some(std::sync::Arc::new(config)));
+        
+        // Setup session
+        let session_id = uuid::Uuid::new_v4();
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+        
+        let err = supervisor.run_step().await.unwrap_err();
+        assert!(matches!(err, AppError::State(_)));
+        assert_eq!(supervisor.session.state, PipelineState::Failed);
+        
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, crate::state::model::SubmissionStatus::Failed);
+    }
+    
+    #[tokio::test]
+    async fn test_uploading_reconciles_missing_parts() {
+        use crate::state::store::StateStore;
+        use crate::config::PipelineConfig;
+        use crate::state::model::{SegmentStatus, Segment};
+        
+        let store = std::sync::Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
+        let config = crate::config::AppConfig {
+            data: Default::default(),
+            record: Default::default(),
+            upload: crate::config::UploadConfig {
+                cookie_file: "test".into(),
+                line: "auto".into(),
+                threads: 1,
+                submit_api: Default::default(),
+                tid: 171,
+                copyright: 2,
+                source: "source".into(),
+                tags: vec![],
+            },
+            pipeline: Default::default(),
+            rooms: vec![],
+        };
+        let mut supervisor = RoomSupervisor::new(1, PipelineConfig::default(), Some(store.clone()), None, Some(std::sync::Arc::new(FakeUploader)), Some(std::sync::Arc::new(config)));
+        
+        let session_id = uuid::Uuid::new_v4();
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Uploading;
+        
+        // Add a finalized segment with no uploaded part
+        store.put_segment(&Segment {
+            session_id,
+            index: 1,
+            path: std::path::PathBuf::from("test.flv"),
+            status: SegmentStatus::Finalized,
+            error: None,
+        }).unwrap();
+        
+        supervisor.run_step().await.unwrap();
+        
+        // Should have transitioned to Submitting and added uploaded part
+        assert_eq!(supervisor.session.state, PipelineState::Submitting);
+        let parts = store.list_uploaded_parts(session_id).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].segment_index, 1);
     }
 }

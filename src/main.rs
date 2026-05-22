@@ -55,6 +55,26 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
     tracing::info!("config loaded from {}", config_path.display());
 
+    use bilive_rec::config::SubmitApi;
+    if !matches!(config.upload.submit_api, SubmitApi::App) {
+        return Err(bilive_rec::error::AppError::Config(
+            "Only 'app' submit API is supported for now.".into(),
+        ));
+    }
+
+    if config.upload.line != "auto" && config.upload.line != "bda2" {
+        return Err(bilive_rec::error::AppError::Config(format!(
+            "Unsupported upload line '{}'. Only 'auto' and 'bda2' are supported for now.",
+            config.upload.line
+        )));
+    }
+
+    if config.upload.threads == 0 {
+        return Err(bilive_rec::error::AppError::Config(
+            "upload.threads must be greater than 0".into(),
+        ));
+    }
+
     use std::sync::Arc;
     use tokio::time::Duration;
     use bilive_rec::pipeline::supervisor::RoomSupervisor;
