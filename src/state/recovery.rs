@@ -22,6 +22,8 @@ pub enum AnomalyKind {
     MissingSegmentFile,
     /// A session is stuck in Recording status (crash interrupted it)
     InterruptedSession,
+    /// A pipeline is persisted in an active state after process exit
+    ActivePipeline,
 }
 
 #[derive(Debug, Clone)]
@@ -199,14 +201,35 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
 
     // Check pipeline states
     for (room_id, state) in &pipeline_by_room {
-        if *state == PipelineState::Failed {
-            anomalies.push(Anomaly {
-                kind: AnomalyKind::FailedPipeline,
-                description: format!(
-                    "Room {} pipeline is stuck in Failed state — requires explicit reset",
-                    room_id
-                ),
-            });
+        match state {
+            PipelineState::Failed => {
+                anomalies.push(Anomaly {
+                    kind: AnomalyKind::FailedPipeline,
+                    description: format!(
+                        "Room {} pipeline is stuck in Failed state — requires explicit reset",
+                        room_id
+                    ),
+                });
+            }
+            PipelineState::Recording
+            | PipelineState::Uploading
+            | PipelineState::Submitting
+            | PipelineState::ReResolving
+            | PipelineState::WaitingReconnect => {
+                anomalies.push(Anomaly {
+                    kind: AnomalyKind::ActivePipeline,
+                    description: format!(
+                        "Room {} pipeline persisted in {:?} state — likely interrupted by process exit, resumable on restart",
+                        room_id, state
+                    ),
+                });
+            }
+            PipelineState::Idle
+            | PipelineState::Resolving
+            | PipelineState::Offline
+            | PipelineState::Submitted => {
+                // Normal or terminal states — not anomalies
+            }
         }
     }
 
@@ -216,6 +239,9 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
 /// A safe recovery action that can be applied to fix persisted state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryAction {
+    /// Mark a LiveSession stuck in Recording as SessionStatus::Failed
+    /// with error "Interrupted by hard crash". Preserves existing data.
+    MarkInterruptedSession { session_id: uuid::Uuid },
     /// Mark a SegmentStatus::Recording segment as SegmentStatus::Failed
     /// with error "Interrupted by hard crash". Leaves .part file on disk.
     MarkInterruptedSegment { session_id: uuid::Uuid, index: u32 },
@@ -236,6 +262,11 @@ pub enum RecoveryAction {
 impl std::fmt::Display for RecoveryAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RecoveryAction::MarkInterruptedSession { session_id } => write!(
+                f,
+                "Would mark session {} as Failed: Interrupted by hard crash",
+                session_id
+            ),
             RecoveryAction::MarkInterruptedSegment { session_id, index } => write!(
                 f,
                 "Would mark segment {}/{} as Failed: Interrupted by hard crash",
@@ -342,6 +373,28 @@ pub fn plan_recovery(
         .map(|s| (s.id, s.room_key.as_str()))
         .collect();
 
+    // Build lookup: session_id -> Submission
+    let submission_by_session: HashMap<uuid::Uuid, &crate::state::model::Submission> =
+        submissions.iter().map(|s| (s.session_id, s)).collect();
+
+    // 0. Interrupted sessions: Recording status with no active pipeline
+    for session in &sessions {
+        if session.status == SessionStatus::Recording {
+            let room_active = session
+                .room_key
+                .parse::<u64>()
+                .ok()
+                .and_then(|room_id| pipeline_by_room.get(&room_id))
+                .is_some_and(is_active_pipeline_state);
+
+            if !room_active {
+                actions.push(RecoveryAction::MarkInterruptedSession {
+                    session_id: session.id,
+                });
+            }
+        }
+    }
+
     // 1. Interrupted segments: Recording status with no active pipeline
     for segment in &segments {
         if segment.status == SegmentStatus::Recording {
@@ -372,6 +425,22 @@ pub fn plan_recovery(
                 let session_requested = retry_upload_sessions.contains(&segment.session_id);
 
                 if session_requested {
+                    // Check submission boundary: refuse if session has a submission
+                    if let Some(sub) = submission_by_session.get(&segment.session_id) {
+                        let status_word = match sub.status {
+                            SubmissionStatus::Submitted => "Submitted",
+                            SubmissionStatus::Pending => "Pending",
+                            SubmissionStatus::Failed => "Failed",
+                        };
+                        actions.push(RecoveryAction::LeaveAsIs {
+                            reason: format!(
+                                "Finalized segment {}/{} missing upload, but session has a {} submission — cannot retry upload",
+                                segment.session_id, segment.index, status_word
+                            ),
+                        });
+                        continue;
+                    }
+
                     // Only schedule upload if the file exists on disk and is .flv
                     if segment.path.exists()
                         && segment
@@ -455,6 +524,18 @@ pub fn plan_recovery(
         }
     }
 
+    // 6. Active pipeline states — informational, may be resumed by run
+    for (room_id, state) in &pipeline_by_room {
+        if is_active_pipeline_state(state) {
+            actions.push(RecoveryAction::LeaveAsIs {
+                reason: format!(
+                    "Room {} pipeline persisted in {:?} — may be resumed by `bilive-rec run`, no automatic recovery performed",
+                    room_id, state
+                ),
+            });
+        }
+    }
+
     Ok(RecoveryPlan { actions })
 }
 
@@ -486,6 +567,24 @@ pub async fn apply_recovery<U: Uploader>(
 
     for action in &plan.actions {
         let result = match action {
+            RecoveryAction::MarkInterruptedSession { session_id } => {
+                // Verify session is still Recording (idempotency)
+                match store.get_session(*session_id)? {
+                    Some(session) if session.status == SessionStatus::Recording => {
+                        let mut updated = session;
+                        updated.status = SessionStatus::Failed;
+                        store.put_session(&updated)?;
+                        ApplyResult::Applied(format!("Marked session {} as Failed", session_id))
+                    }
+                    Some(session) => ApplyResult::Skipped(format!(
+                        "Session {} is {:?}, not Recording — skipping",
+                        session_id, session.status
+                    )),
+                    None => {
+                        ApplyResult::Skipped(format!("Session {} not found — skipping", session_id))
+                    }
+                }
+            }
             RecoveryAction::MarkInterruptedSegment { session_id, index } => {
                 // Verify segment is still Recording (idempotency)
                 let segments = store.list_segments(*session_id)?;
@@ -538,70 +637,92 @@ pub async fn apply_recovery<U: Uploader>(
                 segment_index,
                 path,
             } => {
-                // Re-verify preconditions
-                let segments = store.list_segments(*session_id)?;
-                let segment = segments.iter().find(|s| s.index == *segment_index);
-
-                let skip_reason = if let Some(seg) = segment {
-                    if seg.status != SegmentStatus::Finalized {
-                        Some(format!(
-                            "Segment {}/{} is {:?}, not Finalized",
-                            session_id, segment_index, seg.status
-                        ))
-                    } else if !path.exists() {
-                        Some(format!("File does not exist: {}", path.display()))
-                    } else if !path
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
-                    {
-                        Some(format!("File is not a .flv: {}", path.display()))
-                    } else {
-                        // Check if UploadedPart already exists
-                        let parts = store.list_uploaded_parts(*session_id)?;
-                        if parts.iter().any(|p| p.segment_index == *segment_index) {
-                            Some(format!(
-                                "Segment {}/{} already has an UploadedPart",
-                                session_id, segment_index
-                            ))
-                        } else {
-                            None
-                        }
-                    }
-                } else {
-                    Some(format!(
-                        "Segment {}/{} not found",
-                        session_id, segment_index
-                    ))
-                };
-
-                if let Some(reason) = skip_reason {
-                    ApplyResult::Skipped(reason)
-                } else if let Some(uploader) = uploader {
-                    let req = UploadRequest {
-                        session_id: *session_id,
-                        segment_index: *segment_index,
-                        path: path.clone(),
-                        part_title: format!("Part {}", segment_index),
+                // Re-verify submission boundary at apply time
+                if let Some(sub) = store.get_submission(*session_id)? {
+                    let status_word = match sub.status {
+                        SubmissionStatus::Submitted => "Submitted",
+                        SubmissionStatus::Pending => "Pending",
+                        SubmissionStatus::Failed => "Failed",
                     };
-                    match uploader.upload_segment(req).await {
-                        Ok(part) => {
-                            store.put_uploaded_part(&part)?;
-                            ApplyResult::Applied(format!(
-                                "Uploaded segment {}/{}: {}",
-                                session_id, segment_index, part.bili_filename
-                            ))
-                        }
-                        Err(e) => ApplyResult::Skipped(format!(
-                            "Upload failed for segment {}/{}: {}",
-                            session_id, segment_index, e
-                        )),
-                    }
-                } else {
                     ApplyResult::Skipped(format!(
-                        "Upload skipped for segment {}/{}: no uploader configured",
-                        session_id, segment_index
+                        "Segment {}/{}: session has a {} submission — skipping upload",
+                        session_id, segment_index, status_word
                     ))
-                }
+                } else {
+                    // Re-verify preconditions
+                    let segments = store.list_segments(*session_id)?;
+                    let segment = segments.iter().find(|s| s.index == *segment_index);
+
+                    let skip_reason = if let Some(seg) = segment {
+                        if seg.status != SegmentStatus::Finalized {
+                            Some(format!(
+                                "Segment {}/{} is {:?}, not Finalized",
+                                session_id, segment_index, seg.status
+                            ))
+                        } else if seg.path != *path {
+                            // Fix 3: action path doesn't match persisted path
+                            Some(format!(
+                                "Segment {}/{} path mismatch: action has {}, store has {}",
+                                session_id,
+                                segment_index,
+                                path.display(),
+                                seg.path.display()
+                            ))
+                        } else if !path.exists() {
+                            Some(format!("File does not exist: {}", path.display()))
+                        } else if !path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
+                        {
+                            Some(format!("File is not a .flv: {}", path.display()))
+                        } else {
+                            // Check if UploadedPart already exists
+                            let parts = store.list_uploaded_parts(*session_id)?;
+                            if parts.iter().any(|p| p.segment_index == *segment_index) {
+                                Some(format!(
+                                    "Segment {}/{} already has an UploadedPart",
+                                    session_id, segment_index
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                    } else {
+                        Some(format!(
+                            "Segment {}/{} not found",
+                            session_id, segment_index
+                        ))
+                    };
+
+                    if let Some(reason) = skip_reason {
+                        ApplyResult::Skipped(reason)
+                    } else if let Some(uploader) = uploader {
+                        let req = UploadRequest {
+                            session_id: *session_id,
+                            segment_index: *segment_index,
+                            path: path.clone(),
+                            part_title: format!("Part {}", segment_index),
+                        };
+                        match uploader.upload_segment(req).await {
+                            Ok(part) => {
+                                store.put_uploaded_part(&part)?;
+                                ApplyResult::Applied(format!(
+                                    "Uploaded segment {}/{}: {}",
+                                    session_id, segment_index, part.bili_filename
+                                ))
+                            }
+                            Err(e) => ApplyResult::Skipped(format!(
+                                "Upload failed for segment {}/{}: {}",
+                                session_id, segment_index, e
+                            )),
+                        }
+                    } else {
+                        ApplyResult::Skipped(format!(
+                            "Upload skipped for segment {}/{}: no uploader configured",
+                            session_id, segment_index
+                        ))
+                    }
+                } // end else (no submission)
             }
             RecoveryAction::LeaveAsIs { reason } => ApplyResult::Skipped(reason.clone()),
         };
@@ -1124,14 +1245,15 @@ mod tests {
             .unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
-        assert_eq!(plan.actions.len(), 1);
-        assert_eq!(
-            plan.actions[0],
-            RecoveryAction::MarkInterruptedSegment {
-                session_id,
-                index: 3,
-            }
-        );
+        // Both session and segment are interrupted
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::MarkInterruptedSession { session_id: sid } if *sid == session_id
+        )));
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::MarkInterruptedSegment { session_id: sid, index: 3 } if *sid == session_id
+        )));
     }
 
     #[test]
@@ -1165,7 +1287,25 @@ mod tests {
             .unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
-        assert!(plan.actions.is_empty());
+        // No MarkInterruptedSegment — pipeline is active
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::MarkInterruptedSegment { .. }))
+        );
+        // No MarkInterruptedSession — pipeline is active
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::MarkInterruptedSession { .. }))
+        );
+        // But there IS active pipeline guidance
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("resumed by")
+        )));
     }
 
     #[test]
@@ -1765,5 +1905,585 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], ApplyResult::Skipped(_)));
+    }
+
+    // --- Fix 1: InterruptedSession tests ---
+
+    #[test]
+    fn plan_interrupted_session_produces_action() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_session(&LiveSession {
+                id: session_id,
+                room_key: "123".to_string(),
+                title: "Test".to_string(),
+                started_at: Timestamp::now(),
+                status: SessionStatus::Recording,
+            })
+            .unwrap();
+
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::MarkInterruptedSession { session_id: sid } if *sid == session_id
+        )));
+    }
+
+    #[test]
+    fn plan_active_session_no_action() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_session(&LiveSession {
+                id: session_id,
+                room_key: "456".to_string(),
+                title: "Live".to_string(),
+                started_at: Timestamp::now(),
+                status: SessionStatus::Recording,
+            })
+            .unwrap();
+        store
+            .put_pipeline_state(456, PipelineState::Recording)
+            .unwrap();
+
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::MarkInterruptedSession { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_mark_interrupted_session() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_session(&LiveSession {
+                id: session_id,
+                room_key: "123".to_string(),
+                title: "Test".to_string(),
+                started_at: Timestamp::now(),
+                status: SessionStatus::Recording,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::MarkInterruptedSession { session_id }],
+        };
+
+        let results = apply_recovery::<FakeUploader>(&store, &plan, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Applied(_)));
+
+        let session = store.get_session(session_id).unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn apply_mark_interrupted_session_idempotent() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_session(&LiveSession {
+                id: session_id,
+                room_key: "123".to_string(),
+                title: "Test".to_string(),
+                started_at: Timestamp::now(),
+                status: SessionStatus::Failed,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::MarkInterruptedSession { session_id }],
+        };
+
+        let results = apply_recovery::<FakeUploader>(&store, &plan, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+    }
+
+    // --- Fix 2: ActivePipeline anomaly tests ---
+
+    #[test]
+    fn detect_active_pipeline_recording() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(1, PipelineState::Recording)
+            .unwrap();
+
+        let anomalies = detect_anomalies(&store).unwrap();
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| a.kind == AnomalyKind::ActivePipeline)
+        );
+    }
+
+    #[test]
+    fn detect_active_pipeline_uploading() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(1, PipelineState::Uploading)
+            .unwrap();
+
+        let anomalies = detect_anomalies(&store).unwrap();
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| a.kind == AnomalyKind::ActivePipeline)
+        );
+    }
+
+    #[test]
+    fn detect_active_pipeline_submitting() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(1, PipelineState::Submitting)
+            .unwrap();
+
+        let anomalies = detect_anomalies(&store).unwrap();
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| a.kind == AnomalyKind::ActivePipeline)
+        );
+    }
+
+    #[test]
+    fn detect_active_pipeline_re_resolving() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(1, PipelineState::ReResolving)
+            .unwrap();
+
+        let anomalies = detect_anomalies(&store).unwrap();
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| a.kind == AnomalyKind::ActivePipeline)
+        );
+    }
+
+    #[test]
+    fn detect_active_pipeline_waiting_reconnect() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(1, PipelineState::WaitingReconnect)
+            .unwrap();
+
+        let anomalies = detect_anomalies(&store).unwrap();
+        assert!(
+            anomalies
+                .iter()
+                .any(|a| a.kind == AnomalyKind::ActivePipeline)
+        );
+    }
+
+    #[test]
+    fn detect_idle_pipeline_not_active_anomaly() {
+        let (store, _dir) = test_store();
+        store.put_pipeline_state(1, PipelineState::Idle).unwrap();
+
+        let anomalies = detect_anomalies(&store).unwrap();
+        assert!(
+            !anomalies
+                .iter()
+                .any(|a| a.kind == AnomalyKind::ActivePipeline)
+        );
+    }
+
+    // --- Fix 3: Submission boundary tests ---
+
+    #[test]
+    fn plan_retry_upload_refused_when_submitted() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path,
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Submitted,
+                aid: Some(1),
+                bvid: Some("BV1".into()),
+                error: None,
+            })
+            .unwrap();
+
+        let mut retry_uploads = HashSet::new();
+        retry_uploads.insert(session_id);
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &retry_uploads).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("Submitted submission")
+        )));
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::ScheduleUploadReconciliation { .. }))
+        );
+    }
+
+    #[test]
+    fn plan_retry_upload_refused_when_pending() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path,
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Pending,
+                aid: None,
+                bvid: None,
+                error: None,
+            })
+            .unwrap();
+
+        let mut retry_uploads = HashSet::new();
+        retry_uploads.insert(session_id);
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &retry_uploads).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("Pending submission")
+        )));
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::ScheduleUploadReconciliation { .. }))
+        );
+    }
+
+    #[test]
+    fn plan_retry_upload_refused_when_failed_submission() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path,
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Failed,
+                aid: None,
+                bvid: None,
+                error: Some("timeout".into()),
+            })
+            .unwrap();
+
+        let mut retry_uploads = HashSet::new();
+        retry_uploads.insert(session_id);
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &retry_uploads).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("Failed submission")
+        )));
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, RecoveryAction::ScheduleUploadReconciliation { .. }))
+        );
+    }
+
+    // --- Fix 1: Active pipeline guidance in plan_recovery ---
+
+    #[test]
+    fn plan_active_pipeline_recording_produces_guidance() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(1, PipelineState::Recording)
+            .unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("Recording") && reason.contains("resumed by")
+        )));
+    }
+
+    #[test]
+    fn plan_active_pipeline_uploading_produces_guidance() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(2, PipelineState::Uploading)
+            .unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("Uploading") && reason.contains("resumed by")
+        )));
+    }
+
+    #[test]
+    fn plan_active_pipeline_submitting_produces_guidance() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(3, PipelineState::Submitting)
+            .unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("Submitting") && reason.contains("resumed by")
+        )));
+    }
+
+    #[test]
+    fn plan_active_pipeline_re_resolving_produces_guidance() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(4, PipelineState::ReResolving)
+            .unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("ReResolving") && reason.contains("resumed by")
+        )));
+    }
+
+    #[test]
+    fn plan_active_pipeline_waiting_reconnect_produces_guidance() {
+        let (store, _dir) = test_store();
+        store
+            .put_pipeline_state(5, PipelineState::WaitingReconnect)
+            .unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("WaitingReconnect") && reason.contains("resumed by")
+        )));
+    }
+
+    #[test]
+    fn plan_idle_pipeline_produces_no_active_guidance() {
+        let (store, _dir) = test_store();
+        store.put_pipeline_state(1, PipelineState::Idle).unwrap();
+        let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
+        assert!(!plan.actions.iter().any(|a| matches!(
+            a,
+            RecoveryAction::LeaveAsIs { reason } if reason.contains("resumed by")
+        )));
+    }
+
+    // --- Fix 2: Apply-time submission boundary refusal ---
+
+    #[tokio::test]
+    async fn apply_upload_refused_when_submitted() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake flv").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path.clone(),
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Submitted,
+                aid: Some(1),
+                bvid: Some("BV1".into()),
+                error: None,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index: 1,
+                path: flv_path,
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+        if let ApplyResult::Skipped(msg) = &results[0] {
+            assert!(msg.contains("Submitted submission"));
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_upload_refused_when_pending() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake flv").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path.clone(),
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Pending,
+                aid: None,
+                bvid: None,
+                error: None,
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index: 1,
+                path: flv_path,
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+        if let ApplyResult::Skipped(msg) = &results[0] {
+            assert!(msg.contains("Pending submission"));
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_upload_refused_when_failed_submission() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let flv_path = dir.path().join("seg.flv");
+        std::fs::write(&flv_path, b"fake flv").unwrap();
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: flv_path.clone(),
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Failed,
+                aid: None,
+                bvid: None,
+                error: Some("timeout".into()),
+            })
+            .unwrap();
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index: 1,
+                path: flv_path,
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+        if let ApplyResult::Skipped(msg) = &results[0] {
+            assert!(msg.contains("Failed submission"));
+        }
+    }
+
+    // --- Fix 3: Stale path mismatch ---
+
+    #[tokio::test]
+    async fn apply_upload_skips_when_path_mismatch() {
+        let (store, dir) = test_store();
+        let session_id = Uuid::new_v4();
+        let real_path = dir.path().join("real.flv");
+        let stale_path = dir.path().join("stale.flv");
+        std::fs::write(&real_path, b"real data").unwrap();
+        std::fs::write(&stale_path, b"stale data").unwrap();
+
+        // Store has real_path
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 1,
+                path: real_path,
+                status: SegmentStatus::Finalized,
+                error: None,
+            })
+            .unwrap();
+
+        // Plan has stale_path
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::ScheduleUploadReconciliation {
+                session_id,
+                segment_index: 1,
+                path: stale_path,
+            }],
+        };
+
+        let results = apply_recovery(&store, &plan, Some(&FakeUploader))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ApplyResult::Skipped(_)));
+        if let ApplyResult::Skipped(msg) = &results[0] {
+            assert!(msg.contains("path mismatch"));
+        }
+
+        // Verify no upload happened
+        let parts = store.list_uploaded_parts(session_id).unwrap();
+        assert!(parts.is_empty());
     }
 }
