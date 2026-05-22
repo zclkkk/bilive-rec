@@ -27,14 +27,24 @@ impl RoomSupervisor {
     /// Perform a single state transition, updating internal state and persisting it.
     pub fn transition(&mut self, next: PipelineState) -> AppResult<()> {
         let prev = self.session.state;
-        self.session.transition_to(next)?;
 
-        info!(room_id = self.room_id, from = ?prev, to = ?next, "Pipeline state transition");
+        // 1. Validate the transition is theoretically allowed
+        if !prev.can_transition_to(next) {
+            return Err(crate::error::AppError::State(format!(
+                "Invalid pipeline state transition from {:?} to {:?}",
+                prev, next
+            )));
+        }
 
+        // 2. Persist the new state if we have a store
         if let Some(store) = &self.store {
             store.put_pipeline_state(self.room_id, next)?;
         }
 
+        // 3. Only mutate memory after successful persistence
+        self.session.state = next;
+
+        info!(room_id = self.room_id, from = ?prev, to = ?next, "Pipeline state transition");
         Ok(())
     }
 
