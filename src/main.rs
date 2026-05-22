@@ -98,7 +98,7 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let client = Arc::new(BiliClient::new(None)?);
     let app_config = Arc::new(config.clone());
 
-    let mut handles = Vec::new();
+    let mut handles = futures::stream::FuturesUnordered::new();
 
     for room in &config.rooms {
         let room_url = room.url.clone();
@@ -112,8 +112,10 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                 match bilive_rec::bilibili::room::resolve_room_id(&client, &room_url).await {
                     Ok(id) => id,
                     Err(e) => {
-                        tracing::error!("Failed to resolve room URL {}: {}", room_url, e);
-                        return;
+                        return Err(bilive_rec::error::AppError::Bilibili(format!(
+                            "Failed to resolve room URL {}: {}",
+                            room_url, e
+                        )));
                     }
                 };
 
@@ -124,14 +126,14 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                 Some(client),
                 Some(uploader),
                 Some(app_config.clone()),
-            );
+            )?;
 
             tracing::info!("Started supervisor for room {}", room_id);
 
             loop {
                 if let Err(e) = supervisor.run_step().await {
                     tracing::error!("Fatal supervisor error for room {}: {}", room_id, e);
-                    break;
+                    return Err(e);
                 }
 
                 let state = supervisor.session.state;
@@ -152,15 +154,33 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                     tokio::time::sleep(d).await;
                 }
             }
+            #[allow(unreachable_code)]
+            Ok::<(), bilive_rec::error::AppError>(())
         });
 
         handles.push(handle);
     }
 
-    // Wait for ctrl-c
+    use futures::StreamExt;
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Ctrl-C received, shutting down supervisors...");
+        }
+        res = handles.next() => {
+            match res {
+                Some(Ok(Ok(()))) => {
+                    return Err(bilive_rec::error::AppError::State("Room task exited unexpectedly with Ok(())".into()));
+                }
+                Some(Ok(Err(e))) => {
+                    return Err(e);
+                }
+                Some(Err(join_err)) => {
+                    return Err(bilive_rec::error::AppError::State(format!("Room task panicked or joined with error: {}", join_err)));
+                }
+                None => {
+                    tracing::info!("All room tasks finished.");
+                }
+            }
         }
     }
 

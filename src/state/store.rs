@@ -112,6 +112,29 @@ impl StateStore {
         }
     }
 
+    pub fn get_latest_session_for_room(&self, room_id: u64) -> AppResult<Option<LiveSession>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SESSIONS)?;
+        let mut latest_session: Option<LiveSession> = None;
+        let room_key = room_id.to_string();
+
+        for result in table.iter()? {
+            let (_, v) = result?;
+            let session: LiveSession = serde_json::from_slice(v.value())
+                .map_err(|e| AppError::State(format!("deserialize session: {}", e)))?;
+            if session.room_key == room_key {
+                if let Some(ref current_latest) = latest_session {
+                    if session.started_at > current_latest.started_at {
+                        latest_session = Some(session);
+                    }
+                } else {
+                    latest_session = Some(session);
+                }
+            }
+        }
+        Ok(latest_session)
+    }
+
     pub fn get_session(&self, id: Uuid) -> AppResult<Option<LiveSession>> {
         let key = id.to_string();
         let read_txn = self.db.begin_read()?;

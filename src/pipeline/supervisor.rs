@@ -84,19 +84,41 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         client: Option<Arc<BiliClient>>,
         uploader: Option<Arc<U>>,
         app_config: Option<Arc<AppConfig>>,
-    ) -> Self {
-        Self {
+    ) -> AppResult<Self> {
+        let mut supervisor = Self {
             room_id,
             session: PipelineSession::new(room_id),
             config,
-            store,
+            store: store.clone(),
             client,
             uploader,
             active_session_id: None,
             upload_tasks: Vec::new(),
             offline_since: None,
             app_config,
+        };
+
+        if let Some(store) = store {
+            #[allow(clippy::collapsible_if)]
+            if let Some(state) = store.get_pipeline_state(room_id)? {
+                supervisor.session.state = state;
+                
+                match state {
+                    PipelineState::Recording | PipelineState::WaitingReconnect | PipelineState::ReResolving | PipelineState::Uploading | PipelineState::Submitting => {
+                        if let Some(session) = store.get_latest_session_for_room(room_id)? {
+                            supervisor.active_session_id = Some(session.id);
+                        } else {
+                            return Err(AppError::State(format!("Persisted pipeline state {:?} requires an active session, but none was found.", state)));
+                        }
+                    },
+                    PipelineState::Idle | PipelineState::Resolving | PipelineState::Offline | PipelineState::Submitted | PipelineState::Failed => {
+                        // no active session required, or explicit reset expected
+                    }
+                }
+            }
         }
+        
+        Ok(supervisor)
     }
 
     /// Perform a single state transition, updating internal state and persisting it.
@@ -170,12 +192,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         }
                     }
                 } else {
-                    // Test stubs
-                    if self.session.state == PipelineState::Resolving {
-                        self.transition(PipelineState::Recording)?;
-                    } else {
-                        self.transition(PipelineState::WaitingReconnect)?;
-                    }
+                    return Err(AppError::State("Missing required Bilibili client".into()));
                 }
             }
             PipelineState::Offline => {
@@ -396,37 +413,35 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     ));
                 }
 
-                // Join all tasks and verify success
+                // Join all tasks and treat failures as warnings to be reconciled
                 let tasks = std::mem::take(&mut self.upload_tasks);
-                let mut has_upload_errors = false;
 
                 for task in tasks {
                     match task.await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
-                            error!("Background upload task failed: {}", e);
-                            has_upload_errors = true;
+                            warn!("Background upload task failed (will reconcile): {}", e);
                         }
                         Err(e) => {
-                            error!("Background upload task panicked: {}", e);
-                            has_upload_errors = true;
+                            warn!("Background upload task panicked (will reconcile): {}", e);
                         }
                     }
                 }
 
                 // Reconcile missing uploads from store
+                let mut reconciliation_failed = false;
                 if let (Some(store), Some(active_session), Some(uploader)) =
                     (&self.store, self.active_session_id, &self.uploader)
                 {
                     let segments = store.list_segments(active_session)?;
                     let uploaded_parts = store.list_uploaded_parts(active_session)?;
 
-                    let uploaded_indices: std::collections::HashSet<u32> = uploaded_parts
+                    let mut uploaded_indices: std::collections::HashSet<u32> = uploaded_parts
                         .into_iter()
                         .map(|p| p.segment_index)
                         .collect();
 
-                    for seg in segments {
+                    for seg in &segments {
                         if seg.status == SegmentStatus::Finalized
                             && !uploaded_indices.contains(&seg.index)
                         {
@@ -441,7 +456,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                 Ok(part) => {
                                     if let Err(e) = store.put_uploaded_part(&part) {
                                         error!("Failed to persist reconciled UploadedPart: {}", e);
-                                        has_upload_errors = true;
+                                        reconciliation_failed = true;
+                                    } else {
+                                        uploaded_indices.insert(seg.index);
                                     }
                                 }
                                 Err(e) => {
@@ -449,14 +466,34 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                         "Reconciled upload failed for index {}: {}",
                                         seg.index, e
                                     );
-                                    has_upload_errors = true;
+                                    reconciliation_failed = true;
                                 }
                             }
                         }
                     }
+
+                    // Final check by re-reading
+                    let final_parts = store.list_uploaded_parts(active_session)?;
+                    let final_indices: std::collections::HashSet<u32> = final_parts
+                        .into_iter()
+                        .map(|p| p.segment_index)
+                        .collect();
+
+                    for seg in &segments {
+                        if seg.status == SegmentStatus::Finalized
+                            && !final_indices.contains(&seg.index)
+                        {
+                            error!("Segment {} is finalized but still lacks UploadedPart after reconciliation", seg.index);
+                            reconciliation_failed = true;
+                        }
+                    }
+                } else {
+                    return Err(AppError::State(
+                        "Missing required components for reconciliation".into(),
+                    ));
                 }
 
-                if has_upload_errors {
+                if reconciliation_failed {
                     self.transition(PipelineState::Failed)?;
                 } else {
                     self.transition(PipelineState::Submitting)?;
@@ -543,9 +580,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 self.transition(PipelineState::Idle)?;
             }
             PipelineState::Failed => {
-                self.active_session_id = None;
-                self.offline_since = None;
-                self.transition(PipelineState::Idle)?;
+                // Leave Failed for Phase 6 manual intervention / recovery
             }
         }
         Ok(())
@@ -580,7 +615,7 @@ mod tests {
     }
 
     fn mock_supervisor() -> RoomSupervisor<FakeUploader> {
-        RoomSupervisor::new(1, PipelineConfig::default(), None, None, None, None)
+        RoomSupervisor::new(1, PipelineConfig::default(), None, None, None, None).unwrap()
     }
 
     #[test]
@@ -652,7 +687,7 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader)),
             Some(std::sync::Arc::new(config)),
-        );
+        ).unwrap();
 
         // Setup session
         let session_id = uuid::Uuid::new_v4();
@@ -699,7 +734,7 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader)),
             Some(std::sync::Arc::new(config)),
-        );
+        ).unwrap();
 
         let session_id = uuid::Uuid::new_v4();
         supervisor.active_session_id = Some(session_id);
@@ -769,7 +804,7 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader)),
             Some(std::sync::Arc::new(config.clone())),
-        );
+        ).unwrap();
 
         supervisor.session.state = PipelineState::Recording;
         supervisor.active_session_id = Some(uuid::Uuid::new_v4());
@@ -787,7 +822,7 @@ mod tests {
             None,
             Some(std::sync::Arc::new(FakeUploader)),
             Some(std::sync::Arc::new(config)),
-        );
+        ).unwrap();
         supervisor2.session.state = PipelineState::Recording;
         supervisor2.active_session_id = Some(uuid::Uuid::new_v4());
         supervisor2.client = Some(std::sync::Arc::new(BiliClient::new(None).unwrap()));
