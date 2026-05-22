@@ -1168,16 +1168,143 @@ Acceptance:
 
 Goal: make failures boring.
 
-Tasks:
+Phase 6 focuses on making persisted state observable, recovery actions explicit
+and safe, and shutdown behavior honest. Recovery must never hide data loss,
+silently retry ambiguous submissions, or upload incomplete files.
 
-- Implement `state inspect`.
-- Implement `state recover`.
-- Handle interrupted `.part` files.
-- Retry finalized but unuploaded segments.
+### Safety Rules
+
+- `state inspect` must be read-only.
+- `state recover` must default to dry-run / plan-only behavior.
+- Any mutation must require explicit user intent, such as `--apply`.
+- Recovery actions must be idempotent.
+- Do not auto-retry `SubmissionStatus::Pending`.
+- Do not blindly retry `SubmissionStatus::Failed`.
+- Do not upload incomplete `.part` files.
+- Do not delete or rename user data by default.
+- Do not hide `Failed` states by silently resetting them to `Idle`.
+- Preserve failed states and error messages until an explicit recovery action is
+  requested.
+- Graceful shutdown must not pretend an incomplete recording is finalized.
+
+### Tasks
+
+- Improve `state inspect`.
+- Implement safe `state recover` dry-run planning.
+- Implement explicit recovery apply actions for safe cases.
+- Handle interrupted `.part` files conservatively.
+- Retry finalized but unuploaded segments only through explicit, inspectable
+  recovery flow.
 - Preserve failed states with error messages.
 - Add signal handling for graceful shutdown.
 
-Acceptance:
+### State Inspection
+
+`bilive-rec state inspect` must provide a useful human-readable view of the
+persisted runtime state.
+
+It should show:
+
+- schema version
+- pipeline states by room ID
+- sessions:
+  - session ID
+  - room key
+  - title
+  - started time
+  - status
+- segments grouped by session:
+  - index
+  - status
+  - path
+  - error if present
+- uploaded parts grouped by session:
+  - segment index
+  - Bilibili filename
+  - part title
+- submissions:
+  - session ID
+  - status
+  - aid/bvid if present
+  - error if present
+- detected anomalies and suggested recovery actions
+
+Examples of anomalies:
+
+- `SegmentStatus::Recording` left behind by crash
+- `.part` files referenced by interrupted or failed segments
+- finalized segments missing `UploadedPart`
+- pending submissions
+- failed submissions
+- rooms stuck in failed pipeline state
+
+`state inspect` must not mutate redb, touch files, call Bilibili APIs, upload,
+or submit.
+
+### Recovery Dry Run
+
+`bilive-rec state recover` without mutation flags must be dry-run only.
+
+It should print planned actions, such as:
+
+```text
+Would mark segment <session>/<index> as Failed: Interrupted by hard crash
+Would leave pending submission <session> unchanged: requires manual verification
+Would leave failed pipeline state for room <room_id> unchanged: use explicit reset
+````
+
+Default recovery must not write to redb, rename files, delete files, upload, or
+submit.
+
+### Recovery Apply
+
+Mutating recovery must require explicit flags.
+
+Safe apply actions may include:
+
+* marking interrupted `SegmentStatus::Recording` segments as
+  `SegmentStatus::Failed` with an error such as `"Interrupted by hard crash"`
+* leaving the referenced `.part` file on disk unchanged
+* resetting a failed room pipeline state to `Idle` only through an explicit room
+  target and only when the user accepts that old failure is not being retried
+* moving a room back to `Uploading` only for upload reconciliation of finalized
+  segments missing `UploadedPart`
+
+Unsafe or ambiguous actions must be refused unless future remote verification is
+implemented:
+
+* automatically retrying `SubmissionStatus::Pending`
+* automatically retrying ambiguous `SubmissionStatus::Failed`
+* uploading incomplete `.part`
+* deleting or renaming incomplete files
+
+If a manual failed-submit retry is later added, it must require explicit
+confirmation that the user has checked Bilibili and confirmed there is no remote
+submission, for example:
+
+```bash
+bilive-rec state recover --retry-submit <SESSION_ID> --i-confirm-no-remote-submission
+```
+
+This action must not be implemented as an automatic default.
+
+### Graceful Shutdown
+
+Graceful shutdown should be implemented only after inspect and recovery behavior
+is useful enough to diagnose interrupted state.
+
+On Ctrl-C or shutdown:
+
+* notify room supervisors to stop
+* do not blindly rename active `.part` files to `.flv`
+* only finalize a segment if the recorder can prove it is complete and valid
+* otherwise leave incomplete `.part` files untouched and persist an inspectable
+  failed/interrupted state
+* do not upload incomplete segments
+* do not transition to `Idle` in a way that hides unfinished upload, submit, or
+  failed state
+
+### Acceptance
 
 ```bash
 bilive-rec state inspect
@@ -1185,3 +1312,17 @@ bilive-rec state recover
 ```
 
 Both commands must be useful and safe.
+
+Specific acceptance requirements:
+
+* `state inspect` can explain stuck Recording, Uploading, Submitting, and Failed
+  states without opening redb manually.
+* `state inspect` is read-only.
+* `state recover` without flags is dry-run only.
+* `state recover --apply` mutates only explicitly safe and idempotent state.
+* interrupted `.part` files are not uploaded, deleted, or blindly finalized.
+* pending submissions are not retried automatically.
+* failed submissions are not retried automatically.
+* failed pipeline states are not silently hidden.
+* graceful shutdown does not corrupt segment state or misrepresent incomplete
+  files as finalized recordings.
