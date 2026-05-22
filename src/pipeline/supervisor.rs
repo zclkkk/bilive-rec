@@ -195,6 +195,35 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     &self.app_config,
                     &self.uploader,
                 ) {
+                    let min_segment_size = parse_size(&app_config.record.min_segment_size)
+                        .ok_or_else(|| {
+                            AppError::Config(format!(
+                                "Invalid min_segment_size: {}",
+                                app_config.record.min_segment_size
+                            ))
+                        })?;
+
+                    let segment_time = match &app_config.record.segment_time {
+                        Some(s) => Some(parse_duration(s).ok_or_else(|| {
+                            AppError::Config(format!("Invalid segment_time: {}", s))
+                        })?),
+                        None => None,
+                    };
+
+                    let segment_size = match &app_config.record.segment_size {
+                        Some(s) => Some(parse_size(s).ok_or_else(|| {
+                            AppError::Config(format!("Invalid segment_size: {}", s))
+                        })?),
+                        None => None,
+                    };
+
+                    let policy = SegmentPolicy {
+                        output_dir: app_config.record.output_dir.clone(),
+                        segment_time,
+                        segment_size,
+                        min_segment_size,
+                    };
+
                     let play_info =
                         match fetch_play_info(client, self.room_id, app_config.record.qn).await {
                             Ok(info) => info,
@@ -308,29 +337,6 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                     self.upload_tasks.push(handle);
 
-                    let min_segment_size = parse_size(&app_config.record.min_segment_size)
-                        .ok_or_else(|| {
-                            AppError::Config(format!(
-                                "Invalid min_segment_size: {}",
-                                app_config.record.min_segment_size
-                            ))
-                        })?;
-
-                    let policy = SegmentPolicy {
-                        output_dir: app_config.record.output_dir.clone(),
-                        segment_time: app_config
-                            .record
-                            .segment_time
-                            .as_ref()
-                            .and_then(|s| parse_duration(s)),
-                        segment_size: app_config
-                            .record
-                            .segment_size
-                            .as_ref()
-                            .and_then(|s| parse_size(s)),
-                        min_segment_size,
-                    };
-
                     info!("Starting record_flv from index {}", start_index);
                     match record_flv(resp, active_session, policy, store, event_tx, start_index)
                         .await
@@ -339,10 +345,16 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             info!("record_flv completed gracefully");
                             self.transition(PipelineState::WaitingReconnect)?;
                         }
-                        Err(e) => {
-                            warn!("record_flv failed: {}", e);
-                            self.transition(PipelineState::WaitingReconnect)?;
-                        }
+                        Err(e) => match e {
+                            AppError::Io { .. } | AppError::State(_) | AppError::Config(_) => {
+                                error!("record_flv fatal error: {}", e);
+                                return Err(e);
+                            }
+                            _ => {
+                                warn!("record_flv transient error: {}", e);
+                                self.transition(PipelineState::WaitingReconnect)?;
+                            }
+                        },
                     }
                 } else {
                     return Err(AppError::State(
@@ -581,6 +593,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_duration_variations() {
+        assert_eq!(
+            parse_duration("01:30:00"),
+            Some(std::time::Duration::from_secs(90 * 60))
+        );
+        assert_eq!(
+            parse_duration("00:15:30"),
+            Some(std::time::Duration::from_secs(15 * 60 + 30))
+        );
+        assert_eq!(parse_duration("invalid"), None);
+        assert_eq!(parse_duration("01:aa:bb"), None);
+    }
+    #[test]
     fn test_parse_size_variations() {
         assert_eq!(parse_size("20MiB"), Some(20 * 1024 * 1024));
         assert_eq!(parse_size("2GiB"), Some(2 * 1024 * 1024 * 1024));
@@ -701,5 +726,66 @@ mod tests {
         let err = supervisor.run_step().await.unwrap_err();
         assert!(matches!(err, AppError::State(_)));
         assert_eq!(supervisor.session.state, PipelineState::Recording);
+    }
+
+    #[tokio::test]
+    async fn test_recording_invalid_segment_config() {
+        use crate::config::PipelineConfig;
+        use crate::state::store::StateStore;
+
+        let store = std::sync::Arc::new(
+            StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
+        );
+        let mut config = crate::config::AppConfig {
+            data: Default::default(),
+            record: Default::default(),
+            upload: crate::config::UploadConfig {
+                cookie_file: "test".into(),
+                line: "auto".into(),
+                threads: 1,
+                submit_api: Default::default(),
+                tid: 171,
+                copyright: 2,
+                source: "source".into(),
+                tags: vec![],
+            },
+            pipeline: Default::default(),
+            rooms: vec![],
+        };
+
+        config.record.segment_time = Some("invalid_time".into());
+
+        let mut supervisor = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            Some(store.clone()),
+            None,
+            Some(std::sync::Arc::new(FakeUploader)),
+            Some(std::sync::Arc::new(config.clone())),
+        );
+
+        supervisor.session.state = PipelineState::Recording;
+        supervisor.active_session_id = Some(uuid::Uuid::new_v4());
+        supervisor.client = Some(std::sync::Arc::new(BiliClient::new(None).unwrap()));
+
+        let err = supervisor.run_step().await.unwrap_err();
+        assert!(matches!(err, AppError::Config(_)));
+
+        config.record.segment_time = None;
+        config.record.segment_size = Some("invalid_size".into());
+        let mut supervisor2 = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            Some(store.clone()),
+            None,
+            Some(std::sync::Arc::new(FakeUploader)),
+            Some(std::sync::Arc::new(config)),
+        );
+        supervisor2.session.state = PipelineState::Recording;
+        supervisor2.active_session_id = Some(uuid::Uuid::new_v4());
+        supervisor2.client = Some(std::sync::Arc::new(BiliClient::new(None).unwrap()));
+
+        let err2 = supervisor2.run_step().await.unwrap_err();
+        assert!(matches!(err2, AppError::Config(_)));
     }
 }
