@@ -1,0 +1,33 @@
+[data]
+dir = "./data"
+
+[record]
+cookie_file = "./data/cookies.json"
+output_dir = "./data/recordings"
+segment_time = "01:00:00"
+segment_size = "2GiB"
+min_segment_size = "20MiB"
+prefer_protocol = "flv"
+qn = 10000
+cdn = []
+
+[upload]
+cookie_file = "./data/cookies.json"
+line = "auto"
+threads = 3
+submit_api = "app"
+tid = 171
+copyright = 2
+source = "直播录像"
+tags = ["直播录像"]
+
+[pipeline]
+poll_interval_s = 60
+offline_grace_s = 60
+backoff_s = 15
+
+[[rooms]]
+name = "example"
+url = "https://live.bilibili.com/123456"
+title = "{title}"
+description = "{name} 直播录像\n原直播间：{url}"

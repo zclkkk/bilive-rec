@@ -1,3 +1,7 @@
+//! Configuration policy: credential paths are explicit, operational knobs get
+//! conservative defaults, and command-specific validation decides which
+//! boundaries are required for each action.
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -212,7 +216,7 @@ impl AppConfig {
         upload.validate_cookie_file()
     }
 
-    pub fn validate_for_upload_recovery(&self) -> AppResult<()> {
+    pub fn validate_for_upload_actions(&self) -> AppResult<()> {
         let upload = self.upload_config()?;
         upload.validate()?;
         upload.validate_cookie_file()
@@ -374,35 +378,7 @@ pub fn parse_hms_duration(value: &str) -> AppResult<Duration> {
 mod tests {
     use super::*;
 
-    const SAMPLE_TOML: &str = r#"
-[data]
-dir = "./data"
-
-[record]
-cookie_file = "./data/cookies.json"
-output_dir = "./data/recordings"
-segment_time = "01:00:00"
-segment_size = "2GiB"
-min_segment_size = "20MiB"
-prefer_protocol = "flv"
-qn = 10000
-cdn = []
-
-[upload]
-cookie_file = "./data/cookies.json"
-line = "auto"
-threads = 3
-submit_api = "app"
-tid = 171
-copyright = 2
-tags = ["直播录像"]
-
-[[rooms]]
-name = "example"
-url = "https://live.bilibili.com/123456"
-title = "{streamer} {title} {date}"
-description = "{streamer} 直播录像\n原直播间：{url}"
-"#;
+    const SAMPLE_TOML: &str = include_str!("../config.example.toml");
 
     #[test]
     fn parse_sample_config() {
@@ -429,9 +405,18 @@ description = "{streamer} 直播录像\n原直播间：{url}"
         assert_eq!(upload.threads, 3);
         assert_eq!(upload.tid, 171);
         assert_eq!(upload.copyright, 2);
+        assert_eq!(upload.source, "直播录像");
         assert_eq!(upload.tags, vec!["直播录像"]);
+        assert_eq!(config.pipeline.poll_interval_s, 60);
+        assert_eq!(config.pipeline.offline_grace_s, 60);
+        assert_eq!(config.pipeline.backoff_s, 15);
         assert_eq!(config.rooms.len(), 1);
         assert_eq!(config.rooms[0].name, "example");
+        assert_eq!(config.rooms[0].title.as_deref(), Some("{title}"));
+        assert_eq!(
+            config.rooms[0].description.as_deref(),
+            Some("{name} 直播录像\n原直播间：{url}")
+        );
     }
 
     #[test]
@@ -504,6 +489,16 @@ cookie_file = "./data/cookies.json"
     fn check_validation_does_not_require_upload_config() {
         let config = AppConfig::parse("").unwrap();
         config.validate_for_check().unwrap();
+    }
+
+    #[test]
+    fn credential_paths_are_explicit_not_defaulted() {
+        let config = AppConfig::parse("").unwrap();
+        assert!(config.record.cookie_file.is_none());
+        assert!(config.upload.is_none());
+
+        let err = AppConfig::parse("[upload]\n").unwrap_err();
+        assert!(err.to_string().contains("cookie_file"));
     }
 
     #[test]
@@ -611,11 +606,5 @@ cookie_file = "./definitely-missing-live-cookie.json"
 
         let err = upload.validate().unwrap_err();
         assert!(err.to_string().contains("upload.threads"));
-    }
-
-    #[test]
-    fn upload_config_requires_cookie_file() {
-        let err = AppConfig::parse("[upload]\n").unwrap_err();
-        assert!(err.to_string().contains("cookie_file"));
     }
 }

@@ -392,7 +392,7 @@ async fn state_recover_cmd(
 
     if apply {
         if state::recovery::plan_has_upload_actions(&plan) {
-            config.validate_for_upload_recovery()?;
+            config.validate_for_upload_actions()?;
             let upload_config = config.upload_config()?.clone();
 
             let uploader = bilive_rec::uploader::biliup_adapter::BiliupUploader::new(
