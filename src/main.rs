@@ -29,7 +29,7 @@ async fn main() {
             title,
             config,
         } => upload_cmd(files, title, config.as_deref()).await,
-        Command::Run { config } => run_cmd(&config),
+        Command::Run { config } => run_cmd(&config).await,
         Command::State { config, action } => match action {
             StateAction::Inspect => state_inspect_cmd(&config),
             StateAction::Recover => state_recover_cmd(&config),
@@ -50,11 +50,92 @@ fn init_tracing() {
         .init();
 }
 
-fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
+async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     init_tracing();
-    let _config = AppConfig::load(config_path)?;
+    let config = AppConfig::load(config_path)?;
     tracing::info!("config loaded from {}", config_path.display());
-    println!("not implemented: run");
+
+    use std::sync::Arc;
+    use tokio::time::Duration;
+    use bilive_rec::pipeline::supervisor::RoomSupervisor;
+    use bilive_rec::uploader::biliup_adapter::BiliupUploader;
+    use bilive_rec::pipeline::state_machine::PipelineState;
+
+    let db_path = config.data.dir.join("state.redb");
+    let store = Arc::new(StateStore::open(&db_path)?);
+    let store_clone = store.clone();
+
+    // Check login right at the start
+    let uploader = Arc::new(BiliupUploader::new(
+        config.upload.cookie_file.clone(),
+        config.upload.line.clone(),
+        config.upload.threads,
+    ));
+    use bilive_rec::uploader::types::Uploader;
+    tracing::info!("Checking uploader login...");
+    uploader.check_login().await?;
+
+    let client = Arc::new(BiliClient::new(None)?);
+    let app_config = Arc::new(config.clone());
+
+    let mut handles = Vec::new();
+
+    for room in &config.rooms {
+        let room_url = room.url.clone();
+        let store = store_clone.clone();
+        let uploader = uploader.clone();
+        let client = client.clone();
+        let app_config = app_config.clone();
+        
+        let handle = tokio::spawn(async move {
+            let room_id = match bilive_rec::bilibili::room::resolve_room_id(&client, &room_url).await {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::error!("Failed to resolve room URL {}: {}", room_url, e);
+                    return;
+                }
+            };
+            
+            let mut supervisor = RoomSupervisor::new(
+                room_id,
+                app_config.pipeline.clone(),
+                Some(store),
+                Some(client),
+                Some(uploader),
+                Some(app_config.clone()),
+            );
+
+            tracing::info!("Started supervisor for room {}", room_id);
+            
+            loop {
+                if let Err(e) = supervisor.run_step().await {
+                    tracing::error!("Supervisor error for room {}: {}", room_id, e);
+                }
+
+                let state = supervisor.session.state;
+                let sleep_duration = match state {
+                    PipelineState::Idle => Some(Duration::from_secs(app_config.pipeline.poll_interval_s)),
+                    PipelineState::Failed | PipelineState::Offline => Some(Duration::from_secs(app_config.pipeline.poll_interval_s)),
+                    PipelineState::WaitingReconnect | PipelineState::ReResolving => Some(Duration::from_secs(app_config.pipeline.backoff_s)),
+                    _ => None, // Recording, Uploading blocks/pumps immediately
+                };
+
+                if let Some(d) = sleep_duration {
+                    tokio::time::sleep(d).await;
+                }
+            }
+        });
+        
+        handles.push(handle);
+    }
+
+    // Wait for ctrl-c
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl-C received, shutting down supervisors...");
+        }
+    }
+
     Ok(())
 }
 

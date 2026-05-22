@@ -51,6 +51,7 @@ impl<'a> FlvRecorder<'a> {
         policy: SegmentPolicy,
         store: &'a StateStore,
         event_tx: mpsc::UnboundedSender<SegmentEvent>,
+        start_index: u32,
     ) -> AppResult<Self> {
         // Ensure output dir exists
         tokio::fs::create_dir_all(&policy.output_dir)
@@ -71,7 +72,7 @@ impl<'a> FlvRecorder<'a> {
             avc_seq_tag: None,
             aac_seq_tag: None,
             current_segment: None,
-            next_index: 1,
+            next_index: start_index,
             is_first_segment: true,
         })
     }
@@ -402,6 +403,7 @@ pub async fn record_flv(
     policy: SegmentPolicy,
     store: &StateStore,
     event_tx: mpsc::UnboundedSender<SegmentEvent>,
+    start_index: u32,
 ) -> AppResult<()> {
     if !resp.status().is_success() {
         return Err(AppError::Bilibili(format!(
@@ -410,7 +412,7 @@ pub async fn record_flv(
         )));
     }
 
-    let mut recorder = FlvRecorder::new(session_id, policy, store, event_tx).await?;
+    let mut recorder = FlvRecorder::new(session_id, policy, store, event_tx, start_index).await?;
 
     let result: AppResult<()> = async {
         while let Some(chunk) = resp.chunk().await? {
@@ -454,7 +456,7 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx)
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
             .await
             .unwrap();
 
@@ -535,7 +537,7 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx)
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
             .await
             .unwrap();
 
@@ -584,7 +586,7 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx)
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
             .await
             .unwrap();
 
@@ -654,7 +656,7 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy, &store, tx)
+        let mut recorder = FlvRecorder::new(session_id, policy, &store, tx, 1)
             .await
             .unwrap();
 
@@ -723,7 +725,7 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx)
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
             .await
             .unwrap();
 
