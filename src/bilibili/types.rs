@@ -188,8 +188,6 @@ impl Protocol {
 #[serde(rename_all = "lowercase")]
 pub enum Codec {
     Avc,
-    Hevc,
-    Av1,
     Unknown,
 }
 
@@ -197,8 +195,6 @@ impl Codec {
     pub fn from_api_name(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "avc" => Codec::Avc,
-            "hevc" => Codec::Hevc,
-            "av1" => Codec::Av1,
             _ => Codec::Unknown,
         }
     }
@@ -206,8 +202,6 @@ impl Codec {
     pub fn as_str(self) -> &'static str {
         match self {
             Codec::Avc => "avc",
-            Codec::Hevc => "hevc",
-            Codec::Av1 => "av1",
             Codec::Unknown => "unknown",
         }
     }

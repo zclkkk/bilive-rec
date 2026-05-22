@@ -22,16 +22,7 @@ pub async fn fetch_play_info(
     let mixed_key = mix_wbi_keys(&keys.img_key, &keys.sub_key)?;
 
     // 3. Prepare parameters
-    let mut params = HashMap::new();
-    params.insert("room_id".to_string(), room_id.to_string());
-    params.insert("qn".to_string(), qn.to_string());
-    params.insert("platform".to_string(), "web".to_string());
-    params.insert("protocol".to_string(), "0,1".to_string());
-    params.insert("format".to_string(), "0,1,2".to_string());
-    params.insert("codec".to_string(), "0,1".to_string());
-    params.insert("ptype".to_string(), "8".to_string());
-    params.insert("dolby".to_string(), "5".to_string());
-    params.insert("web_location".to_string(), "444.8".to_string());
+    let params = build_play_info_params(room_id, qn);
 
     // 4. Sign params with current unix timestamp
     let now_secs = std::time::SystemTime::now()
@@ -54,6 +45,20 @@ pub async fn fetch_play_info(
         .await?;
 
     Ok(resp)
+}
+
+fn build_play_info_params(room_id: u64, qn: u32) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    params.insert("room_id".to_string(), room_id.to_string());
+    params.insert("qn".to_string(), qn.to_string());
+    params.insert("platform".to_string(), "web".to_string());
+    params.insert("protocol".to_string(), "0,1".to_string());
+    params.insert("format".to_string(), "0,1,2".to_string());
+    params.insert("codec".to_string(), "0".to_string());
+    params.insert("ptype".to_string(), "8".to_string());
+    params.insert("dolby".to_string(), "5".to_string());
+    params.insert("web_location".to_string(), "444.8".to_string());
+    params
 }
 
 /// Parses the PlayInfoResponse into domain stream candidates.
@@ -89,6 +94,9 @@ pub fn parse_stream_candidates(resp: &PlayInfoResponse) -> AppResult<Vec<StreamC
             let protocol = Protocol::from_api_name(&format_info.format_name);
             for codec_info in &format_info.codec {
                 let codec = Codec::from_api_name(&codec_info.codec_name);
+                if !is_supported_codec(codec) {
+                    continue;
+                }
                 for url_info in &codec_info.url_info {
                     let url = format!("{}{}{}", url_info.host, codec_info.base_url, url_info.extra);
                     let cdn_name = extract_cdn_name(&url_info.extra);
@@ -132,7 +140,14 @@ pub fn select_stream_candidate(
     if candidates.is_empty() {
         return None;
     }
-    let mut sorted = candidates.to_vec();
+    let mut sorted: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| is_supported_codec(candidate.codec))
+        .cloned()
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
     sorted.sort_by(|a, b| compare_candidates(a, b, config));
     sorted.first().cloned()
 }
@@ -147,7 +162,14 @@ pub async fn select_healthy_stream_candidate(
     if candidates.is_empty() {
         return Ok(None);
     }
-    let mut sorted = candidates.to_vec();
+    let mut sorted: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| is_supported_codec(candidate.codec))
+        .cloned()
+        .collect();
+    if sorted.is_empty() {
+        return Ok(None);
+    }
     sorted.sort_by(|a, b| compare_candidates(a, b, config));
 
     for candidate in sorted {
@@ -201,26 +223,19 @@ fn compare_candidates(
         return b_proto_val.cmp(&a_proto_val);
     }
 
-    // 3. Codec preference: AVC > HEVC > AV1 / Unknown
-    let a_codec_val = codec_value(a.codec);
-    let b_codec_val = codec_value(b.codec);
-    if a_codec_val != b_codec_val {
-        return b_codec_val.cmp(&a_codec_val);
-    }
-
-    // 4, 5, 6. QN ranking logic
+    // 3, 4, 5. QN ranking logic
     let qn_ord = compare_qn(a.qn, b.qn, config.qn);
     if qn_ord != std::cmp::Ordering::Equal {
         return qn_ord.reverse();
     }
 
-    // 7. Configured CDN order
+    // 6. Configured CDN order
     let cdn_ord = compare_cdn(&a.cdn_name, &b.cdn_name, &config.cdn);
     if cdn_ord != std::cmp::Ordering::Equal {
         return cdn_ord.reverse();
     }
 
-    // 8. Non-MCDN before MCDN
+    // 7. Non-MCDN before MCDN
     let mcdn_ord = compare_mcdn(&a.host, &b.host);
     if mcdn_ord != std::cmp::Ordering::Equal {
         return mcdn_ord.reverse();
@@ -247,13 +262,8 @@ fn protocol_fallback_value(proto: Protocol) -> u8 {
     }
 }
 
-fn codec_value(codec: Codec) -> u8 {
-    match codec {
-        Codec::Avc => 3,
-        Codec::Hevc => 2,
-        Codec::Av1 => 1,
-        Codec::Unknown => 0,
-    }
+fn is_supported_codec(codec: Codec) -> bool {
+    matches!(codec, Codec::Avc)
 }
 
 fn compare_qn(a: u32, b: u32, conf_qn: u32) -> std::cmp::Ordering {
@@ -397,16 +407,31 @@ mod tests {
     }
 
     #[test]
-    fn test_ranking_codec() {
+    fn test_unsupported_codec_is_not_selected() {
         let config = default_config();
 
-        let c1 = make_test_candidate("hevc_url", Protocol::Flv, Codec::Hevc, 10000, "ws", "host");
-        let c2 = make_test_candidate("avc_url", Protocol::Flv, Codec::Avc, 10000, "ws", "host");
-        let c3 = make_test_candidate("av1_url", Protocol::Flv, Codec::Av1, 10000, "ws", "host");
+        let unsupported = make_test_candidate(
+            "unsupported_url",
+            Protocol::Flv,
+            Codec::Unknown,
+            10000,
+            "ws",
+            "host",
+        );
+        let avc = make_test_candidate("avc_url", Protocol::Flv, Codec::Avc, 10000, "ws", "host");
 
-        // AVC > HEVC > AV1 / Unknown
-        let selected = select_stream_candidate(&[c1, c2, c3], &config).unwrap();
+        let selected = select_stream_candidate(&[unsupported.clone(), avc], &config).unwrap();
         assert_eq!(selected.url, "avc_url");
+        assert!(select_stream_candidate(&[unsupported], &config).is_none());
+    }
+
+    #[test]
+    fn test_build_play_info_params_requests_avc_only() {
+        let params = build_play_info_params(123, 10000);
+
+        assert_eq!(params.get("room_id").map(String::as_str), Some("123"));
+        assert_eq!(params.get("qn").map(String::as_str), Some("10000"));
+        assert_eq!(params.get("codec").map(String::as_str), Some("0"));
     }
 
     #[test]
@@ -524,6 +549,17 @@ mod tests {
                                                     {
                                                         "host": "https://tx.bili.com",
                                                         "extra": "?cdn=txcdn&key=2"
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                "codec_name": "hevc",
+                                                "current_qn": 10000,
+                                                "base_url": "/live-bili/hevc.flv",
+                                                "url_info": [
+                                                    {
+                                                        "host": "https://hevc.bili.com",
+                                                        "extra": "?cdn=hevc&key=3"
                                                     }
                                                 ]
                                             }
