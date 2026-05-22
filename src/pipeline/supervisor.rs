@@ -516,10 +516,27 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     &self.app_config,
                     &self.uploader,
                 ) {
-                    // Mark LiveSession as finalized
-                    if let Some(mut session) = store.get_session(active_session)? {
-                        session.status = SessionStatus::Finalized;
-                        store.put_session(&session)?;
+                    // Check if already submitted or failed to avoid duplicate submissions
+                    if let Some(existing_sub) = store.get_submission(active_session)? {
+                        match existing_sub.status {
+                            SubmissionStatus::Submitted => {
+                                self.transition(PipelineState::Submitted)?;
+                                return Ok(());
+                            }
+                            SubmissionStatus::Failed => {
+                                self.transition(PipelineState::Failed)?;
+                                return Ok(());
+                            }
+                            SubmissionStatus::Pending => {
+                                // Will retry submit using persisted parts
+                            }
+                        }
+                    } else {
+                        // Mark LiveSession as finalized
+                        if let Some(mut session) = store.get_session(active_session)? {
+                            session.status = SessionStatus::Finalized;
+                            store.put_session(&session)?;
+                        }
                     }
 
                     let mut parts = store.list_uploaded_parts(active_session)?;
@@ -548,13 +565,18 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         parts,
                     };
 
-                    let mut sub = Submission {
+                    let mut sub = store.get_submission(active_session)?.unwrap_or(Submission {
                         session_id: active_session,
                         status: SubmissionStatus::Pending,
                         aid: None,
                         bvid: None,
                         error: None,
-                    };
+                    });
+                    
+                    if sub.status != SubmissionStatus::Pending {
+                        sub.status = SubmissionStatus::Pending;
+                        sub.error = None;
+                    }
                     store.put_submission(&sub)?;
 
                     match uploader.submit(req).await {
@@ -593,7 +615,22 @@ mod tests {
     use crate::state::model::UploadedPart;
     use crate::uploader::types::SubmissionResult;
 
-    struct FakeUploader;
+    struct FakeUploader {
+        submit_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeUploader {
+        fn new() -> Self {
+            Self {
+                submit_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        
+        fn get_submit_count(&self) -> usize {
+            self.submit_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
     impl Uploader for FakeUploader {
         async fn check_login(&self) -> AppResult<()> {
             Ok(())
@@ -607,6 +644,7 @@ mod tests {
             })
         }
         async fn submit(&self, _req: SubmissionRequest) -> AppResult<SubmissionResult> {
+            self.submit_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(SubmissionResult {
                 aid: Some(1),
                 bvid: Some("bv1".to_string()),
@@ -685,7 +723,7 @@ mod tests {
             PipelineConfig::default(),
             Some(store.clone()),
             None,
-            Some(std::sync::Arc::new(FakeUploader)),
+            Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
         ).unwrap();
 
@@ -732,7 +770,7 @@ mod tests {
             PipelineConfig::default(),
             Some(store.clone()),
             None,
-            Some(std::sync::Arc::new(FakeUploader)),
+            Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
         ).unwrap();
 
@@ -802,7 +840,7 @@ mod tests {
             PipelineConfig::default(),
             Some(store.clone()),
             None,
-            Some(std::sync::Arc::new(FakeUploader)),
+            Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config.clone())),
         ).unwrap();
 
@@ -820,7 +858,7 @@ mod tests {
             PipelineConfig::default(),
             Some(store.clone()),
             None,
-            Some(std::sync::Arc::new(FakeUploader)),
+            Some(std::sync::Arc::new(FakeUploader::new())),
             Some(std::sync::Arc::new(config)),
         ).unwrap();
         supervisor2.session.state = PipelineState::Recording;
@@ -829,5 +867,119 @@ mod tests {
 
         let err2 = supervisor2.run_step().await.unwrap_err();
         assert!(matches!(err2, AppError::Config(_)));
+    }
+    #[tokio::test]
+    async fn test_submitting_idempotent_submitted() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let uploader = std::sync::Arc::new(FakeUploader::new());
+        let mut config = AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"").unwrap();
+        config.upload.tid = 123;
+
+        let mut supervisor = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            Some(store.clone()),
+            None,
+            Some(uploader.clone()),
+            Some(std::sync::Arc::new(config)),
+        ).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+
+        store.put_submission(&Submission {
+            session_id,
+            status: SubmissionStatus::Submitted,
+            aid: Some(1),
+            bvid: Some("bv1".into()),
+            error: None,
+        }).unwrap();
+
+        supervisor.run_step().await.unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::Submitted);
+        assert_eq!(uploader.get_submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_submitting_idempotent_failed() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let uploader = std::sync::Arc::new(FakeUploader::new());
+        let mut config = AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"").unwrap();
+        config.upload.tid = 123;
+
+        let mut supervisor = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            Some(store.clone()),
+            None,
+            Some(uploader.clone()),
+            Some(std::sync::Arc::new(config)),
+        ).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+
+        store.put_submission(&Submission {
+            session_id,
+            status: SubmissionStatus::Failed,
+            aid: None,
+            bvid: None,
+            error: Some("mock err".into()),
+        }).unwrap();
+
+        supervisor.run_step().await.unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::Failed);
+        assert_eq!(uploader.get_submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_submitting_idempotent_pending() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let uploader = std::sync::Arc::new(FakeUploader::new());
+        let mut config = AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"").unwrap();
+        config.upload.tid = 123;
+
+        let mut supervisor = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            Some(store.clone()),
+            None,
+            Some(uploader.clone()),
+            Some(std::sync::Arc::new(config)),
+        ).unwrap();
+
+        let session_id = uuid::Uuid::new_v4();
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+
+        store.put_submission(&Submission {
+            session_id,
+            status: SubmissionStatus::Pending,
+            aid: None,
+            bvid: None,
+            error: None,
+        }).unwrap();
+
+        store.put_uploaded_part(&UploadedPart {
+            session_id,
+            segment_index: 0,
+            bili_filename: "fake_file".into(),
+            part_title: "part 0".into(),
+        }).unwrap();
+
+        supervisor.run_step().await.unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::Submitted);
+        assert_eq!(uploader.get_submit_count(), 1);
+        
+        let final_sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(final_sub.status, SubmissionStatus::Submitted);
     }
 }
