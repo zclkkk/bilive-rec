@@ -589,7 +589,7 @@ pub fn plan_recovery(
         if submission.status == SubmissionStatus::Ambiguous {
             actions.push(RecoveryAction::LeaveAsIs {
                 reason: format!(
-                    "Ambiguous submission {} — Bilibili accepted but did not return aid/bvid; verify on Bilibili and use `state recover --resolve-submission`",
+                    "Ambiguous submission {} — Bilibili accepted but did not return aid/bvid; verify on Bilibili and use `state resolve-submission`",
                     submission.session_id
                 ),
             });
@@ -637,6 +637,106 @@ pub fn plan_recovery(
     }
 
     Ok(RecoveryPlan { actions })
+}
+
+/// Outcome of a successful manual submission resolve.
+#[derive(Debug, Clone)]
+pub struct SubmissionResolved {
+    pub session_id: uuid::Uuid,
+    pub from: SubmissionStatus,
+    pub to: SubmissionStatus,
+    pub aid: Option<u64>,
+    pub bvid: Option<String>,
+}
+
+/// Manually resolve a Pending or Ambiguous submission to a definitive
+/// outcome the operator confirmed on Bilibili.
+///
+/// Refuses to:
+///   - touch a submission that is already Submitted or Failed (those are
+///     definitive; if they need editing, that's an operator data-fix, not
+///     recovery);
+///   - flip to Submitted without at least one of aid/bvid (otherwise the
+///     row would claim a confirmed identity it does not have);
+///   - resolve a session that has no submission row.
+///
+/// On success the existing aid/bvid are overwritten when resolving to
+/// Submitted, and preserved (but the row marked Failed) when resolving to
+/// Failed — the original error string is replaced with a "Manually
+/// resolved as Failed" annotation including the prior status.
+pub fn resolve_submission(
+    store: &StateStore,
+    session_id: uuid::Uuid,
+    target: SubmissionStatus,
+    aid: Option<u64>,
+    bvid: Option<String>,
+) -> AppResult<SubmissionResolved> {
+    use crate::error::AppError;
+    use crate::state::model::Submission;
+
+    if !matches!(
+        target,
+        SubmissionStatus::Submitted | SubmissionStatus::Failed
+    ) {
+        return Err(AppError::Config(format!(
+            "resolve target must be Submitted or Failed, got {target:?}"
+        )));
+    }
+
+    let current = store
+        .get_submission(session_id)?
+        .ok_or_else(|| AppError::State(format!("Submission for session {session_id} not found")))?;
+
+    match current.status {
+        SubmissionStatus::Pending | SubmissionStatus::Ambiguous => {}
+        other => {
+            return Err(AppError::State(format!(
+                "Submission for session {session_id} is {other:?}, not Pending or Ambiguous — refusing manual resolve"
+            )));
+        }
+    }
+
+    let updated = match target {
+        SubmissionStatus::Submitted => {
+            if aid.is_none() && bvid.is_none() {
+                return Err(AppError::Config(
+                    "resolving to Submitted requires at least one of --aid or --bvid".into(),
+                ));
+            }
+            Submission {
+                session_id,
+                status: SubmissionStatus::Submitted,
+                aid,
+                bvid: bvid.clone(),
+                error: None,
+            }
+        }
+        SubmissionStatus::Failed => Submission {
+            session_id,
+            status: SubmissionStatus::Failed,
+            aid: current.aid,
+            bvid: current.bvid.clone(),
+            error: Some(format!(
+                "Manually resolved as Failed (was {:?})",
+                current.status
+            )),
+        },
+        _ => unreachable!("guarded above"),
+    };
+
+    let from = current.status;
+    let to = updated.status;
+    let aid_out = updated.aid;
+    let bvid_out = updated.bvid.clone();
+    store.put_submission(&updated)?;
+
+    Ok(SubmissionResolved {
+        session_id,
+        from,
+        to,
+        aid: aid_out,
+        bvid: bvid_out,
+    })
 }
 
 /// Result of applying a single recovery action.
@@ -1251,8 +1351,7 @@ mod tests {
             })
             .unwrap();
 
-        let plan =
-            plan_recovery(&store, &HashSet::new(), &HashSet::new()).unwrap();
+        let plan = plan_recovery(&store, &HashSet::new(), &HashSet::new()).unwrap();
 
         let leave_msgs: Vec<&String> = plan
             .actions
@@ -2658,5 +2757,197 @@ mod tests {
         // Verify no upload happened
         let parts = store.list_uploaded_parts(session_id).unwrap();
         assert!(parts.is_empty());
+    }
+
+    // --- resolve_submission tests ---
+
+    #[test]
+    fn resolve_pending_to_submitted_with_aid() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Pending,
+                aid: None,
+                bvid: None,
+                error: None,
+            })
+            .unwrap();
+
+        let resolved = resolve_submission(
+            &store,
+            session_id,
+            SubmissionStatus::Submitted,
+            Some(12345),
+            None,
+        )
+        .unwrap();
+        assert_eq!(resolved.from, SubmissionStatus::Pending);
+        assert_eq!(resolved.to, SubmissionStatus::Submitted);
+        assert_eq!(resolved.aid, Some(12345));
+
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, SubmissionStatus::Submitted);
+        assert_eq!(sub.aid, Some(12345));
+        assert!(sub.error.is_none());
+    }
+
+    #[test]
+    fn resolve_ambiguous_to_submitted_with_bvid() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Ambiguous,
+                aid: None,
+                bvid: None,
+                error: Some("no aid/bvid in response".into()),
+            })
+            .unwrap();
+
+        let resolved = resolve_submission(
+            &store,
+            session_id,
+            SubmissionStatus::Submitted,
+            None,
+            Some("BV1xxx".into()),
+        )
+        .unwrap();
+        assert_eq!(resolved.from, SubmissionStatus::Ambiguous);
+        assert_eq!(resolved.to, SubmissionStatus::Submitted);
+        assert_eq!(resolved.bvid.as_deref(), Some("BV1xxx"));
+
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, SubmissionStatus::Submitted);
+        // Original error string cleared on Submitted resolve.
+        assert!(sub.error.is_none());
+    }
+
+    #[test]
+    fn resolve_pending_to_failed_records_origin() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Pending,
+                aid: None,
+                bvid: None,
+                error: None,
+            })
+            .unwrap();
+
+        resolve_submission(&store, session_id, SubmissionStatus::Failed, None, None).unwrap();
+
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, SubmissionStatus::Failed);
+        assert!(sub.error.as_deref().unwrap().contains("Manually resolved"));
+        assert!(sub.error.as_deref().unwrap().contains("Pending"));
+    }
+
+    #[test]
+    fn resolve_to_submitted_without_aid_or_bvid_is_refused() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Pending,
+                aid: None,
+                bvid: None,
+                error: None,
+            })
+            .unwrap();
+
+        let err = resolve_submission(&store, session_id, SubmissionStatus::Submitted, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("--aid"));
+
+        // Submission is untouched.
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, SubmissionStatus::Pending);
+    }
+
+    #[test]
+    fn resolve_refuses_already_submitted() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Submitted,
+                aid: Some(1),
+                bvid: Some("BV1".into()),
+                error: None,
+            })
+            .unwrap();
+
+        let err = resolve_submission(
+            &store,
+            session_id,
+            SubmissionStatus::Submitted,
+            Some(2),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not Pending or Ambiguous"));
+
+        // Submission preserved verbatim.
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.aid, Some(1));
+    }
+
+    #[test]
+    fn resolve_refuses_already_failed() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Failed,
+                aid: None,
+                bvid: None,
+                error: Some("real failure".into()),
+            })
+            .unwrap();
+
+        let err = resolve_submission(&store, session_id, SubmissionStatus::Failed, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("not Pending or Ambiguous"));
+
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.error.as_deref(), Some("real failure"));
+    }
+
+    #[test]
+    fn resolve_with_unknown_session_errors() {
+        let (store, _dir) = test_store();
+        let err = resolve_submission(&store, Uuid::new_v4(), SubmissionStatus::Failed, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn resolve_to_invalid_target_is_refused() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Pending,
+                aid: None,
+                bvid: None,
+                error: None,
+            })
+            .unwrap();
+
+        // Resolving to Pending or Ambiguous makes no sense — those are the
+        // states we're resolving *from*.
+        for bad in [SubmissionStatus::Pending, SubmissionStatus::Ambiguous] {
+            let err = resolve_submission(&store, session_id, bad, None, None).unwrap_err();
+            assert!(err.to_string().contains("target must be"));
+        }
     }
 }

@@ -2,7 +2,7 @@ use std::process;
 
 use bilive_rec::bilibili;
 use bilive_rec::bilibili::client::BiliClient;
-use bilive_rec::cli::{Cli, Command, StateAction};
+use bilive_rec::cli::{Cli, Command, ResolveOutcome, StateAction};
 use bilive_rec::config::{AppConfig, RecordConfig};
 use bilive_rec::error::AppResult;
 use bilive_rec::state;
@@ -37,6 +37,12 @@ async fn main() {
                 reset_room,
                 retry_upload,
             } => state_recover_cmd(&config, apply, reset_room, retry_upload).await,
+            StateAction::ResolveSubmission {
+                session_id,
+                outcome,
+                aid,
+                bvid,
+            } => state_resolve_submission_cmd(&config, session_id, outcome, aid, bvid),
         },
     };
 
@@ -468,6 +474,36 @@ async fn state_recover_cmd(
     Ok(())
 }
 
+fn state_resolve_submission_cmd(
+    config_path: &std::path::Path,
+    session_id: uuid::Uuid,
+    outcome: ResolveOutcome,
+    aid: Option<u64>,
+    bvid: Option<String>,
+) -> AppResult<()> {
+    let config = AppConfig::load(config_path)?;
+    let db_path = config.data.dir.join("state.redb");
+    let store = StateStore::open(&db_path)?;
+
+    let target = match outcome {
+        ResolveOutcome::Submitted => bilive_rec::state::model::SubmissionStatus::Submitted,
+        ResolveOutcome::Failed => bilive_rec::state::model::SubmissionStatus::Failed,
+    };
+
+    let resolved = state::recovery::resolve_submission(&store, session_id, target, aid, bvid)?;
+    println!(
+        "session {}: {:?} -> {:?}",
+        resolved.session_id, resolved.from, resolved.to
+    );
+    if let Some(a) = resolved.aid {
+        println!("aid = {a}");
+    }
+    if let Some(b) = resolved.bvid {
+        println!("bvid = {b}");
+    }
+    Ok(())
+}
+
 async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> AppResult<()> {
     let config = match config_path {
         None => {
@@ -836,7 +872,7 @@ async fn upload_cmd(
             println!("Submission accepted but outcome is AMBIGUOUS.");
             println!("Bilibili did not return aid/bvid; verify on Bilibili and");
             println!(
-                "resolve via: bilive-rec state recover --resolve-submission {} --as submitted|failed",
+                "resolve via: bilive-rec state resolve-submission {} --as submitted|failed",
                 session_id
             );
             println!("Reason: {}", reason);

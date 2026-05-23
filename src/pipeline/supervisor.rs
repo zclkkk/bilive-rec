@@ -764,7 +764,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             return Err(AppError::State("Pending submission is unknown/in-flight and requires Phase 6 recovery/manual verification.".into()));
                         }
                         SubmissionStatus::Ambiguous => {
-                            return Err(AppError::State("Ambiguous submission — Bilibili accepted but did not return aid/bvid; requires manual verification and `state recover --resolve-submission`.".into()));
+                            return Err(AppError::State("Ambiguous submission — Bilibili accepted but did not return aid/bvid; resolve via `state resolve-submission <session_id> --as submitted|failed`.".into()));
                         }
                     }
                 } else {
@@ -866,7 +866,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         // submission status records that we don't actually know
                         // whether Bilibili created the video. Operators must
                         // verify on Bilibili and use
-                        // `state recover --resolve-submission`.
+                        // `state resolve-submission`.
                         warn!(
                             session_id = %active_session,
                             "Submission outcome is ambiguous: {}",

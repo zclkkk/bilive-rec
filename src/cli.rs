@@ -88,4 +88,35 @@ pub enum StateAction {
         #[arg(long)]
         retry_upload: Option<Uuid>,
     },
+
+    /// Manually resolve a Pending or Ambiguous submission after verifying on
+    /// Bilibili. Required when a submit call left the outcome unknown
+    /// (e.g. crash between submit and response, or Bilibili returned code=0
+    /// without aid/bvid). Refuses to overwrite Submitted or Failed
+    /// submissions — those are already definitive.
+    ResolveSubmission {
+        /// Session ID whose submission to resolve
+        session_id: Uuid,
+
+        /// Target outcome the operator confirmed on Bilibili
+        #[arg(long = "as", value_enum)]
+        outcome: ResolveOutcome,
+
+        /// Bilibili archive ID (required if --as submitted and --bvid not given)
+        #[arg(long)]
+        aid: Option<u64>,
+
+        /// Bilibili video BVID (required if --as submitted and --aid not given)
+        #[arg(long)]
+        bvid: Option<String>,
+    },
+}
+
+/// Outcome the operator confirms after manual Bilibili verification.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ResolveOutcome {
+    /// Bilibili created the video — operator provides aid/bvid.
+    Submitted,
+    /// Bilibili did not create the video.
+    Failed,
 }
