@@ -1,3 +1,4 @@
+use crate::config::SubmitApi;
 use crate::error::{AppError, AppResult};
 use crate::state::model::UploadedPart;
 use crate::uploader::types::{SubmissionOutcome, SubmissionRequest, UploadRequest, Uploader};
@@ -13,14 +14,21 @@ pub struct BiliupUploader {
     cookie_path: PathBuf,
     line: String,
     threads: usize,
+    submit_api: SubmitApi,
 }
 
 impl BiliupUploader {
-    pub fn new(cookie_path: PathBuf, line: String, threads: usize) -> Self {
+    pub fn new(
+        cookie_path: PathBuf,
+        line: String,
+        threads: usize,
+        submit_api: SubmitApi,
+    ) -> Self {
         Self {
             cookie_path,
             line,
             threads,
+            submit_api,
         }
     }
 
@@ -133,9 +141,15 @@ impl Uploader for BiliupUploader {
             extra_fields: None,
         };
 
-        let res = match bili.submit_by_app(&studio, None).await {
-            Ok(res) => res,
-            Err(error) => return submit_error_to_outcome("app", error),
+        let res = match self.submit_api {
+            SubmitApi::App => match bili.submit_by_app(&studio, None).await {
+                Ok(res) => res,
+                Err(error) => return submit_error_to_outcome("app", error),
+            },
+            SubmitApi::Web => match bili.submit_by_web(&studio, None).await {
+                Ok(res) => res,
+                Err(error) => return submit_error_to_outcome("web", error),
+            },
         };
 
         if res.code != 0 {

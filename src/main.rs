@@ -76,6 +76,7 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
         upload_config.cookie_file.clone(),
         upload_config.line.clone(),
         upload_config.threads,
+        upload_config.submit_api.clone(),
     ));
     use bilive_rec::uploader::types::Uploader;
     tracing::info!("Checking uploader login...");
@@ -432,6 +433,7 @@ async fn state_recover_cmd(
                 upload_config.cookie_file.clone(),
                 upload_config.line.clone(),
                 upload_config.threads,
+                upload_config.submit_api.clone(),
             );
             use bilive_rec::uploader::types::Uploader;
             uploader.check_login().await?;
@@ -748,6 +750,7 @@ async fn upload_cmd(
         upload_config.cookie_file.clone(),
         upload_config.line.clone(),
         upload_config.threads,
+        upload_config.submit_api.clone(),
     );
     uploader.check_login().await?;
 

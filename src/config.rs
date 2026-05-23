@@ -273,11 +273,8 @@ impl RecordConfig {
 
 impl UploadConfig {
     pub fn validate(&self) -> AppResult<()> {
-        if !matches!(self.submit_api, SubmitApi::App) {
-            return Err(AppError::Config(
-                "Only 'app' submit API is supported for now.".into(),
-            ));
-        }
+        // Both SubmitApi::App and SubmitApi::Web are supported; biliup
+        // provides submit_by_app and submit_by_web. No restriction here.
         if self.line != "auto" && self.line != "bda2" {
             return Err(AppError::Config(format!(
                 "Unsupported upload line '{}'. Only 'auto' and 'bda2' are supported for now.",
@@ -606,5 +603,27 @@ cookie_file = "./definitely-missing-live-cookie.json"
 
         let err = upload.validate().unwrap_err();
         assert!(err.to_string().contains("upload.threads"));
+    }
+
+    #[test]
+    fn upload_validation_accepts_both_submit_apis() {
+        // SubmitApi::Web was previously declared but rejected — the config
+        // schema exposed a variant the code refused to honor. With biliup's
+        // submit_by_web wired up (Finding 8), both variants must validate.
+        for api in [SubmitApi::App, SubmitApi::Web] {
+            let upload = UploadConfig {
+                cookie_file: "cookies.json".into(),
+                line: "auto".into(),
+                threads: 3,
+                submit_api: api,
+                tid: 171,
+                copyright: 2,
+                source: "source".into(),
+                tags: vec![],
+            };
+            upload
+                .validate()
+                .expect("both App and Web submit APIs must validate");
+        }
     }
 }
