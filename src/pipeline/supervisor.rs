@@ -114,6 +114,39 @@ fn ensure_session_ready_to_submit(store: &StateStore, session_id: Uuid) -> AppRe
     Ok(())
 }
 
+fn validate_session_credentials(
+    session: &LiveSession,
+    expected: &RoomCredentials,
+) -> AppResult<()> {
+    if session.record_credential != expected.record {
+        return Err(AppError::State(format!(
+            "Persisted session {} record credential does not match current room config",
+            session.id
+        )));
+    }
+    if session.upload_credential.as_ref() != Some(&expected.upload) {
+        let actual = session
+            .upload_credential
+            .as_ref()
+            .map(|credential| {
+                format!(
+                    "'{}' at {}",
+                    credential.name,
+                    credential.cookie_file.display()
+                )
+            })
+            .unwrap_or_else(|| "no upload credential".to_string());
+        return Err(AppError::State(format!(
+            "Persisted session {} upload credential {} does not match current room config credential '{}' at {}",
+            session.id,
+            actual,
+            expected.upload.name,
+            expected.upload.cookie_file.display()
+        )));
+    }
+    Ok(())
+}
+
 pub struct RoomSupervisor<U: Uploader + Send + Sync + 'static> {
     pub room_id: u64,
     pub session: PipelineSession,
@@ -137,6 +170,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         deps: RoomSupervisorDeps<U>,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> AppResult<Self> {
+        let expected_credentials = deps.app_config.room_credentials(&room_config)?;
         let mut supervisor = Self {
             room_id,
             session: PipelineSession::new(room_id),
@@ -180,6 +214,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         session_id
                     )));
                 }
+                validate_session_credentials(&session, &expected_credentials)?;
                 supervisor.active_session_id = Some(session_id);
             }
         }
@@ -260,6 +295,8 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         if info.live_status == LiveStatus::Live {
                             if self.session.state == PipelineState::Resolving {
                                 let session_id = Uuid::new_v4();
+                                let room_credentials =
+                                    self.app_config.room_credentials(&self.room_config)?;
 
                                 let live_session = LiveSession {
                                     id: session_id,
@@ -267,6 +304,8 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                     title: info.title.clone(),
                                     started_at: jiff::Timestamp::now(),
                                     status: SessionStatus::Recording,
+                                    record_credential: room_credentials.record,
+                                    upload_credential: Some(room_credentials.upload),
                                 };
 
                                 // Validate before the atomic write: an invalid
@@ -787,6 +826,11 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 if parts.is_empty() {
                     let sub = Submission {
                         session_id: active_session,
+                        upload_credential: session.upload_credential.clone().ok_or_else(|| {
+                            AppError::State(format!(
+                                "Session {active_session} has no upload credential"
+                            ))
+                        })?,
                         status: SubmissionStatus::Failed,
                         aid: None,
                         bvid: None,
@@ -840,6 +884,11 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     .get_submission(active_session)?
                     .unwrap_or(Submission {
                         session_id: active_session,
+                        upload_credential: session.upload_credential.clone().ok_or_else(|| {
+                            AppError::State(format!(
+                                "Session {active_session} has no upload credential"
+                            ))
+                        })?,
                         status: SubmissionStatus::Pending,
                         aid: None,
                         bvid: None,
@@ -986,7 +1035,31 @@ mod tests {
     }
 
     fn test_app_config() -> AppConfig {
-        AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"").unwrap()
+        AppConfig::parse(
+            "[credentials.main]\ncookie_file=\"Cargo.toml\"\n\n[credentials.test]\ncookie_file=\"Cargo.toml\"\n\n[upload]\ncredential=\"main\"\ntid=1\nline=\"auto\"",
+        )
+        .unwrap()
+    }
+
+    fn test_credentials() -> std::collections::HashMap<String, crate::config::CredentialConfig> {
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert(
+            "main".into(),
+            crate::config::CredentialConfig {
+                cookie_file: "Cargo.toml".into(),
+            },
+        );
+        credentials.insert(
+            "test".into(),
+            crate::config::CredentialConfig {
+                cookie_file: "Cargo.toml".into(),
+            },
+        );
+        credentials
+    }
+
+    fn test_upload_credential() -> crate::credential::CredentialIdentity {
+        crate::credential::CredentialIdentity::new("main", "Cargo.toml")
     }
 
     fn test_room_config() -> RoomConfig {
@@ -995,6 +1068,8 @@ mod tests {
             url: "https://live.bilibili.com/1".into(),
             title: None,
             description: None,
+            record_credential: None,
+            upload_credential: None,
         }
     }
 
@@ -1007,6 +1082,8 @@ mod tests {
                 title: "Test Stream".into(),
                 started_at: jiff::Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: Some(test_upload_credential()),
             })
             .unwrap();
         session_id
@@ -1165,9 +1242,10 @@ mod tests {
         );
         let config = crate::config::AppConfig {
             data: Default::default(),
+            credentials: test_credentials(),
             record: Default::default(),
             upload: Some(crate::config::UploadConfig {
-                cookie_file: "test".into(),
+                credential: Some("test".into()),
                 line: "auto".into(),
                 threads: 1,
                 submit_api: Default::default(),
@@ -1207,9 +1285,10 @@ mod tests {
         );
         let config = crate::config::AppConfig {
             data: Default::default(),
+            credentials: test_credentials(),
             record: Default::default(),
             upload: Some(crate::config::UploadConfig {
-                cookie_file: "test".into(),
+                credential: Some("test".into()),
                 line: "auto".into(),
                 threads: 1,
                 submit_api: Default::default(),
@@ -1358,6 +1437,8 @@ mod tests {
                 title: "newer terminal session".into(),
                 started_at: jiff::Timestamp::now() + jiff::SignedDuration::from_secs(1),
                 status: SessionStatus::Finalized,
+                record_credential: None,
+                upload_credential: Some(test_upload_credential()),
             })
             .unwrap();
         store
@@ -1382,6 +1463,46 @@ mod tests {
         assert_eq!(supervisor.active_session_id, Some(active_session_id));
     }
 
+    #[test]
+    fn test_resume_refuses_upload_credential_mismatch() {
+        let store =
+            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
+        let session_id = Uuid::new_v4();
+        store
+            .put_session(&LiveSession {
+                id: session_id,
+                room_key: "1".into(),
+                title: "mismatched credential".into(),
+                started_at: jiff::Timestamp::now(),
+                status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: Some(crate::credential::CredentialIdentity::new(
+                    "main",
+                    "Cargo.lock",
+                )),
+            })
+            .unwrap();
+        store
+            .put_room_pipeline_state(1, PipelineState::Recording, Some(session_id))
+            .unwrap();
+
+        let (_, rx) = tokio::sync::watch::channel(false);
+        let res = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            test_room_config(),
+            RoomSupervisorDeps {
+                store,
+                client: Arc::new(BiliClient::new(None).unwrap()),
+                uploader: Arc::new(FakeUploader::new()),
+                app_config: Arc::new(test_app_config()),
+            },
+            rx,
+        );
+
+        assert!(matches!(res, Err(AppError::State(ref msg)) if msg.contains("upload credential")));
+    }
+
     #[tokio::test]
     async fn test_recording_invalid_segment_config() {
         use crate::state::store::StateStore;
@@ -1391,9 +1512,10 @@ mod tests {
         );
         let mut config = crate::config::AppConfig {
             data: Default::default(),
+            credentials: test_credentials(),
             record: Default::default(),
             upload: Some(crate::config::UploadConfig {
-                cookie_file: "test".into(),
+                credential: Some("test".into()),
                 line: "auto".into(),
                 threads: 1,
                 submit_api: Default::default(),
@@ -1432,9 +1554,7 @@ mod tests {
         let store =
             std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config =
-            AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
-                .unwrap();
+        let mut config = test_app_config();
         config.upload.as_mut().unwrap().tid = 123;
 
         let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
@@ -1446,6 +1566,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Submitted,
                 aid: Some(1),
                 bvid: Some("bv1".into()),
@@ -1469,6 +1593,8 @@ mod tests {
             url: "https://live.bilibili.com/1".into(),
             title: Some("Archive {title} #{room_id}".into()),
             description: Some("From {name}: {url}".into()),
+            record_credential: None,
+            upload_credential: None,
         };
         let mut supervisor = supervisor_with_room(
             store.clone(),
@@ -1536,9 +1662,7 @@ mod tests {
         let store =
             std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config =
-            AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
-                .unwrap();
+        let mut config = test_app_config();
         config.upload.as_mut().unwrap().tid = 123;
 
         let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
@@ -1550,6 +1674,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Failed,
                 aid: None,
                 bvid: None,
@@ -1570,9 +1698,7 @@ mod tests {
         let store =
             std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config =
-            AppConfig::parse("[upload]\ncookie_file=\"cookies.json\"\ntid=1\nline=\"auto\"")
-                .unwrap();
+        let mut config = test_app_config();
         config.upload.as_mut().unwrap().tid = 123;
 
         let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
@@ -1584,6 +1710,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,
@@ -1661,6 +1791,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Ambiguous,
                 aid: None,
                 bvid: None,

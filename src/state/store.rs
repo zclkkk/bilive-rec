@@ -413,6 +413,8 @@ mod tests {
             title: "Test Stream".to_string(),
             started_at: Timestamp::now(),
             status: SessionStatus::Recording,
+            record_credential: None,
+            upload_credential: None,
         };
         store.put_session(&session).unwrap();
         let loaded = store.get_session(session.id).unwrap().unwrap();
@@ -475,6 +477,8 @@ mod tests {
             title: "t".to_string(),
             started_at: Timestamp::now(),
             status: SessionStatus::Recording,
+            record_credential: None,
+            upload_credential: None,
         };
         store.put_session(&session).unwrap();
 
@@ -526,6 +530,8 @@ mod tests {
             title: "persist".to_string(),
             started_at: Timestamp::now(),
             status: SessionStatus::Finalized,
+            record_credential: None,
+            upload_credential: None,
         };
 
         {
@@ -561,6 +567,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let sub = crate::state::model::Submission {
             session_id,
+            upload_credential: crate::credential::CredentialIdentity::new("test", "cookies.json"),
             status: crate::state::model::SubmissionStatus::Submitted,
             aid: Some(123),
             bvid: Some("BV123".to_string()),

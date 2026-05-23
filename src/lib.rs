@@ -1,6 +1,7 @@
 pub mod bilibili;
 pub mod cli;
 pub mod config;
+pub mod credential;
 pub mod error;
 pub mod pipeline;
 pub mod recorder;

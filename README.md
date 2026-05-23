@@ -25,15 +25,17 @@ cp config.example.toml config.toml
 | --- | --- | --- | --- |
 | **`[data]`** | **数据存储配置 (可选)** | | |
 | `dir` | 内部持久化状态数据库 (`state.redb`) 的存放路径。 | `./data` | |
+| **`[credentials.<name>]`** | **账号凭据配置（按名字复用）** | | |
+| `cookie_file` | B站登录 Cookie JSON 文件路径。录制和上传通过 credential 名字引用它。 | **(必填)** | `./data/cookies.json` |
 | **`[record]`** | **录制参数配置 (可选)** | | |
-| `cookie_file` | B站登录 Cookie JSON 文件的路径（用于获取最高画质）。 | `无 (可选)` | `./data/cookies.json` |
+| `credential` | 默认录制账号名（用于获取最高画质）。不配置则匿名拉流。 | `无 (可选)` | `main` |
 | `output_dir` | 录制分段 `.flv` 视频的存放目录。 | `./data/recordings` | |
 | `segment_time` | 切片时间阈值（格式 `HH:MM:SS`），到达此长度将切割新分段。 | `无 (可选)` | `01:00:00` |
 | `segment_size` | 切片大小阈值，到达此大小将切割新分段。 | `无 (可选)` | `2GiB` |
 | `min_segment_size` | 最小切片大小。小于此大小的分段会被过滤（防止碎片）。 | `20MiB` | |
 | `qn` | 视频画质档位（10000 对应原画/蓝光）。 | `10000` | |
 | **`[upload]`** | **上传发布配置 (可选，如果不配置则只录制不上传)** | | |
-| `cookie_file` | **[必填]** 用于上传与投稿授权的 Cookie JSON 文件路径。 | **(必填)** | `./data/cookies.json` |
+| `credential` | 默认上传账号名。`upload` 命令必填；`run` 可由每个房间的 `upload_credential` 覆盖。 | `无 (按命令校验)` | `main` |
 | `line` | B站上传线路选择（可选 `auto` 或 `bda2`）。 | `auto` | |
 | `submit_api` | 发布使用的 API 接口（可选 `app` 或 `web`）。 | `app` | |
 | `tid` | 投稿分区 ID（如 171 代表电子竞技）。 | `171` | |
@@ -47,11 +49,13 @@ cp config.example.toml config.toml
 | `url` | **[必填]** B站直播间完整的 URL。 | **(必填)** | `https://live.bilibili.com/123` |
 | `title` | 投稿标题模板（支持 `{title}`, `{name}` 等占位符）。 | `无 (可选)` | `{title}` |
 | `description` | 投稿简介模板。 | `无 (可选)` | `{name} 直播录像...` |
+| `record_credential`| 专属拉流账号名（用于录制舰长专属直播等），若不配则回退到全局 `[record].credential`。 | `无 (可选)` | `captain` |
+| `upload_credential`| 专属上传账号名，若不配则回退到全局 `[upload].credential`。 | `无 (可选)` | `alt_uploader` |
 
 ### 2. 准备鉴权文件
 
 你需要获取你的 Bilibili 网页版登录 Cookie 以供程序进行原画质直播流拉取和视频上传发布。
-将获取的 Cookie 保存至 `data/cookies.json`。推荐使用专门的小号进行 Cookie 的提取。
+将获取的 Cookie 保存至 `data/cookies.json`，并在 `[credentials.main]` 中引用。推荐使用专门的小号进行 Cookie 的提取。
 
 ### 3. 开始运行
 

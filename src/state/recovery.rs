@@ -705,6 +705,7 @@ pub fn resolve_submission(
             }
             Submission {
                 session_id,
+                upload_credential: current.upload_credential.clone(),
                 status: SubmissionStatus::Submitted,
                 aid,
                 bvid: bvid.clone(),
@@ -713,6 +714,7 @@ pub fn resolve_submission(
         }
         SubmissionStatus::Failed => Submission {
             session_id,
+            upload_credential: current.upload_credential.clone(),
             status: SubmissionStatus::Failed,
             aid: current.aid,
             bvid: current.bvid.clone(),
@@ -938,6 +940,8 @@ mod tests {
                 title: "Test".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -958,6 +962,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -985,6 +991,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1012,6 +1020,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1039,6 +1049,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1065,6 +1077,8 @@ mod tests {
                 title: "Test".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1099,6 +1113,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1137,6 +1153,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1175,6 +1193,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1297,6 +1317,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,
@@ -1320,6 +1344,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Ambiguous,
                 aid: None,
                 bvid: None,
@@ -1344,6 +1372,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Ambiguous,
                 aid: None,
                 bvid: None,
@@ -1377,6 +1409,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Failed,
                 aid: None,
                 bvid: None,
@@ -1416,6 +1452,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Submitted,
                 aid: Some(123),
                 bvid: Some("BV123".to_string()),
@@ -1479,6 +1519,8 @@ mod tests {
                 title: "Test".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1517,6 +1559,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -1726,6 +1770,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,
@@ -1749,6 +1797,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Failed,
                 aid: None,
                 bvid: None,
@@ -2192,6 +2244,8 @@ mod tests {
                 title: "Test".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -2213,6 +2267,8 @@ mod tests {
                 title: "Live".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
         store
@@ -2239,6 +2295,8 @@ mod tests {
                 title: "Test".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Recording,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -2267,6 +2325,8 @@ mod tests {
                 title: "Test".to_string(),
                 started_at: Timestamp::now(),
                 status: SessionStatus::Failed,
+                record_credential: None,
+                upload_credential: None,
             })
             .unwrap();
 
@@ -2393,6 +2453,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Submitted,
                 aid: Some(1),
                 bvid: Some("BV1".into()),
@@ -2435,6 +2499,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,
@@ -2477,6 +2545,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Failed,
                 aid: None,
                 bvid: None,
@@ -2599,6 +2671,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Submitted,
                 aid: Some(1),
                 bvid: Some("BV1".into()),
@@ -2644,6 +2720,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,
@@ -2689,6 +2769,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Failed,
                 aid: None,
                 bvid: None,
@@ -2768,6 +2852,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,
@@ -2800,6 +2888,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Ambiguous,
                 aid: None,
                 bvid: None,
@@ -2832,6 +2924,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,
@@ -2854,6 +2950,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,
@@ -2877,6 +2977,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Submitted,
                 aid: Some(1),
                 bvid: Some("BV1".into()),
@@ -2906,6 +3010,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Failed,
                 aid: None,
                 bvid: None,
@@ -2936,6 +3044,10 @@ mod tests {
         store
             .put_submission(&Submission {
                 session_id,
+                upload_credential: crate::credential::CredentialIdentity::new(
+                    "test",
+                    "cookies.json",
+                ),
                 status: SubmissionStatus::Pending,
                 aid: None,
                 bvid: None,

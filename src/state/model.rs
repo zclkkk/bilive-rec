@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::credential::CredentialIdentity;
 use crate::pipeline::state_machine::PipelineState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,6 +11,10 @@ pub struct LiveSession {
     pub title: String,
     pub started_at: jiff::Timestamp,
     pub status: SessionStatus,
+    #[serde(default)]
+    pub record_credential: Option<CredentialIdentity>,
+    #[serde(default)]
+    pub upload_credential: Option<CredentialIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +38,7 @@ pub struct UploadedPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Submission {
     pub session_id: Uuid,
+    pub upload_credential: CredentialIdentity,
     pub status: SubmissionStatus,
     #[serde(default)]
     pub aid: Option<u64>,
@@ -140,11 +146,15 @@ mod tests {
             title: "Test".to_string(),
             started_at: Timestamp::now(),
             status: SessionStatus::Recording,
+            record_credential: Some(CredentialIdentity::new("record", "record.json")),
+            upload_credential: Some(CredentialIdentity::new("upload", "upload.json")),
         };
         let json = serde_json::to_string(&session).unwrap();
         let decoded: LiveSession = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.id, session.id);
         assert_eq!(decoded.status, SessionStatus::Recording);
+        assert_eq!(decoded.record_credential, session.record_credential);
+        assert_eq!(decoded.upload_credential, session.upload_credential);
     }
 
     #[test]

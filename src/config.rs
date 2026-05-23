@@ -2,17 +2,22 @@
 //! conservative defaults, and command-specific validation decides which
 //! boundaries are required for each action.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::credential::CredentialIdentity;
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     #[serde(default)]
     pub data: DataConfig,
+    #[serde(default)]
+    pub credentials: HashMap<String, CredentialConfig>,
     #[serde(default)]
     pub record: RecordConfig,
     #[serde(default)]
@@ -24,6 +29,7 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataConfig {
     #[serde(default = "default_data_dir")]
     pub dir: PathBuf,
@@ -38,9 +44,16 @@ impl Default for DataConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialConfig {
+    pub cookie_file: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordConfig {
     #[serde(default)]
-    pub cookie_file: Option<PathBuf>,
+    pub credential: Option<String>,
     #[serde(default = "default_output_dir")]
     pub output_dir: PathBuf,
     #[serde(default)]
@@ -60,7 +73,7 @@ pub struct RecordConfig {
 impl Default for RecordConfig {
     fn default() -> Self {
         Self {
-            cookie_file: None,
+            credential: None,
             output_dir: PathBuf::from("./data/recordings"),
             segment_time: None,
             segment_size: None,
@@ -73,8 +86,10 @@ impl Default for RecordConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UploadConfig {
-    pub cookie_file: PathBuf,
+    #[serde(default)]
+    pub credential: Option<String>,
     #[serde(default = "default_line")]
     pub line: String,
     #[serde(default = "default_threads")]
@@ -92,6 +107,7 @@ pub struct UploadConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoomConfig {
     pub name: String,
     pub url: String,
@@ -99,6 +115,26 @@ pub struct RoomConfig {
     pub title: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub record_credential: Option<String>,
+    #[serde(default)]
+    pub upload_credential: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomCredentials {
+    pub record: Option<CredentialIdentity>,
+    pub upload: CredentialIdentity,
+}
+
+impl RoomCredentials {
+    pub fn record_cookie_file(&self) -> Option<&Path> {
+        self.record.as_ref().map(CredentialIdentity::cookie_file)
+    }
+
+    pub fn upload_cookie_file(&self) -> &Path {
+        self.upload.cookie_file()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -157,6 +193,7 @@ fn default_source() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     #[serde(default = "default_poll_interval_s")]
     pub poll_interval_s: u64,
@@ -207,23 +244,30 @@ impl AppConfig {
         self.record.validate()?;
         let upload = self.upload_config()?;
         upload.validate()?;
-        upload.validate_cookie_file()
+        for room in &self.rooms {
+            self.room_credentials(room)?;
+        }
+        Ok(())
     }
 
     pub fn validate_for_upload(&self) -> AppResult<()> {
         let upload = self.upload_config()?;
         upload.validate()?;
-        upload.validate_cookie_file()
+        self.upload_cookie_file()?;
+        Ok(())
     }
 
     pub fn validate_for_upload_actions(&self) -> AppResult<()> {
         let upload = self.upload_config()?;
         upload.validate()?;
-        upload.validate_cookie_file()
+        self.upload_cookie_file()?;
+        Ok(())
     }
 
     pub fn validate_for_check(&self) -> AppResult<()> {
-        self.record.validate()
+        self.record.validate()?;
+        self.record_cookie_file()?;
+        Ok(())
     }
 
     pub fn upload_config(&self) -> AppResult<&UploadConfig> {
@@ -231,13 +275,76 @@ impl AppConfig {
             .as_ref()
             .ok_or_else(|| AppError::Config("[upload] config is required for this command".into()))
     }
+
+    pub fn record_cookie_file(&self) -> AppResult<Option<PathBuf>> {
+        self.record_credential_identity()
+            .map(|credential| credential.map(|credential| credential.cookie_file))
+    }
+
+    pub fn record_credential_identity(&self) -> AppResult<Option<CredentialIdentity>> {
+        self.record
+            .credential
+            .as_deref()
+            .map(|name| self.credential_identity(name, "record.credential"))
+            .transpose()
+    }
+
+    pub fn upload_cookie_file(&self) -> AppResult<PathBuf> {
+        self.upload_credential_identity()
+            .map(|credential| credential.cookie_file)
+    }
+
+    pub fn upload_credential_identity(&self) -> AppResult<CredentialIdentity> {
+        let upload = self.upload_config()?;
+        let name = upload.credential.as_deref().ok_or_else(|| {
+            AppError::Config("upload.credential is required for this command".into())
+        })?;
+        self.credential_identity(name, "upload.credential")
+    }
+
+    pub fn room_credentials(&self, room: &RoomConfig) -> AppResult<RoomCredentials> {
+        let record = if let Some(name) = room.record_credential.as_deref() {
+            Some(
+                self.credential_identity(name, &format!("rooms[{}].record_credential", room.name))?,
+            )
+        } else if let Some(name) = self.record.credential.as_deref() {
+            Some(self.credential_identity(name, "record.credential")?)
+        } else {
+            None
+        };
+
+        let upload = self.upload_config()?;
+        let upload = if let Some(name) = room.upload_credential.as_deref() {
+            self.credential_identity(name, &format!("rooms[{}].upload_credential", room.name))?
+        } else if let Some(name) = upload.credential.as_deref() {
+            self.credential_identity(name, "upload.credential")?
+        } else {
+            return Err(AppError::Config(format!(
+                "rooms[{}] requires upload_credential or upload.credential",
+                room.name
+            )));
+        };
+
+        Ok(RoomCredentials { record, upload })
+    }
+
+    pub fn credential_identity(&self, name: &str, label: &str) -> AppResult<CredentialIdentity> {
+        let credential = self.credentials.get(name).ok_or_else(|| {
+            AppError::Config(format!("{label} references unknown credential '{name}'"))
+        })?;
+        validate_cookie_file_path(
+            &credential.cookie_file,
+            &format!("credentials.{name}.cookie_file"),
+        )?;
+        Ok(CredentialIdentity::new(
+            name,
+            credential.cookie_file.clone(),
+        ))
+    }
 }
 
 impl RecordConfig {
     pub fn validate(&self) -> AppResult<()> {
-        if let Some(path) = &self.cookie_file {
-            validate_cookie_file_path(path, "record.cookie_file")?;
-        }
         self.min_segment_size_bytes()?;
         self.segment_time_duration()?;
         self.segment_size_bytes()?;
@@ -287,10 +394,6 @@ impl UploadConfig {
             ));
         }
         Ok(())
-    }
-
-    pub fn validate_cookie_file(&self) -> AppResult<()> {
-        validate_cookie_file_path(&self.cookie_file, "upload.cookie_file")
     }
 }
 
@@ -386,19 +489,17 @@ mod tests {
             std::path::PathBuf::from("./data/recordings")
         );
         assert_eq!(
-            config.record.cookie_file.as_deref(),
-            Some(std::path::Path::new("./data/cookies.json"))
+            config.credentials["main"].cookie_file,
+            std::path::PathBuf::from("./data/cookies.json")
         );
+        assert_eq!(config.record.credential.as_deref(), Some("main"));
         assert_eq!(config.record.segment_time.as_deref(), Some("01:00:00"));
         assert_eq!(config.record.segment_size.as_deref(), Some("2GiB"));
         assert_eq!(config.record.min_segment_size, "20MiB");
         assert_eq!(config.record.qn, 10000);
         assert!(config.record.cdn.is_empty());
         let upload = config.upload_config().unwrap();
-        assert_eq!(
-            upload.cookie_file,
-            std::path::PathBuf::from("./data/cookies.json")
-        );
+        assert_eq!(upload.credential.as_deref(), Some("main"));
         assert_eq!(upload.threads, 3);
         assert_eq!(upload.tid, 171);
         assert_eq!(upload.copyright, 2);
@@ -425,22 +526,22 @@ dir = "./data"
 [record]
 output_dir = "./rec"
 
-[upload]
+[credentials.main]
 cookie_file = "./data/cookies.json"
+
+[upload]
+credential = "main"
 
 [[rooms]]
 name = "test"
 url = "https://live.bilibili.com/1"
 "#;
         let config = AppConfig::parse(toml).unwrap();
-        assert!(config.record.cookie_file.is_none());
+        assert!(config.record.credential.is_none());
         assert_eq!(config.record.min_segment_size, "20MiB");
         assert_eq!(config.record.qn, 10000);
         let upload = config.upload_config().unwrap();
-        assert_eq!(
-            upload.cookie_file,
-            std::path::PathBuf::from("./data/cookies.json")
-        );
+        assert_eq!(upload.credential.as_deref(), Some("main"));
         assert_eq!(upload.line, "auto");
         assert_eq!(upload.threads, 3);
         assert_eq!(upload.tid, 171);
@@ -451,7 +552,7 @@ url = "https://live.bilibili.com/1"
     fn parse_upload_only_config() {
         let toml = r#"
 [upload]
-cookie_file = "./data/cookies.json"
+credential = "main"
 "#;
         let config = AppConfig::parse(toml).unwrap();
 
@@ -462,11 +563,11 @@ cookie_file = "./data/cookies.json"
             std::path::PathBuf::from("./data/recordings")
         );
         assert!(config.rooms.is_empty());
-        assert!(config.record.cookie_file.is_none());
+        assert!(config.record.credential.is_none());
 
         assert_eq!(
-            config.upload_config().unwrap().cookie_file,
-            std::path::PathBuf::from("./data/cookies.json")
+            config.upload_config().unwrap().credential.as_deref(),
+            Some("main")
         );
         assert_eq!(config.upload_config().unwrap().source, "直播录像");
     }
@@ -478,8 +579,38 @@ cookie_file = "./data/cookies.json"
 "#;
         let config = AppConfig::parse(toml).unwrap();
 
-        assert!(config.record.cookie_file.is_none());
+        assert!(config.record.credential.is_none());
         assert!(config.upload.is_none());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_top_level_and_section_fields() {
+        let top = AppConfig::parse(
+            r#"
+[pipline]
+backoff_s = 1
+"#,
+        )
+        .unwrap_err();
+        assert!(top.to_string().contains("unknown field"));
+
+        let data = AppConfig::parse(
+            r#"
+[data]
+directory = "./data"
+"#,
+        )
+        .unwrap_err();
+        assert!(data.to_string().contains("unknown field"));
+
+        let pipeline = AppConfig::parse(
+            r#"
+[pipeline]
+retry_forever = true
+"#,
+        )
+        .unwrap_err();
+        assert!(pipeline.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -491,11 +622,12 @@ cookie_file = "./data/cookies.json"
     #[test]
     fn credential_paths_are_explicit_not_defaulted() {
         let config = AppConfig::parse("").unwrap();
-        assert!(config.record.cookie_file.is_none());
+        assert!(config.record.credential.is_none());
         assert!(config.upload.is_none());
 
-        let err = AppConfig::parse("[upload]\n").unwrap_err();
-        assert!(err.to_string().contains("cookie_file"));
+        let config = AppConfig::parse("[upload]\n").unwrap();
+        let err = config.validate_for_upload().unwrap_err();
+        assert!(err.to_string().contains("upload.credential"));
     }
 
     #[test]
@@ -504,6 +636,9 @@ cookie_file = "./data/cookies.json"
         let toml = format!(
             r#"
 [record]
+credential = "main"
+
+[credentials.main]
 cookie_file = "{}"
 
 [[rooms]]
@@ -519,23 +654,72 @@ url = "https://live.bilibili.com/1"
     }
 
     #[test]
+    fn room_credentials_resolve_named_overrides() {
+        let main_cookie = tempfile::NamedTempFile::new().unwrap();
+        let record_cookie = tempfile::NamedTempFile::new().unwrap();
+        let upload_cookie = tempfile::NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[credentials.main]
+cookie_file = "{}"
+
+[credentials.record_alt]
+cookie_file = "{}"
+
+[credentials.upload_alt]
+cookie_file = "{}"
+
+[record]
+credential = "main"
+
+[upload]
+credential = "main"
+
+[[rooms]]
+name = "test"
+url = "https://live.bilibili.com/1"
+record_credential = "record_alt"
+upload_credential = "upload_alt"
+"#,
+            main_cookie.path().display(),
+            record_cookie.path().display(),
+            upload_cookie.path().display()
+        );
+        let config = AppConfig::parse(&toml).unwrap();
+        let credentials = config.room_credentials(&config.rooms[0]).unwrap();
+
+        assert_eq!(
+            credentials
+                .record
+                .as_ref()
+                .map(|credential| credential.cookie_file.as_path()),
+            Some(record_cookie.path())
+        );
+        assert_eq!(credentials.upload.name, "upload_alt");
+        assert_eq!(credentials.upload.cookie_file, upload_cookie.path());
+    }
+
+    #[test]
     fn record_validation_rejects_missing_cookie_file() {
         let config = AppConfig::parse(
             r#"
-[record]
+[credentials.main]
 cookie_file = "./definitely-missing-live-cookie.json"
+
+[record]
+credential = "main"
 "#,
         )
         .unwrap();
 
         let err = config.validate_for_check().unwrap_err();
-        assert!(err.to_string().contains("record.cookie_file"));
+        assert!(err.to_string().contains("credentials.main.cookie_file"));
     }
 
     #[test]
     fn record_config_default_matches_schema_defaults() {
         let config = RecordConfig::default();
-        assert!(config.cookie_file.is_none());
+        assert!(config.credential.is_none());
         assert_eq!(
             config.output_dir,
             std::path::PathBuf::from("./data/recordings")
@@ -591,7 +775,7 @@ cookie_file = "./definitely-missing-live-cookie.json"
     #[test]
     fn upload_validation_rejects_zero_threads() {
         let upload = UploadConfig {
-            cookie_file: "cookies.json".into(),
+            credential: Some("main".into()),
             line: "auto".into(),
             threads: 0,
             submit_api: SubmitApi::App,
@@ -612,7 +796,7 @@ cookie_file = "./definitely-missing-live-cookie.json"
         // submit_by_web wired up (Finding 8), both variants must validate.
         for api in [SubmitApi::App, SubmitApi::Web] {
             let upload = UploadConfig {
-                cookie_file: "cookies.json".into(),
+                credential: Some("main".into()),
                 line: "auto".into(),
                 threads: 3,
                 submit_api: api,
