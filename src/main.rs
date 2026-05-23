@@ -12,6 +12,13 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() {
+    // Initialize tracing once, before dispatch. Every subcommand's
+    // info!/warn!/error! output should reach the operator on stderr,
+    // regardless of which command they invoked. stdout stays reserved
+    // for machine-readable command output (e.g. `state inspect`,
+    // `state recover` dry-run plans).
+    init_tracing();
+
     let cli = Cli::parse();
 
     let result = match cli.command {
@@ -49,7 +56,6 @@ fn init_tracing() {
 }
 
 async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
-    init_tracing();
     let config = AppConfig::load(config_path)?;
     config.validate_for_run()?;
     tracing::info!("config loaded from {}", config_path.display());
@@ -528,8 +534,6 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
 /// upload, no pipeline state machine. Stops on Ctrl-C or when the stream
 /// ends. For long-running multi-room operation with auto-upload, use `run`.
 async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> AppResult<()> {
-    init_tracing();
-
     use bilive_rec::recorder::record_flv;
     use bilive_rec::recorder::segment::{SegmentEvent, SegmentPolicy};
     use bilive_rec::state::model::{LiveSession, SessionStatus};
