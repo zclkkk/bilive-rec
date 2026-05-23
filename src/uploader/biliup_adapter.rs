@@ -9,33 +9,40 @@ use biliup::uploader::credential::login_by_cookies;
 use biliup::uploader::line;
 use futures::StreamExt;
 use std::path::PathBuf;
+use tokio::sync::OnceCell;
 
 pub struct BiliupUploader {
     cookie_path: PathBuf,
     line: String,
     threads: usize,
     submit_api: SubmitApi,
+    // Login state owned here, initialized once lazily. A single BiliBili
+    // instance is reused across check_login / upload_segment / submit;
+    // before this, every call re-read cookies.json and built a fresh
+    // reqwest::Client, which is wasted work and obscured the question
+    // "who owns this login session?" with the answer "nobody".
+    bili: OnceCell<BiliBili>,
 }
 
 impl BiliupUploader {
-    pub fn new(
-        cookie_path: PathBuf,
-        line: String,
-        threads: usize,
-        submit_api: SubmitApi,
-    ) -> Self {
+    pub fn new(cookie_path: PathBuf, line: String, threads: usize, submit_api: SubmitApi) -> Self {
         Self {
             cookie_path,
             line,
             threads,
             submit_api,
+            bili: OnceCell::new(),
         }
     }
 
-    async fn get_bilibili(&self) -> AppResult<BiliBili> {
-        login_by_cookies(&self.cookie_path, None)
+    async fn get_bilibili(&self) -> AppResult<&BiliBili> {
+        self.bili
+            .get_or_try_init(|| async {
+                login_by_cookies(&self.cookie_path, None)
+                    .await
+                    .map_err(|e| AppError::Bilibili(format!("Biliup login failed: {}", e)))
+            })
             .await
-            .map_err(|e| AppError::Bilibili(format!("Biliup login failed: {}", e)))
     }
 }
 
@@ -70,7 +77,7 @@ impl Uploader for BiliupUploader {
         };
 
         let uploader = upos_line
-            .pre_upload(&bili, video_file)
+            .pre_upload(bili, video_file)
             .await
             .map_err(|e| AppError::Bilibili(format!("Pre-upload failed: {}", e)))?;
 
@@ -226,5 +233,41 @@ mod tests {
 
         assert!(err.to_string().contains("Submission (app) failed"));
         assert!(err.to_string().contains("code=-1"));
+    }
+
+    /// Failed login must not poison the OnceCell — a corrected cookie file
+    /// on a subsequent call should still get a chance to initialize.
+    /// (We can't easily test the success path without real Bilibili
+    /// credentials, but failure-doesn't-poison is the safety property
+    /// that matters for owner-of-login semantics.)
+    #[tokio::test]
+    async fn login_failure_does_not_poison_cell() {
+        let uploader = BiliupUploader::new(
+            PathBuf::from("/nonexistent/path/that/will/never/exist.json"),
+            "auto".into(),
+            1,
+            SubmitApi::App,
+        );
+
+        let err1 = uploader.get_bilibili().await.unwrap_err();
+        assert!(matches!(err1, AppError::Bilibili(_)));
+
+        // OnceCell::get_or_try_init returns the error without storing it,
+        // so a second call retries instead of returning the cached error.
+        let err2 = uploader.get_bilibili().await.unwrap_err();
+        assert!(matches!(err2, AppError::Bilibili(_)));
+
+        // And the cell is still empty — no half-initialized BiliBili.
+        assert!(uploader.bili.get().is_none());
+    }
+
+    /// Sanity check: BiliupUploader is Send + Sync, so it can live behind
+    /// the `Arc<U: Uploader + Send + Sync + 'static>` that RoomSupervisor
+    /// requires. If a future change adds a non-Send field this fails to
+    /// compile loudly.
+    #[test]
+    fn bili_up_uploader_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<BiliupUploader>();
     }
 }
