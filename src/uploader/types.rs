@@ -22,10 +22,30 @@ pub struct SubmissionRequest {
     pub parts: Vec<UploadedPart>,
 }
 
+/// Outcome of a remote submission call.
+///
+/// Bilibili's submit API can answer in three ways:
+///   - `Confirmed`: code=0 and at least one of aid/bvid is returned.
+///   - `Ambiguous`: code=0 but neither aid nor bvid is returned. The remote
+///     may have accepted the submission, but we cannot prove it locally
+///     without a follow-up query — operators must verify on Bilibili and
+///     resolve via `state resolve-submission`.
+///   - `Err(...)`: a locally known failure or explicit Bilibili rejection.
+///     Transport/response errors after the submit boundary must be mapped to
+///     `Ambiguous`, because the remote side may already have accepted it.
+///
+/// Folding Ambiguous into Err would lie about the remote state; folding it
+/// into Confirmed would silently lose the aid/bvid we need to navigate back
+/// to the upload. So it gets its own arm.
 #[derive(Debug, Clone)]
-pub struct SubmissionResult {
-    pub aid: Option<u64>,
-    pub bvid: Option<String>,
+pub enum SubmissionOutcome {
+    Confirmed {
+        aid: Option<u64>,
+        bvid: Option<String>,
+    },
+    Ambiguous {
+        reason: String,
+    },
 }
 
 pub trait Uploader: Send + Sync {
@@ -39,5 +59,5 @@ pub trait Uploader: Send + Sync {
     fn submit(
         &self,
         req: SubmissionRequest,
-    ) -> impl std::future::Future<Output = AppResult<SubmissionResult>> + Send;
+    ) -> impl std::future::Future<Output = AppResult<SubmissionOutcome>> + Send;
 }

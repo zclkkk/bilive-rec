@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::state::model::UploadedPart;
-use crate::uploader::types::{SubmissionRequest, SubmissionResult, UploadRequest, Uploader};
+use crate::uploader::types::{SubmissionOutcome, SubmissionRequest, UploadRequest, Uploader};
+use biliup::error::Kind as BiliupError;
 use biliup::uploader::VideoFile;
 use biliup::uploader::bilibili::{BiliBili, Studio, Video};
 use biliup::uploader::credential::login_by_cookies;
@@ -86,7 +87,7 @@ impl Uploader for BiliupUploader {
         })
     }
 
-    async fn submit(&self, req: SubmissionRequest) -> AppResult<SubmissionResult> {
+    async fn submit(&self, req: SubmissionRequest) -> AppResult<SubmissionOutcome> {
         let bili = self.get_bilibili().await?;
 
         let mut videos = Vec::new();
@@ -109,10 +110,10 @@ impl Uploader for BiliupUploader {
 
         studio.videos = videos;
 
-        let res = bili
-            .submit_by_app(&studio, None)
-            .await
-            .map_err(|e| AppError::Bilibili(format!("Submission failed: {}", e)))?;
+        let res = match bili.submit_by_app(&studio, None).await {
+            Ok(res) => res,
+            Err(error) => return submit_error_to_outcome("app", error),
+        };
 
         if res.code != 0 {
             return Err(AppError::Bilibili(format!("Bilibili API error: {}", res)));
@@ -131,12 +132,62 @@ impl Uploader for BiliupUploader {
         }
 
         if aid.is_none() && bvid.is_none() {
-            return Err(AppError::Bilibili(format!(
-                "Submission succeeded but no aid/bvid returned. Response context: {}",
-                res
-            )));
+            // Bilibili accepted the submission (code=0) but did not return any
+            // identifier — we cannot prove locally whether the video was
+            // actually created. Surface it as Ambiguous so the operator can
+            // verify on Bilibili and resolve via `state resolve-submission`.
+            Ok(SubmissionOutcome::Ambiguous {
+                reason: format!(
+                    "Bilibili API returned code=0 but no aid/bvid; response: {}",
+                    res
+                ),
+            })
+        } else {
+            Ok(SubmissionOutcome::Confirmed { aid, bvid })
         }
+    }
+}
 
-        Ok(SubmissionResult { aid, bvid })
+fn submit_error_to_outcome(api: &str, error: BiliupError) -> AppResult<SubmissionOutcome> {
+    match error {
+        BiliupError::Reqwest(error) => Ok(SubmissionOutcome::Ambiguous {
+            reason: format!("Submission ({api}) outcome unknown after HTTP error: {error}"),
+        }),
+        BiliupError::SerdeJson(error) => Ok(SubmissionOutcome::Ambiguous {
+            reason: format!(
+                "Submission ({api}) outcome unknown after response parse error: {error}"
+            ),
+        }),
+        other => Err(AppError::Bilibili(format!(
+            "Submission ({api}) failed: {other}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_response_parse_error_is_ambiguous() {
+        let parse_error = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let outcome = submit_error_to_outcome("app", BiliupError::SerdeJson(parse_error)).unwrap();
+
+        match outcome {
+            SubmissionOutcome::Ambiguous { reason } => {
+                assert!(reason.contains("outcome unknown"));
+                assert!(reason.contains("response parse"));
+            }
+            SubmissionOutcome::Confirmed { .. } => panic!("parse error must not be confirmed"),
+        }
+    }
+
+    #[test]
+    fn submit_explicit_biliup_custom_error_is_failed() {
+        let err = submit_error_to_outcome("app", BiliupError::Custom("code=-1".into()))
+            .expect_err("explicit remote rejection should stay an error");
+
+        assert!(err.to_string().contains("Submission (app) failed"));
+        assert!(err.to_string().contains("code=-1"));
     }
 }

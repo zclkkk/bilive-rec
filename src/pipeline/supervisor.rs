@@ -21,7 +21,7 @@ use crate::state::model::{
     LiveSession, SegmentStatus, SessionStatus, Submission, SubmissionStatus,
 };
 use crate::state::store::StateStore;
-use crate::uploader::types::{SubmissionRequest, Uploader};
+use crate::uploader::types::{SubmissionOutcome, SubmissionRequest, Uploader};
 use crate::uploader::validation::{
     PersistedUploadFailure, upload_and_persist_segment, validate_finalized_segment_for_upload,
 };
@@ -731,6 +731,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         SubmissionStatus::Pending => {
                             return Err(AppError::State("Pending submission is unknown/in-flight and requires Phase 6 recovery/manual verification.".into()));
                         }
+                        SubmissionStatus::Ambiguous => {
+                            return Err(AppError::State("Ambiguous submission — Bilibili accepted but did not return aid/bvid; requires manual verification and `state recover --resolve-submission`.".into()));
+                        }
                     }
                 } else {
                     // Mark LiveSession as finalized
@@ -818,10 +821,27 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 self.store.put_submission(&sub)?;
 
                 match self.uploader.submit(req).await {
-                    Ok(res) => {
+                    Ok(SubmissionOutcome::Confirmed { aid, bvid }) => {
                         sub.status = SubmissionStatus::Submitted;
-                        sub.aid = res.aid;
-                        sub.bvid = res.bvid;
+                        sub.aid = aid;
+                        sub.bvid = bvid;
+                        self.store.put_submission(&sub)?;
+                        self.transition(PipelineState::Submitted)?;
+                    }
+                    Ok(SubmissionOutcome::Ambiguous { reason }) => {
+                        // The submit call completed without error, so the pipeline
+                        // *action* succeeded — transition to Submitted. But the
+                        // submission status records that we don't actually know
+                        // whether Bilibili created the video. Operators must
+                        // verify on Bilibili and use
+                        // `state recover --resolve-submission`.
+                        warn!(
+                            session_id = %active_session,
+                            "Submission outcome is ambiguous: {}",
+                            reason
+                        );
+                        sub.status = SubmissionStatus::Ambiguous;
+                        sub.error = Some(reason);
                         self.store.put_submission(&sub)?;
                         self.transition(PipelineState::Submitted)?;
                     }
@@ -853,12 +873,21 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 mod tests {
     use super::*;
     use crate::state::model::UploadedPart;
-    use crate::uploader::types::{SubmissionResult, UploadRequest};
+    use crate::uploader::types::UploadRequest;
+
+    /// What the FakeUploader should do on the next `submit` call.
+    #[derive(Debug, Clone)]
+    enum SubmitBehavior {
+        Confirmed { aid: Option<u64>, bvid: Option<String> },
+        Ambiguous { reason: String },
+        Err(String),
+    }
 
     struct FakeUploader {
         submit_count: std::sync::atomic::AtomicUsize,
         upload_count: std::sync::atomic::AtomicUsize,
         last_submission: std::sync::Mutex<Option<SubmissionRequest>>,
+        submit_behavior: std::sync::Mutex<SubmitBehavior>,
     }
 
     impl FakeUploader {
@@ -867,6 +896,10 @@ mod tests {
                 submit_count: std::sync::atomic::AtomicUsize::new(0),
                 upload_count: std::sync::atomic::AtomicUsize::new(0),
                 last_submission: std::sync::Mutex::new(None),
+                submit_behavior: std::sync::Mutex::new(SubmitBehavior::Confirmed {
+                    aid: Some(1),
+                    bvid: Some("bv1".to_string()),
+                }),
             }
         }
 
@@ -880,6 +913,10 @@ mod tests {
 
         fn last_submission(&self) -> Option<SubmissionRequest> {
             self.last_submission.lock().unwrap().clone()
+        }
+
+        fn set_submit_behavior(&self, behavior: SubmitBehavior) {
+            *self.submit_behavior.lock().unwrap() = behavior;
         }
     }
 
@@ -897,14 +934,19 @@ mod tests {
                 part_title: req.part_title,
             })
         }
-        async fn submit(&self, _req: SubmissionRequest) -> AppResult<SubmissionResult> {
+        async fn submit(&self, _req: SubmissionRequest) -> AppResult<SubmissionOutcome> {
             self.submit_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.last_submission.lock().unwrap() = Some(_req);
-            Ok(SubmissionResult {
-                aid: Some(1),
-                bvid: Some("bv1".to_string()),
-            })
+            match self.submit_behavior.lock().unwrap().clone() {
+                SubmitBehavior::Confirmed { aid, bvid } => {
+                    Ok(SubmissionOutcome::Confirmed { aid, bvid })
+                }
+                SubmitBehavior::Ambiguous { reason } => {
+                    Ok(SubmissionOutcome::Ambiguous { reason })
+                }
+                SubmitBehavior::Err(msg) => Err(AppError::Bilibili(msg)),
+            }
         }
     }
 
@@ -1473,5 +1515,106 @@ mod tests {
 
         assert_eq!(supervisor.session.state, PipelineState::Submitting);
         assert_eq!(uploader.get_submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_submitting_records_ambiguous_outcome() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let uploader = Arc::new(FakeUploader::new());
+        uploader.set_submit_behavior(SubmitBehavior::Ambiguous {
+            reason: "code=0 but no aid/bvid".into(),
+        });
+
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+
+        let session_id = put_recording_session(&store, 1);
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+
+        store
+            .put_uploaded_part(&UploadedPart {
+                session_id,
+                segment_index: 0,
+                bili_filename: "fake_file".into(),
+                part_title: "part 0".into(),
+            })
+            .unwrap();
+
+        // submit succeeds (the pipeline action completed), but the submission
+        // status records the outcome as Ambiguous.
+        supervisor.run_step().await.unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::Submitted);
+        assert_eq!(uploader.get_submit_count(), 1);
+
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, SubmissionStatus::Ambiguous);
+        assert!(sub.aid.is_none());
+        assert!(sub.bvid.is_none());
+        assert!(sub.error.as_deref().unwrap().contains("no aid/bvid"));
+    }
+
+    #[tokio::test]
+    async fn test_submitting_refuses_existing_ambiguous_submission() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let uploader = Arc::new(FakeUploader::new());
+
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+
+        let session_id = put_recording_session(&store, 1);
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+
+        // Pre-existing Ambiguous submission from a prior run.
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Ambiguous,
+                aid: None,
+                bvid: None,
+                error: Some("prior ambiguous outcome".into()),
+            })
+            .unwrap();
+
+        let err = supervisor.run_step().await.unwrap_err();
+        assert!(matches!(err, AppError::State(ref msg) if msg.contains("Ambiguous")));
+        // Refused — no re-submission.
+        assert_eq!(uploader.get_submit_count(), 0);
+        // Status stayed Ambiguous; no automatic flip.
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, SubmissionStatus::Ambiguous);
+    }
+
+    #[tokio::test]
+    async fn test_submitting_records_failed_on_remote_error() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let uploader = Arc::new(FakeUploader::new());
+        uploader.set_submit_behavior(SubmitBehavior::Err("network reset".into()));
+
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+
+        let session_id = put_recording_session(&store, 1);
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+
+        store
+            .put_uploaded_part(&UploadedPart {
+                session_id,
+                segment_index: 0,
+                bili_filename: "fake_file".into(),
+                part_title: "part 0".into(),
+            })
+            .unwrap();
+
+        // submit Err → SubmissionStatus::Failed, pipeline → Failed.
+        let _ = supervisor.run_step().await;
+
+        assert_eq!(supervisor.session.state, PipelineState::Failed);
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, SubmissionStatus::Failed);
+        assert!(sub.error.as_deref().unwrap().contains("network reset"));
     }
 }

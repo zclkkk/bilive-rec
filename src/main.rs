@@ -538,7 +538,9 @@ async fn upload_cmd(
     use bilive_rec::state::model::{Submission, SubmissionStatus};
     use bilive_rec::state::store::StateStore;
     use bilive_rec::uploader::biliup_adapter::BiliupUploader;
-    use bilive_rec::uploader::types::{SubmissionRequest, UploadRequest, Uploader};
+    use bilive_rec::uploader::types::{
+        SubmissionOutcome, SubmissionRequest, UploadRequest, Uploader,
+    };
     use uuid::Uuid;
 
     let config = match config_path {
@@ -655,19 +657,35 @@ async fn upload_cmd(
 
     let res = uploader.submit(submit_req).await;
     match res {
-        Ok(sres) => {
+        Ok(SubmissionOutcome::Confirmed { aid, bvid }) => {
             submission.status = SubmissionStatus::Submitted;
-            submission.aid = sres.aid;
-            submission.bvid = sres.bvid.clone();
+            submission.aid = aid;
+            submission.bvid = bvid.clone();
             store.put_submission(&submission)?;
 
             println!("Submission complete!");
-            if let Some(ref bvid) = sres.bvid {
-                println!("BVID: {}", bvid);
+            if let Some(ref b) = bvid {
+                println!("BVID: {}", b);
             }
-            if let Some(aid) = sres.aid {
-                println!("AID: {}", aid);
+            if let Some(a) = aid {
+                println!("AID: {}", a);
             }
+        }
+        Ok(SubmissionOutcome::Ambiguous { reason }) => {
+            submission.status = SubmissionStatus::Ambiguous;
+            submission.error = Some(reason.clone());
+            store.put_submission(&submission)?;
+
+            println!("Submission accepted but outcome is AMBIGUOUS.");
+            println!("Bilibili did not return aid/bvid; verify on Bilibili and");
+            println!(
+                "resolve via: bilive-rec state recover --resolve-submission {} --as submitted|failed",
+                session_id
+            );
+            println!("Reason: {}", reason);
+            return Err(bilive_rec::error::AppError::Bilibili(format!(
+                "submission ambiguous: {reason}"
+            )));
         }
         Err(e) => {
             submission.status = SubmissionStatus::Failed;

@@ -71,8 +71,14 @@ pub enum SegmentStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubmissionStatus {
+    /// Submission has been initiated but not yet confirmed.
     Pending,
+    /// Submission was confirmed by Bilibili (aid and/or bvid returned).
     Submitted,
+    /// Bilibili accepted the submission (code=0) but did not return aid/bvid;
+    /// the remote outcome is unknown and must be verified manually.
+    Ambiguous,
+    /// Submission failed and no remote artifact is expected.
     Failed,
 }
 
@@ -117,6 +123,7 @@ mod tests {
         for status in [
             SubmissionStatus::Pending,
             SubmissionStatus::Submitted,
+            SubmissionStatus::Ambiguous,
             SubmissionStatus::Failed,
         ] {
             let json = serde_json::to_string(&status).unwrap();

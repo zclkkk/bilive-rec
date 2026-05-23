@@ -19,6 +19,8 @@ pub enum AnomalyKind {
     PendingSubmission,
     /// A submission has Failed
     FailedSubmission,
+    /// A submission is Ambiguous (Bilibili accepted but did not return aid/bvid)
+    AmbiguousSubmission,
     /// A room's pipeline is stuck in Failed state
     FailedPipeline,
     /// A segment references a file path that does not exist on disk
@@ -229,6 +231,16 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                     description: format!(
                         "Submission for session {} is Pending — outcome unknown, requires manual verification",
                         submission.session_id
+                    ),
+                });
+            }
+            SubmissionStatus::Ambiguous => {
+                let error_detail = submission.error.as_deref().unwrap_or("no detail");
+                anomalies.push(Anomaly {
+                    kind: AnomalyKind::AmbiguousSubmission,
+                    description: format!(
+                        "Submission for session {} is Ambiguous (Bilibili accepted but did not return aid/bvid): {}",
+                        submission.session_id, error_detail
                     ),
                 });
             }
@@ -481,6 +493,7 @@ pub fn plan_recovery(
                         let status_word = match sub.status {
                             SubmissionStatus::Submitted => "Submitted",
                             SubmissionStatus::Pending => "Pending",
+                            SubmissionStatus::Ambiguous => "Ambiguous",
                             SubmissionStatus::Failed => "Failed",
                         };
                         actions.push(RecoveryAction::LeaveAsIs {
@@ -558,12 +571,25 @@ pub fn plan_recovery(
         }
     }
 
-    // 4. Pending submissions — ambiguous, must not auto-retry
+    // 4. Pending submissions — outcome unknown, must not auto-retry
     for submission in &submissions {
         if submission.status == SubmissionStatus::Pending {
             actions.push(RecoveryAction::LeaveAsIs {
                 reason: format!(
                     "Pending submission {} — outcome unknown, requires manual verification",
+                    submission.session_id
+                ),
+            });
+        }
+    }
+
+    // 4b. Ambiguous submissions — Bilibili accepted but did not return aid/bvid;
+    // we cannot prove whether the video was created. Manual verification required.
+    for submission in &submissions {
+        if submission.status == SubmissionStatus::Ambiguous {
+            actions.push(RecoveryAction::LeaveAsIs {
+                reason: format!(
+                    "Ambiguous submission {} — Bilibili accepted but did not return aid/bvid; verify on Bilibili and use `state recover --resolve-submission`",
                     submission.session_id
                 ),
             });
@@ -1187,6 +1213,64 @@ mod tests {
     }
 
     #[test]
+    fn detect_ambiguous_submission() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Ambiguous,
+                aid: None,
+                bvid: None,
+                error: Some("Bilibili returned code=0 but no aid/bvid".to_string()),
+            })
+            .unwrap();
+
+        let anomalies = detect_anomalies(&store).unwrap();
+        let ambig = anomalies
+            .iter()
+            .find(|a| a.kind == AnomalyKind::AmbiguousSubmission)
+            .expect("expected an AmbiguousSubmission anomaly");
+        assert!(ambig.description.contains("Ambiguous"));
+        assert!(ambig.description.contains("aid/bvid") || ambig.description.contains("code=0"));
+    }
+
+    #[test]
+    fn plan_recovery_leaves_ambiguous_submission_alone() {
+        let (store, _dir) = test_store();
+        let session_id = Uuid::new_v4();
+
+        store
+            .put_submission(&Submission {
+                session_id,
+                status: SubmissionStatus::Ambiguous,
+                aid: None,
+                bvid: None,
+                error: Some("ambiguous".into()),
+            })
+            .unwrap();
+
+        let plan =
+            plan_recovery(&store, &HashSet::new(), &HashSet::new()).unwrap();
+
+        let leave_msgs: Vec<&String> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                RecoveryAction::LeaveAsIs { reason } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            leave_msgs
+                .iter()
+                .any(|msg| msg.contains("Ambiguous submission")
+                    && msg.contains("resolve-submission"))
+        );
+    }
+
+    #[test]
     fn detect_failed_submission() {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
@@ -1654,8 +1738,8 @@ mod tests {
         async fn submit(
             &self,
             _req: crate::uploader::types::SubmissionRequest,
-        ) -> AppResult<crate::uploader::types::SubmissionResult> {
-            Ok(crate::uploader::types::SubmissionResult {
+        ) -> AppResult<crate::uploader::types::SubmissionOutcome> {
+            Ok(crate::uploader::types::SubmissionOutcome::Confirmed {
                 aid: None,
                 bvid: None,
             })

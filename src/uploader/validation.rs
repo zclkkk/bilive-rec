@@ -117,6 +117,7 @@ pub fn validate_finalized_segment_for_upload(
         let status = match submission.status {
             SubmissionStatus::Submitted => "Submitted",
             SubmissionStatus::Pending => "Pending",
+            SubmissionStatus::Ambiguous => "Ambiguous",
             SubmissionStatus::Failed => "Failed",
         };
         return Ok(Err(format!(
