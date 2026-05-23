@@ -187,39 +187,65 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         Ok(supervisor)
     }
 
-    /// Perform a single state transition, updating internal state and persisting it.
-    pub fn transition(&mut self, next: PipelineState) -> AppResult<()> {
-        let prev = self.session.state;
+    /// Validate the transition `prev -> next` against the state machine
+    /// table and the active-session invariant. Used as a precondition by
+    /// both `transition` (which persists first) and the atomic-write paths
+    /// that bundle the pipeline state with other rows (which must validate
+    /// *before* persisting so an invalid transition cannot poison disk
+    /// state).
+    fn check_transition(&self, next: PipelineState) -> AppResult<()> {
+        self.check_transition_with_active_session(next, self.active_session_id)
+    }
 
-        if !prev.can_transition_to(next) {
+    fn check_transition_with_active_session(
+        &self,
+        next: PipelineState,
+        active_session_id: Option<Uuid>,
+    ) -> AppResult<()> {
+        if !self.session.state.can_transition_to(next) {
             return Err(AppError::State(format!(
                 "Invalid pipeline state transition from {:?} to {:?}",
-                prev, next
+                self.session.state, next
             )));
         }
+        if pipeline_state_requires_active_session(next) && active_session_id.is_none() {
+            return Err(AppError::State(format!(
+                "Pipeline state {:?} requires an active session",
+                next
+            )));
+        }
+        Ok(())
+    }
 
-        let active_session_id = if pipeline_state_requires_active_session(next) {
-            Some(self.active_session_id.ok_or_else(|| {
-                AppError::State(format!(
-                    "Pipeline state {:?} requires an active session",
-                    next
-                ))
-            })?)
-        } else {
-            None
-        };
-
-        self.store
-            .put_room_pipeline_state(self.room_id, next, active_session_id)?;
-
+    /// Apply an in-memory state transition that has already been persisted.
+    /// Callers must have validated with `check_transition` and persisted
+    /// the new pipeline state to redb before invoking this. The re-check
+    /// here is a safety net — if it ever fires it means a caller skipped
+    /// the contract and we should refuse to silently corrupt in-memory
+    /// state to match a bad on-disk write.
+    fn apply_transition(&mut self, next: PipelineState) -> AppResult<()> {
+        self.check_transition(next)?;
+        let prev = self.session.state;
         if !pipeline_state_requires_active_session(next) {
             self.active_session_id = None;
         }
-
         self.session.state = next;
-
         info!(room_id = self.room_id, from = ?prev, to = ?next, "Pipeline state transition");
         Ok(())
+    }
+
+    /// Validate, persist, and apply a state transition. The common path
+    /// where the pipeline state is the only thing changing on disk.
+    pub fn transition(&mut self, next: PipelineState) -> AppResult<()> {
+        self.check_transition(next)?;
+        let active_session_id = if pipeline_state_requires_active_session(next) {
+            self.active_session_id
+        } else {
+            None
+        };
+        self.store
+            .put_room_pipeline_state(self.room_id, next, active_session_id)?;
+        self.apply_transition(next)
     }
 
     /// Main state machine pump. Blocks when performing long tasks (e.g. recording, uploading).
@@ -243,17 +269,23 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                     status: SessionStatus::Recording,
                                 };
 
+                                // Validate before the atomic write: an invalid
+                                // transition must not be persisted, even via
+                                // bundled writes. (Resolving -> Recording is in
+                                // the table, but we're not going to trust that
+                                // by hand — every caller of the state machine
+                                // goes through check_transition.)
+                                self.check_transition_with_active_session(
+                                    PipelineState::Recording,
+                                    Some(session_id),
+                                )?;
                                 self.store.put_session_and_pipeline_state(
                                     &live_session,
                                     self.room_id,
                                     PipelineState::Recording,
                                 )?;
-
                                 self.active_session_id = Some(session_id);
-
-                                let prev = self.session.state;
-                                self.session.state = PipelineState::Recording;
-                                info!(room_id = self.room_id, from = ?prev, to = ?PipelineState::Recording, "Pipeline state transition");
+                                self.apply_transition(PipelineState::Recording)?;
                                 self.offline_since = None;
                             } else {
                                 self.offline_since = None;
@@ -878,8 +910,13 @@ mod tests {
     /// What the FakeUploader should do on the next `submit` call.
     #[derive(Debug, Clone)]
     enum SubmitBehavior {
-        Confirmed { aid: Option<u64>, bvid: Option<String> },
-        Ambiguous { reason: String },
+        Confirmed {
+            aid: Option<u64>,
+            bvid: Option<String>,
+        },
+        Ambiguous {
+            reason: String,
+        },
         Err(String),
     }
 
@@ -942,9 +979,7 @@ mod tests {
                 SubmitBehavior::Confirmed { aid, bvid } => {
                     Ok(SubmissionOutcome::Confirmed { aid, bvid })
                 }
-                SubmitBehavior::Ambiguous { reason } => {
-                    Ok(SubmissionOutcome::Ambiguous { reason })
-                }
+                SubmitBehavior::Ambiguous { reason } => Ok(SubmissionOutcome::Ambiguous { reason }),
                 SubmitBehavior::Err(msg) => Err(AppError::Bilibili(msg)),
             }
         }
@@ -1039,6 +1074,61 @@ mod tests {
 
         // Go back to idle
         supervisor.transition(PipelineState::Idle).unwrap();
+        assert_eq!(supervisor.session.state, PipelineState::Idle);
+    }
+
+    #[test]
+    fn test_transition_rejects_invalid_jump_and_leaves_disk_clean() {
+        let mut supervisor = mock_supervisor();
+        let room_id = supervisor.room_id;
+        let store = supervisor.store.clone();
+
+        // Idle -> Recording is not in the state-machine table.
+        let err = supervisor
+            .transition(PipelineState::Recording)
+            .expect_err("invalid transition must be rejected");
+        assert!(matches!(err, AppError::State(_)));
+        assert_eq!(supervisor.session.state, PipelineState::Idle);
+        // No pipeline state should have been written to redb.
+        assert!(store.get_pipeline_state(room_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_transition_rejects_target_without_active_session() {
+        let mut supervisor = mock_supervisor();
+        let room_id = supervisor.room_id;
+        let store = supervisor.store.clone();
+
+        // Drive to Resolving legitimately so the transition table allows
+        // Resolving -> Recording. But active_session_id is still None, so
+        // Recording (which requires a session) must be refused.
+        supervisor.transition(PipelineState::Resolving).unwrap();
+        let err = supervisor
+            .transition(PipelineState::Recording)
+            .expect_err("Recording without active_session_id must be rejected");
+        assert!(
+            matches!(err, AppError::State(ref msg) if msg.contains("requires an active session"))
+        );
+        // Disk state still Resolving — no half-written Recording row.
+        assert_eq!(
+            store.get_pipeline_state(room_id).unwrap(),
+            Some(PipelineState::Resolving)
+        );
+    }
+
+    #[test]
+    fn test_apply_transition_is_safety_net_for_atomic_write_callers() {
+        // Simulates a caller that bundled the pipeline state with another
+        // write but skipped check_transition. apply_transition's internal
+        // re-check must catch the invalid transition and refuse to update
+        // the in-memory state — at that point on-disk state is already
+        // corrupt, but at least the in-memory state machine refuses to
+        // pretend it's fine.
+        let mut supervisor = mock_supervisor();
+        let err = supervisor
+            .apply_transition(PipelineState::Recording)
+            .expect_err("apply_transition must re-check");
+        assert!(matches!(err, AppError::State(_)));
         assert_eq!(supervisor.session.state, PipelineState::Idle);
     }
 
