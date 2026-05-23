@@ -15,15 +15,8 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Login => {
-            println!("not implemented: login");
-            Ok(())
-        }
         Command::Check { room_url, config } => check_cmd(&room_url, config.as_deref()).await,
-        Command::Record { room_url } => {
-            println!("not implemented: record {room_url}");
-            Ok(())
-        }
+        Command::Record { room_url, config } => record_cmd(&room_url, config.as_deref()).await,
         Command::Upload {
             files,
             title,
@@ -530,6 +523,163 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
     Ok(())
 }
 
+/// One-shot recording. Resolves the room, captures the stream into the
+/// configured output dir, and persists a LiveSession + segment rows. No
+/// upload, no pipeline state machine. Stops on Ctrl-C or when the stream
+/// ends. For long-running multi-room operation with auto-upload, use `run`.
+async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> AppResult<()> {
+    init_tracing();
+
+    use bilive_rec::recorder::record_flv;
+    use bilive_rec::recorder::segment::{SegmentEvent, SegmentPolicy};
+    use bilive_rec::state::model::{LiveSession, SessionStatus};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    let config = match config_path {
+        None => {
+            let default_path = std::path::Path::new("config.toml");
+            if default_path.exists() {
+                AppConfig::load(default_path)?
+            } else {
+                AppConfig::parse("")?
+            }
+        }
+        Some(path) => AppConfig::load(path)?,
+    };
+    config.validate_for_check()?;
+
+    let client = BiliClient::from_optional_cookie_file(config.record.cookie_file.as_deref())?;
+    let room_id = bilibili::room::resolve_room_id(&client, room_url).await?;
+
+    let room_info = bilibili::room::fetch_room_info(&client, room_id).await?;
+    if !room_info.live_status.is_live() {
+        println!("offline");
+        println!("room_id = {}", room_info.room_id);
+        println!("title = {}", room_info.title);
+        return Ok(());
+    }
+
+    let play_info_resp =
+        bilibili::stream::fetch_play_info(&client, room_info.room_id, config.record.qn).await?;
+    let candidates = bilibili::stream::parse_stream_candidates(&play_info_resp)?;
+    let candidate =
+        bilibili::stream::select_healthy_stream_candidate(&candidates, &config.record, &client)
+            .await?
+            .ok_or_else(|| {
+                bilive_rec::error::AppError::Bilibili("no healthy stream candidates".into())
+            })?;
+
+    tracing::info!(
+        room_id = room_info.room_id,
+        url = candidate.url.as_str(),
+        "selected stream candidate"
+    );
+
+    // Persist truth before risk: create the LiveSession row before we open
+    // the network stream. If the process dies mid-record, `state inspect`
+    // can still see the session and its segments.
+    let db_path = config.data.dir.join("state.redb");
+    let store = Arc::new(bilive_rec::state::store::StateStore::open(&db_path)?);
+
+    let session_id = Uuid::new_v4();
+    let live_session = LiveSession {
+        id: session_id,
+        room_key: room_info.room_id.to_string(),
+        title: room_info.title.clone(),
+        started_at: jiff::Timestamp::now(),
+        status: SessionStatus::Recording,
+    };
+    store.put_session(&live_session)?;
+    println!("session_id = {session_id}");
+
+    let policy = SegmentPolicy {
+        output_dir: config.record.output_dir.clone(),
+        segment_time: config.record.segment_time_duration()?,
+        segment_size: config.record.segment_size_bytes()?,
+        min_segment_size: config.record.min_segment_size_bytes()?,
+    };
+
+    let resp = client
+        .stream_client()
+        .get(&candidate.url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://live.bilibili.com/")
+        .send()
+        .await?;
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SegmentEvent>();
+    let event_drain = tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                SegmentEvent::Started {
+                    index, part_path, ..
+                } => {
+                    println!("started segment {index} at {}", part_path.display());
+                }
+                SegmentEvent::Finalized {
+                    index, path, size, ..
+                } => {
+                    println!(
+                        "finalized segment {index} ({size} bytes) at {}",
+                        path.display()
+                    );
+                }
+                SegmentEvent::Filtered { index, size, .. } => {
+                    println!("filtered segment {index} (too small: {size} bytes)");
+                }
+            }
+        }
+    });
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Forward the first Ctrl-C into the shared shutdown channel. We don't
+    // spawn the recorder itself in a task because record_flv takes
+    // &StateStore (no Arc), which can't live on a 'static future.
+    let shutdown_tx_clone = shutdown_tx.clone();
+    let signal_task = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Ctrl-C received; signaling graceful shutdown");
+            let _ = shutdown_tx_clone.send(true);
+        }
+    });
+
+    let record_result = record_flv(
+        resp,
+        session_id,
+        policy,
+        store.as_ref(),
+        event_tx,
+        1,
+        shutdown_rx,
+    )
+    .await;
+
+    signal_task.abort();
+    let _ = event_drain.await;
+
+    // Persist session status reflecting the outcome.
+    let session_status = match &record_result {
+        Ok(()) | Err(bilive_rec::error::AppError::GracefulShutdown) => SessionStatus::Finalized,
+        Err(_) => SessionStatus::Failed,
+    };
+    let mut updated = live_session;
+    updated.status = session_status;
+    store.put_session(&updated)?;
+
+    match record_result {
+        Ok(()) => {
+            println!("recording complete");
+            Ok(())
+        }
+        Err(bilive_rec::error::AppError::GracefulShutdown) => {
+            println!("recording interrupted by Ctrl-C; session marked Finalized");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
 async fn upload_cmd(
     files: Vec<std::path::PathBuf>,
     title: Option<String>,
@@ -761,17 +911,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_room_result_graceful_shutdown() {
-        let handle =
-            tokio::spawn(async { Err(bilive_rec::error::AppError::GracefulShutdown) });
+        let handle = tokio::spawn(async { Err(bilive_rec::error::AppError::GracefulShutdown) });
         let res = handle.await;
         assert!(!process_room_result(res));
     }
 
     #[tokio::test]
     async fn test_process_room_result_fatal_error() {
-        let handle = tokio::spawn(
-            async { Err(bilive_rec::error::AppError::State("room is in Failed".into())) },
-        );
+        let handle = tokio::spawn(async {
+            Err(bilive_rec::error::AppError::State(
+                "room is in Failed".into(),
+            ))
+        });
         let res = handle.await;
         assert!(process_room_result(res));
     }
@@ -794,7 +945,9 @@ mod tests {
             FuturesUnordered::new();
         handles.push(tokio::spawn(async { Ok(()) }));
         handles.push(tokio::spawn(async {
-            Err(bilive_rec::error::AppError::State("simulated room failure".into()))
+            Err(bilive_rec::error::AppError::State(
+                "simulated room failure".into(),
+            ))
         }));
         handles.push(tokio::spawn(async {
             Err(bilive_rec::error::AppError::GracefulShutdown)

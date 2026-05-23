@@ -12,9 +12,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Log in to Bilibili
-    Login,
-
     /// Check live status of a room
     Check {
         /// Room URL (e.g. https://live.bilibili.com/123456)
@@ -25,10 +22,18 @@ pub enum Command {
         config: Option<PathBuf>,
     },
 
-    /// Record a live stream
+    /// Record a live stream once (no upload, no pipeline state machine).
+    ///
+    /// Use this for ad-hoc recording. Stops on Ctrl-C or when the stream
+    /// ends. For long-running multi-room operation with auto-upload, use
+    /// `run` with a config.toml.
     Record {
-        /// Room URL
+        /// Room URL (e.g. https://live.bilibili.com/123456)
         room_url: String,
+
+        /// Path to config file (defaults to ./config.toml if it exists)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
 
     /// Upload recorded files
