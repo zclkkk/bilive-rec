@@ -3,7 +3,7 @@ use crate::state::model::UploadedPart;
 use crate::uploader::types::{SubmissionOutcome, SubmissionRequest, UploadRequest, Uploader};
 use biliup::error::Kind as BiliupError;
 use biliup::uploader::VideoFile;
-use biliup::uploader::bilibili::{BiliBili, Studio, Video};
+use biliup::uploader::bilibili::{BiliBili, Video};
 use biliup::uploader::credential::login_by_cookies;
 use biliup::uploader::line;
 use futures::StreamExt;
@@ -97,18 +97,41 @@ impl Uploader for BiliupUploader {
             videos.push(video);
         }
 
-        // We use serde_json to populate Studio since it has many fields and builder patterns might change
-        let mut studio: Studio = serde_json::from_value(serde_json::json!({
-            "copyright": req.copyright,
-            "source": req.source,
-            "tid": req.tid,
-            "title": req.title,
-            "desc": req.description,
-            "tag": req.tags.join(","),
-        }))
-        .map_err(|e| AppError::Bilibili(format!("Failed to build Studio: {}", e)))?;
-
-        studio.videos = videos;
+        // Construct Studio by explicit field assignment. The previous
+        // implementation hopped through serde_json::from_value(json!({...}))
+        // which let biliup's Studio shape leak in via untyped JSON — if
+        // biliup renamed a field or changed a type we'd silently send the
+        // wrong thing. With named-field construction the compiler breaks
+        // loudly when the upstream schema moves, and the boundary stays
+        // explicit at this one site.
+        let studio = biliup::uploader::bilibili::Studio {
+            copyright: req.copyright,
+            source: req.source,
+            tid: req.tid,
+            cover: String::new(),
+            title: req.title,
+            desc_format_id: 0,
+            desc: req.description,
+            desc_v2: None,
+            dynamic: String::new(),
+            subtitle: biliup::uploader::bilibili::Subtitle::default(),
+            tag: req.tags.join(","),
+            videos,
+            dtime: None,
+            open_subtitle: false,
+            interactive: 0,
+            mission_id: None,
+            dolby: 0,
+            lossless_music: 0,
+            no_reprint: 0,
+            is_only_self: None,
+            charging_pay: 0,
+            aid: None,
+            up_selection_reply: false,
+            up_close_reply: false,
+            up_close_danmu: false,
+            extra_fields: None,
+        };
 
         let res = match bili.submit_by_app(&studio, None).await {
             Ok(res) => res,
