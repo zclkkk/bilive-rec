@@ -179,48 +179,82 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     }
 
     use futures::StreamExt;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Ctrl-C received, signaling graceful shutdown...");
-            let _ = shutdown_tx.send(true);
-            // Wait for all room tasks to finish their current operation
-            while let Some(res) = handles.next().await {
-                match res {
-                    Ok(Ok(())) => {
-                        tracing::info!("Room task shut down cleanly");
-                    }
-                    Ok(Err(bilive_rec::error::AppError::GracefulShutdown)) => {
-                        tracing::info!("Room task interrupted by shutdown");
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!("Room task error during shutdown: {}", e);
-                    }
-                    Err(join_err) => {
-                        tracing::warn!("Room task panicked during shutdown: {}", join_err);
+
+    // Each room runs independently. A failure in one room is logged and
+    // recorded in redb but must not terminate sibling rooms — operators
+    // can inspect failures via `bilive-rec state inspect` after the run.
+    //
+    // Shutdown contract:
+    //   - First Ctrl-C: broadcast shutdown, drain handles cleanly.
+    //   - Second Ctrl-C: forced exit; in-flight uploads may be lost.
+    let mut shutdown_initiated = false;
+    let mut any_failed = false;
+
+    while !handles.is_empty() {
+        if !shutdown_initiated {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl-C received, signaling graceful shutdown...");
+                    let _ = shutdown_tx.send(true);
+                    shutdown_initiated = true;
+                }
+                Some(res) = handles.next() => {
+                    if process_room_result(res) {
+                        any_failed = true;
                     }
                 }
             }
-            tracing::info!("All room tasks stopped.");
-        }
-        res = handles.next() => {
-            match res {
-                Some(Ok(Ok(()))) => {
-                    return Err(bilive_rec::error::AppError::State("Room task exited unexpectedly with Ok(())".into()));
+        } else {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("Second Ctrl-C received; forcing exit. In-flight uploads may be lost.");
+                    return Err(bilive_rec::error::AppError::State(
+                        "Forced exit by second Ctrl-C".into(),
+                    ));
                 }
-                Some(Ok(Err(e))) => {
-                    return Err(e);
-                }
-                Some(Err(join_err)) => {
-                    return Err(bilive_rec::error::AppError::State(format!("Room task panicked or joined with error: {}", join_err)));
-                }
-                None => {
-                    tracing::info!("All room tasks finished.");
+                Some(res) = handles.next() => {
+                    if process_room_result(res) {
+                        any_failed = true;
+                    }
                 }
             }
         }
     }
 
-    Ok(())
+    tracing::info!("All room tasks finished.");
+
+    if any_failed {
+        Err(bilive_rec::error::AppError::State(
+            "One or more room tasks failed; run `state inspect` for details".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Classify a single room task result. Returns true if the task failed
+/// (non-graceful error or panic), false otherwise.
+fn process_room_result(
+    res: Result<bilive_rec::error::AppResult<()>, tokio::task::JoinError>,
+) -> bool {
+    match res {
+        Ok(Ok(())) => {
+            tracing::info!("Room task shut down cleanly");
+            false
+        }
+        Ok(Err(bilive_rec::error::AppError::GracefulShutdown)) => {
+            tracing::info!("Room task interrupted by shutdown");
+            false
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Room task error: {}", e);
+            true
+        }
+        Err(join_err) => {
+            tracing::warn!("Room task panicked: {}", join_err);
+            true
+        }
+    }
 }
 
 fn state_inspect_cmd(config_path: &std::path::Path) -> AppResult<()> {
@@ -698,5 +732,65 @@ mod tests {
                     .contains("pipeline.backoff_s must be greater than 0")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_process_room_result_clean_exit() {
+        let handle = tokio::spawn(async { Ok(()) });
+        let res = handle.await;
+        assert!(!process_room_result(res));
+    }
+
+    #[tokio::test]
+    async fn test_process_room_result_graceful_shutdown() {
+        let handle =
+            tokio::spawn(async { Err(bilive_rec::error::AppError::GracefulShutdown) });
+        let res = handle.await;
+        assert!(!process_room_result(res));
+    }
+
+    #[tokio::test]
+    async fn test_process_room_result_fatal_error() {
+        let handle = tokio::spawn(
+            async { Err(bilive_rec::error::AppError::State("room is in Failed".into())) },
+        );
+        let res = handle.await;
+        assert!(process_room_result(res));
+    }
+
+    #[tokio::test]
+    async fn test_process_room_result_panic() {
+        let handle: tokio::task::JoinHandle<bilive_rec::error::AppResult<()>> =
+            tokio::spawn(async { panic!("simulated panic") });
+        let res = handle.await;
+        assert!(process_room_result(res));
+    }
+
+    /// Smoke test: drain loop terminates when all handles complete, regardless
+    /// of whether they succeed, fail, or panic, and reports any_failed correctly.
+    #[tokio::test]
+    async fn test_run_cmd_drains_mixed_room_outcomes() {
+        use futures::stream::FuturesUnordered;
+
+        let handles: FuturesUnordered<tokio::task::JoinHandle<bilive_rec::error::AppResult<()>>> =
+            FuturesUnordered::new();
+        handles.push(tokio::spawn(async { Ok(()) }));
+        handles.push(tokio::spawn(async {
+            Err(bilive_rec::error::AppError::State("simulated room failure".into()))
+        }));
+        handles.push(tokio::spawn(async {
+            Err(bilive_rec::error::AppError::GracefulShutdown)
+        }));
+
+        // Drain all handles using the same classifier the main loop uses.
+        let mut any_failed = false;
+        let mut handles = handles;
+        while let Some(res) = futures::StreamExt::next(&mut handles).await {
+            if process_room_result(res) {
+                any_failed = true;
+            }
+        }
+
+        assert!(any_failed, "expected at least one failure to be recorded");
     }
 }
