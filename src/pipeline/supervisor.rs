@@ -158,6 +158,7 @@ pub struct RoomSupervisor<U: Uploader + Send + Sync + 'static> {
     pub active_session_id: Option<Uuid>,
     upload_tasks: Vec<JoinHandle<BackgroundUploadResult>>,
     pub offline_since: Option<Instant>,
+    reconnect_attempt: u32,
     pub app_config: Arc<AppConfig>,
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
@@ -182,6 +183,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             active_session_id: None,
             upload_tasks: Vec::new(),
             offline_since: None,
+            reconnect_attempt: 0,
             app_config: deps.app_config,
             shutdown_rx,
         };
@@ -264,6 +266,18 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         if !pipeline_state_requires_active_session(next) {
             self.active_session_id = None;
         }
+        if next == PipelineState::WaitingReconnect && prev != PipelineState::WaitingReconnect {
+            self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+        }
+        if matches!(
+            next,
+            PipelineState::Recording
+                | PipelineState::Uploading
+                | PipelineState::Submitted
+                | PipelineState::Idle
+        ) {
+            self.reconnect_attempt = 0;
+        }
         self.session.state = next;
         info!(room_id = self.room_id, from = ?prev, to = ?next, "Pipeline state transition");
         Ok(())
@@ -281,6 +295,14 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         self.store
             .put_room_pipeline_state(self.room_id, next, active_session_id)?;
         self.apply_transition(next)
+    }
+
+    pub fn reconnect_delay(&self) -> std::time::Duration {
+        let base = std::time::Duration::from_secs(self.config.backoff_s);
+        let max = std::time::Duration::from_secs(self.config.max_backoff_s);
+        let exponent = self.reconnect_attempt.saturating_sub(1).min(31);
+        let factor = 1_u32 << exponent;
+        base.saturating_mul(factor).min(max)
     }
 
     /// Main state machine pump. Blocks when performing long tasks (e.g. recording, uploading).
@@ -1196,6 +1218,56 @@ mod tests {
         assert_eq!(
             store.get_pipeline_state(room_id).unwrap(),
             Some(PipelineState::Resolving)
+        );
+    }
+
+    #[test]
+    fn test_reconnect_delay_exponential_and_clamped() {
+        let mut supervisor = mock_supervisor();
+        supervisor.config.backoff_s = 5;
+        supervisor.config.max_backoff_s = 20;
+        supervisor.session.state = PipelineState::Recording;
+        supervisor.active_session_id = Some(Uuid::new_v4());
+
+        supervisor
+            .transition(PipelineState::WaitingReconnect)
+            .unwrap();
+        assert_eq!(
+            supervisor.reconnect_delay(),
+            std::time::Duration::from_secs(5)
+        );
+
+        supervisor.transition(PipelineState::ReResolving).unwrap();
+        supervisor
+            .transition(PipelineState::WaitingReconnect)
+            .unwrap();
+        assert_eq!(
+            supervisor.reconnect_delay(),
+            std::time::Duration::from_secs(10)
+        );
+
+        supervisor.transition(PipelineState::ReResolving).unwrap();
+        supervisor
+            .transition(PipelineState::WaitingReconnect)
+            .unwrap();
+        assert_eq!(
+            supervisor.reconnect_delay(),
+            std::time::Duration::from_secs(20)
+        );
+
+        supervisor.transition(PipelineState::ReResolving).unwrap();
+        supervisor
+            .transition(PipelineState::WaitingReconnect)
+            .unwrap();
+        assert_eq!(
+            supervisor.reconnect_delay(),
+            std::time::Duration::from_secs(20)
+        );
+
+        supervisor.transition(PipelineState::Recording).unwrap();
+        assert_eq!(
+            supervisor.reconnect_delay(),
+            std::time::Duration::from_secs(5)
         );
     }
 

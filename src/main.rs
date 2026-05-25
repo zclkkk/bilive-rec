@@ -207,7 +207,7 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                         Some(Duration::from_secs(app_config.pipeline.poll_interval_s))
                     }
                     PipelineState::WaitingReconnect | PipelineState::ReResolving => {
-                        Some(Duration::from_secs(app_config.pipeline.backoff_s))
+                        Some(supervisor.reconnect_delay())
                     }
                     _ => None, // Recording, Uploading blocks/pumps immediately
                 };

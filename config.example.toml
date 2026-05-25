@@ -33,6 +33,7 @@ tags = ["直播录像"]
 poll_interval_s = 60
 offline_grace_s = 60
 backoff_s = 15
+max_backoff_s = 300
 
 [[rooms]]
 name = "example"

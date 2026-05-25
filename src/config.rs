@@ -187,6 +187,8 @@ pub struct PipelineConfig {
     pub offline_grace_s: u64,
     #[serde(default = "default_backoff_s")]
     pub backoff_s: u64,
+    #[serde(default = "default_max_backoff_s")]
+    pub max_backoff_s: u64,
 }
 
 impl Default for PipelineConfig {
@@ -195,6 +197,7 @@ impl Default for PipelineConfig {
             poll_interval_s: default_poll_interval_s(),
             offline_grace_s: default_offline_grace_s(),
             backoff_s: default_backoff_s(),
+            max_backoff_s: default_max_backoff_s(),
         }
     }
 }
@@ -207,6 +210,9 @@ fn default_offline_grace_s() -> u64 {
 }
 fn default_backoff_s() -> u64 {
     15
+}
+fn default_max_backoff_s() -> u64 {
+    300
 }
 
 impl AppConfig {
@@ -411,6 +417,16 @@ impl PipelineConfig {
                 "pipeline.backoff_s must be greater than 0".into(),
             ));
         }
+        if self.max_backoff_s == 0 {
+            return Err(AppError::Config(
+                "pipeline.max_backoff_s must be greater than 0".into(),
+            ));
+        }
+        if self.max_backoff_s < self.backoff_s {
+            return Err(AppError::Config(
+                "pipeline.max_backoff_s must be greater than or equal to pipeline.backoff_s".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -494,6 +510,7 @@ mod tests {
         assert_eq!(config.pipeline.poll_interval_s, 60);
         assert_eq!(config.pipeline.offline_grace_s, 60);
         assert_eq!(config.pipeline.backoff_s, 15);
+        assert_eq!(config.pipeline.max_backoff_s, 300);
         assert_eq!(config.rooms.len(), 1);
         assert_eq!(config.rooms[0].name, "example");
         assert_eq!(config.rooms[0].title.as_deref(), Some("{title}"));
@@ -736,6 +753,19 @@ credential = "main"
         record.segment_time = None;
         record.segment_size = Some("bad".into());
         assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn pipeline_validation_rejects_invalid_backoff_bounds() {
+        let mut pipeline = PipelineConfig {
+            max_backoff_s: 0,
+            ..PipelineConfig::default()
+        };
+        assert!(pipeline.validate().is_err());
+
+        pipeline.max_backoff_s = 1;
+        pipeline.backoff_s = 15;
+        assert!(pipeline.validate().is_err());
     }
 
     #[test]
