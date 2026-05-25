@@ -681,9 +681,7 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
         println!("candidates = {}", candidates.len());
         for candidate in &candidates {
             println!(
-                "  - protocol={}, format={}, codec={}, qn={}, cdn={}, url={}",
-                candidate.protocol.as_str(),
-                candidate.format,
+                "  - codec={}, qn={}, cdn={}, url={}",
                 candidate.codec.as_str(),
                 candidate.qn,
                 candidate.cdn_name,

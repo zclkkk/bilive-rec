@@ -62,8 +62,6 @@ pub struct RecordConfig {
     pub segment_size: Option<String>,
     #[serde(default = "default_min_segment_size")]
     pub min_segment_size: String,
-    #[serde(default)]
-    pub prefer_protocol: PreferredProtocol,
     #[serde(default = "default_qn")]
     pub qn: u32,
     #[serde(default)]
@@ -78,7 +76,6 @@ impl Default for RecordConfig {
             segment_time: None,
             segment_size: None,
             min_segment_size: default_min_segment_size(),
-            prefer_protocol: PreferredProtocol::default(),
             qn: default_qn(),
             cdn: Vec::new(),
         }
@@ -135,17 +132,6 @@ impl RoomCredentials {
     pub fn upload_cookie_file(&self) -> &Path {
         self.upload.cookie_file()
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub enum PreferredProtocol {
-    #[serde(rename = "flv")]
-    #[default]
-    Flv,
-    #[serde(rename = "hls_ts", alias = "hlsts", alias = "ts")]
-    HlsTs,
-    #[serde(rename = "hls_fmp4", alias = "hlsfmp4", alias = "fmp4")]
-    HlsFmp4,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -727,28 +713,8 @@ credential = "main"
         assert_eq!(config.segment_time, None);
         assert_eq!(config.segment_size, None);
         assert_eq!(config.min_segment_size, "20MiB");
-        assert!(matches!(config.prefer_protocol, PreferredProtocol::Flv));
         assert_eq!(config.qn, 10000);
         assert!(config.cdn.is_empty());
-    }
-
-    #[test]
-    fn preferred_protocol_serde_roundtrip() {
-        let json = serde_json::to_string(&PreferredProtocol::Flv).unwrap();
-        assert_eq!(json, "\"flv\"");
-
-        let hls_ts = serde_json::to_string(&PreferredProtocol::HlsTs).unwrap();
-        assert_eq!(hls_ts, "\"hls_ts\"");
-        let p: PreferredProtocol = serde_json::from_str("\"hls_ts\"").unwrap();
-        assert!(matches!(p, PreferredProtocol::HlsTs));
-
-        let legacy_p: PreferredProtocol = serde_json::from_str("\"hlsts\"").unwrap();
-        assert!(matches!(legacy_p, PreferredProtocol::HlsTs));
-
-        let hls_fmp4 = serde_json::to_string(&PreferredProtocol::HlsFmp4).unwrap();
-        assert_eq!(hls_fmp4, "\"hls_fmp4\"");
-        let f: PreferredProtocol = serde_json::from_str("\"fmp4\"").unwrap();
-        assert!(matches!(f, PreferredProtocol::HlsFmp4));
     }
 
     #[test]

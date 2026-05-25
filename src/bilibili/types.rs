@@ -157,35 +157,6 @@ pub struct UrlInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Protocol {
-    Flv,
-    HlsFmp4,
-    HlsTs,
-    Unknown,
-}
-
-impl Protocol {
-    pub fn from_api_name(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "flv" => Protocol::Flv,
-            "fmp4" => Protocol::HlsFmp4,
-            "ts" => Protocol::HlsTs,
-            _ => Protocol::Unknown,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Protocol::Flv => "flv",
-            Protocol::HlsFmp4 => "hls_fmp4",
-            Protocol::HlsTs => "hls_ts",
-            Protocol::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum Codec {
     Avc,
     Unknown,
@@ -210,8 +181,6 @@ impl Codec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamCandidate {
     pub url: String,
-    pub protocol: Protocol,
-    pub format: String,
     pub codec: Codec,
     pub qn: u32,
     pub cdn_name: String,

@@ -16,7 +16,6 @@ output_dir = "./data/recordings"
 segment_time = "01:00:00"
 segment_size = "2GiB"
 min_segment_size = "20MiB"
-prefer_protocol = "flv"
 qn = 10000
 cdn = []
 
