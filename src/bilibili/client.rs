@@ -1,5 +1,6 @@
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::bilibili::types::{NavResponse, WbiKeys};
 use crate::bilibili::wbi::extract_key;
@@ -7,14 +8,68 @@ use crate::error::{AppError, AppResult};
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
 
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+const WBI_KEY_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+
+static GLOBAL_WBI_CACHE: OnceLock<Arc<WbiKeyCache>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct CachedWbiKeys {
+    keys: WbiKeys,
+    fetched_at: Instant,
+}
+
+#[derive(Debug)]
+struct WbiKeyCache {
+    ttl: Duration,
+    value: tokio::sync::RwLock<Option<CachedWbiKeys>>,
+}
+
+impl WbiKeyCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            value: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    async fn fresh_keys(&self) -> Option<WbiKeys> {
+        let guard = self.value.read().await;
+        guard.as_ref().and_then(|cached| {
+            if cached.fetched_at.elapsed() < self.ttl {
+                Some(cached.keys.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn store(&self, keys: WbiKeys) {
+        let mut guard = self.value.write().await;
+        *guard = Some(CachedWbiKeys {
+            keys,
+            fetched_at: Instant::now(),
+        });
+    }
+}
+
+fn global_wbi_cache() -> Arc<WbiKeyCache> {
+    GLOBAL_WBI_CACHE
+        .get_or_init(|| Arc::new(WbiKeyCache::new(WBI_KEY_TTL)))
+        .clone()
+}
 
 pub struct BiliClient {
     client: reqwest::Client,
     stream_client: reqwest::Client,
+    wbi_cache: Arc<WbiKeyCache>,
 }
 
 impl BiliClient {
     pub fn new(cookie: Option<String>) -> AppResult<Self> {
+        Self::with_wbi_cache(cookie, global_wbi_cache())
+    }
+
+    fn with_wbi_cache(cookie: Option<String>, wbi_cache: Arc<WbiKeyCache>) -> AppResult<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
             USER_AGENT,
@@ -42,10 +97,15 @@ impl BiliClient {
         Ok(Self {
             client,
             stream_client,
+            wbi_cache,
         })
     }
 
     pub async fn fetch_wbi_keys(&self) -> AppResult<WbiKeys> {
+        if let Some(keys) = self.wbi_cache.fresh_keys().await {
+            return Ok(keys);
+        }
+
         let resp: NavResponse = self
             .client
             .get("https://api.bilibili.com/x/web-interface/nav")
@@ -54,7 +114,9 @@ impl BiliClient {
             .json()
             .await?;
 
-        parse_wbi_keys(&resp)
+        let keys = parse_wbi_keys(&resp)?;
+        self.wbi_cache.store(keys.clone()).await;
+        Ok(keys)
     }
 
     pub fn client(&self) -> &reqwest::Client {
@@ -188,6 +250,32 @@ mod tests {
         // cookies with invalid ASCII values or control characters
         let client_res = BiliClient::new(Some("SESSDATA=\n".to_string()));
         assert!(client_res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_wbi_cache_returns_fresh_keys() {
+        let cache = WbiKeyCache::new(Duration::from_secs(2 * 60 * 60));
+        let keys = WbiKeys {
+            img_key: "img".into(),
+            sub_key: "sub".into(),
+        };
+
+        cache.store(keys.clone()).await;
+
+        assert_eq!(cache.fresh_keys().await, Some(keys));
+    }
+
+    #[tokio::test]
+    async fn test_wbi_cache_expires_keys() {
+        let cache = WbiKeyCache::new(Duration::ZERO);
+        let keys = WbiKeys {
+            img_key: "img".into(),
+            sub_key: "sub".into(),
+        };
+
+        cache.store(keys).await;
+
+        assert!(cache.fresh_keys().await.is_none());
     }
 
     #[test]
