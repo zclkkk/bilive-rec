@@ -11,11 +11,11 @@ use crate::bilibili::stream::{
     fetch_play_info, parse_stream_candidates, select_healthy_stream_candidate,
 };
 use crate::bilibili::types::LiveStatus;
-use crate::config::{AppConfig, PipelineConfig, RoomConfig};
+use crate::config::{AppConfig, PipelineConfig, RoomConfig, RoomCredentials};
 use crate::error::{AppError, AppResult};
 use crate::pipeline::session::PipelineSession;
 use crate::pipeline::state_machine::PipelineState;
-use crate::recorder::segment::SegmentPolicy;
+use crate::recorder::segment::{RecorderPolicy, SegmentFilter, SegmentLayout, SegmentPolicy};
 use crate::recorder::{record_flv, segment::SegmentEvent};
 use crate::state::model::{
     LiveSession, SegmentStatus, SessionStatus, Submission, SubmissionStatus,
@@ -354,11 +354,17 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     AppError::State("Recording state requires active_session_id".into())
                 })?;
 
-                let policy = SegmentPolicy {
-                    output_dir: self.app_config.record.output_dir.clone(),
-                    segment_time: self.app_config.record.segment_time_duration()?,
-                    segment_size: self.app_config.record.segment_size_bytes()?,
-                    min_segment_size: self.app_config.record.min_segment_size_bytes()?,
+                let policy = RecorderPolicy {
+                    layout: SegmentLayout {
+                        output_dir: self.app_config.record.output_dir.clone(),
+                    },
+                    segment: SegmentPolicy {
+                        segment_time: self.app_config.record.segment_time_duration()?,
+                        segment_size: self.app_config.record.segment_size_bytes()?,
+                    },
+                    filter: SegmentFilter {
+                        min_segment_size: self.app_config.record.min_segment_size_bytes()?,
+                    },
                 };
 
                 let play_info =

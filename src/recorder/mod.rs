@@ -7,7 +7,7 @@ use crate::recorder::flv::{
     is_avc_sequence_header, read_previous_tag_size,
 };
 use crate::recorder::segment::{
-    SegmentEvent, SegmentPolicy, final_path, part_path, should_filter_by_size,
+    RecorderPolicy, SegmentEvent, final_path, part_path, should_filter_by_size,
     should_rotate_by_elapsed, should_rotate_by_size,
 };
 use crate::state::model::{Segment, SegmentStatus};
@@ -37,7 +37,7 @@ enum RecordPhase {
 
 pub struct FlvRecorder<'a> {
     session_id: Uuid,
-    policy: SegmentPolicy,
+    policy: RecorderPolicy,
     store: &'a StateStore,
     event_tx: mpsc::UnboundedSender<SegmentEvent>,
 
@@ -55,16 +55,16 @@ pub struct FlvRecorder<'a> {
 impl<'a> FlvRecorder<'a> {
     pub async fn new(
         session_id: Uuid,
-        policy: SegmentPolicy,
+        policy: RecorderPolicy,
         store: &'a StateStore,
         event_tx: mpsc::UnboundedSender<SegmentEvent>,
         start_index: u32,
     ) -> AppResult<Self> {
         // Ensure output dir exists
-        tokio::fs::create_dir_all(&policy.output_dir)
+        tokio::fs::create_dir_all(&policy.layout.output_dir)
             .await
             .map_err(|e| AppError::Io {
-                path: policy.output_dir.clone(),
+                path: policy.layout.output_dir.clone(),
                 source: e,
             })?;
 
@@ -177,8 +177,8 @@ impl<'a> FlvRecorder<'a> {
                 && is_keyframe
                 && let RecordPhase::Recording(seg) = &self.phase
                 && (self.codec_dirty
-                    || should_rotate_by_size(seg.size, &self.policy)
-                    || should_rotate_by_elapsed(seg.start_time.elapsed(), &self.policy))
+                    || should_rotate_by_size(seg.size, &self.policy.segment)
+                    || should_rotate_by_elapsed(seg.start_time.elapsed(), &self.policy.segment))
             {
                 needs_rotation = true;
             }
@@ -220,9 +220,9 @@ impl<'a> FlvRecorder<'a> {
         }
         drop(seg.file);
 
-        let final_p = final_path(&self.policy, &self.session_id, seg.index);
+        let final_p = final_path(&self.policy.layout, &self.session_id, seg.index);
 
-        if should_filter_by_size(seg.size, &self.policy) {
+        if should_filter_by_size(seg.size, &self.policy.filter) {
             let db_seg = Segment {
                 session_id: self.session_id,
                 index: seg.index,
@@ -329,7 +329,7 @@ impl<'a> FlvRecorder<'a> {
 
     async fn open_new_segment(&mut self) -> AppResult<()> {
         let idx = self.next_index;
-        let p_path = part_path(&self.policy, &self.session_id, idx);
+        let p_path = part_path(&self.policy.layout, &self.session_id, idx);
 
         // Persist truth before risk: the segment row goes into redb *before*
         // we create a file on disk. If we crashed between File::create and
@@ -473,7 +473,7 @@ impl<'a> FlvRecorder<'a> {
 pub async fn record_flv(
     mut resp: Response,
     session_id: Uuid,
-    policy: SegmentPolicy,
+    policy: RecorderPolicy,
     store: &StateStore,
     event_tx: mpsc::UnboundedSender<SegmentEvent>,
     start_index: u32,
@@ -542,18 +542,29 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_policy(
+        output_dir: PathBuf,
+        segment_size: Option<u64>,
+        segment_time: Option<std::time::Duration>,
+        min_segment_size: u64,
+    ) -> RecorderPolicy {
+        RecorderPolicy {
+            layout: crate::recorder::segment::SegmentLayout { output_dir },
+            segment: crate::recorder::segment::SegmentPolicy {
+                segment_time,
+                segment_size,
+            },
+            filter: crate::recorder::segment::SegmentFilter { min_segment_size },
+        }
+    }
+
     #[tokio::test]
     async fn test_flv_recorder_push_chunk() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: Some(1024),
-            segment_time: None,
-            min_segment_size: 0,
-        };
+        let policy = test_policy(dir.path().to_path_buf(), Some(1024), None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -658,8 +669,8 @@ mod tests {
         }
 
         // Verify `.part -> .flv` lifecycle
-        let part_p = part_path(&policy, &session_id, 1);
-        let final_p = final_path(&policy, &session_id, 1);
+        let part_p = part_path(&policy.layout, &session_id, 1);
+        let final_p = final_path(&policy.layout, &session_id, 1);
         assert!(!part_p.exists(), ".part file should be gone");
         assert!(final_p.exists(), ".flv file should exist");
         assert!(
@@ -681,12 +692,7 @@ mod tests {
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: None,
-            segment_time: None,
-            min_segment_size: 99999, // very large minimum size
-        };
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 99999);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -753,8 +759,8 @@ mod tests {
 
         recorder.finalize().await.unwrap();
 
-        let part_p = part_path(&policy, &session_id, 1);
-        let final_p = final_path(&policy, &session_id, 1);
+        let part_p = part_path(&policy.layout, &session_id, 1);
+        let final_p = final_path(&policy.layout, &session_id, 1);
         assert!(!part_p.exists(), ".part file should be removed");
         assert!(!final_p.exists(), ".flv file should not be created");
 
@@ -769,12 +775,7 @@ mod tests {
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: Some(50), // very small limit to trigger rotation
-            segment_time: None,
-            min_segment_size: 0,
-        };
+        let policy = test_policy(dir.path().to_path_buf(), Some(50), None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -878,12 +879,7 @@ mod tests {
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: None,
-            segment_time: None,
-            min_segment_size: 0,
-        };
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -990,12 +986,7 @@ mod tests {
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: None,
-            segment_time: None,
-            min_segment_size: 0,
-        };
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1061,8 +1052,8 @@ mod tests {
         tag.write(&mut tag_buf).unwrap();
         recorder.push_chunk(&tag_buf).await.unwrap();
 
-        let part_p = part_path(&policy, &session_id, 1);
-        let final_p = final_path(&policy, &session_id, 1);
+        let part_p = part_path(&policy.layout, &session_id, 1);
+        let final_p = final_path(&policy.layout, &session_id, 1);
         std::fs::create_dir(&final_p).unwrap();
 
         let err = recorder.finalize().await.unwrap_err();
@@ -1082,12 +1073,7 @@ mod tests {
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: None,
-            segment_time: None,
-            min_segment_size: 0,
-        };
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1185,12 +1171,7 @@ mod tests {
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: None,
-            segment_time: None,
-            min_segment_size: 0,
-        };
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1319,19 +1300,14 @@ mod tests {
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: None,
-            segment_time: None,
-            min_segment_size: 0,
-        };
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         // Pre-place a *directory* at the .part path the recorder will try
         // to use for index 1. File::create against a directory returns
         // EISDIR (or equivalent) — exactly the post-DB-write failure we
         // want to exercise.
-        let blocking_path = part_path(&policy, &session_id, 1);
+        let blocking_path = part_path(&policy.layout, &session_id, 1);
         std::fs::create_dir(&blocking_path).unwrap();
 
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1418,12 +1394,7 @@ mod tests {
         let db_path = dir.path().join("state.redb");
         let store = StateStore::open(&db_path).unwrap();
 
-        let policy = SegmentPolicy {
-            output_dir: dir.path().to_path_buf(),
-            segment_size: None,
-            segment_time: None,
-            min_segment_size: 0,
-        };
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();

@@ -712,7 +712,9 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
 /// ends. For long-running multi-room operation with auto-upload, use `run`.
 async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> AppResult<()> {
     use bilive_rec::recorder::record_flv;
-    use bilive_rec::recorder::segment::{SegmentEvent, SegmentPolicy};
+    use bilive_rec::recorder::segment::{
+        RecorderPolicy, SegmentEvent, SegmentFilter, SegmentLayout, SegmentPolicy,
+    };
     use bilive_rec::state::model::{LiveSession, SessionStatus};
     use std::sync::Arc;
     use uuid::Uuid;
@@ -781,11 +783,17 @@ async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> Ap
     store.put_session(&live_session)?;
     println!("session_id = {session_id}");
 
-    let policy = SegmentPolicy {
-        output_dir: config.record.output_dir.clone(),
-        segment_time: config.record.segment_time_duration()?,
-        segment_size: config.record.segment_size_bytes()?,
-        min_segment_size: config.record.min_segment_size_bytes()?,
+    let policy = RecorderPolicy {
+        layout: SegmentLayout {
+            output_dir: config.record.output_dir.clone(),
+        },
+        segment: SegmentPolicy {
+            segment_time: config.record.segment_time_duration()?,
+            segment_size: config.record.segment_size_bytes()?,
+        },
+        filter: SegmentFilter {
+            min_segment_size: config.record.min_segment_size_bytes()?,
+        },
     };
 
     let resp = client
