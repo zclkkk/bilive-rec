@@ -1,0 +1,115 @@
+name: Build Artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_NAME: bilive-rec
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build - ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-musl
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            exe: bilive-rec
+            archive_ext: tar.gz
+
+          - name: linux-aarch64-musl
+            runner: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            exe: bilive-rec
+            archive_ext: tar.gz
+
+          - name: macos-x86_64
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+            exe: bilive-rec
+            archive_ext: tar.gz
+
+          - name: macos-aarch64
+            runner: macos-26
+            target: aarch64-apple-darwin
+            exe: bilive-rec
+            archive_ext: tar.gz
+
+          - name: windows-x86_64-msvc
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            exe: bilive-rec.exe
+            archive_ext: zip
+
+          - name: windows-aarch64-msvc
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            exe: bilive-rec.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Build release binary
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--locked --release --bin bilive-rec"
+
+      - name: Package artifact (Unix)
+        id: package_unix
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+
+          archive="${APP_NAME}-${{ matrix.target }}.${{ matrix.archive_ext }}"
+
+          rm -rf staging dist
+          mkdir -p staging dist
+
+          install -m 755 "target/${{ matrix.target }}/release/${{ matrix.exe }}" "staging/${APP_NAME}"
+          install -m 644 config.example.toml staging/
+
+          tar -czf "dist/${archive}" -C staging .
+          echo "archive=dist/${archive}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Package artifact (Windows)
+        id: package_windows
+        if: runner.os == 'Windows'
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $archive = "${env:APP_NAME}-${{ matrix.target }}.${{ matrix.archive_ext }}"
+
+          Remove-Item -Recurse -Force staging, dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path staging, dist | Out-Null
+
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.exe }}" "staging\${{ matrix.exe }}"
+          Copy-Item config.example.toml staging\
+
+          Compress-Archive -Path staging\* -DestinationPath "dist\$archive" -Force
+          "archive=dist/$archive" >> $env:GITHUB_OUTPUT
+        shell: pwsh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.target }}
+          path: ${{ steps.package_unix.outputs.archive || steps.package_windows.outputs.archive }}
+          if-no-files-found: error
