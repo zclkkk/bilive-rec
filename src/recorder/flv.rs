@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::{Read, Write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +199,15 @@ pub fn is_avc_keyframe(data: &[u8]) -> bool {
     frame_type == 1 && codec_id == 7 && packet_type == 1
 }
 
+pub fn is_avc_nalu_packet(data: &[u8]) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+    let codec_id = data[0] & 0x0F;
+    let packet_type = data[1];
+    codec_id == 7 && packet_type == 1
+}
+
 pub fn is_avc_sequence_header(data: &[u8]) -> bool {
     if data.len() < 2 {
         return false;
@@ -205,6 +215,138 @@ pub fn is_avc_sequence_header(data: &[u8]) -> bool {
     let codec_id = data[0] & 0x0F;
     let packet_type = data[1];
     codec_id == 7 && packet_type == 0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AvcNaluInspection {
+    pub has_sps: bool,
+    pub has_pps: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvcPayloadError {
+    NotSequenceHeader,
+    SequenceHeaderTooShort,
+    InvalidSequenceHeader,
+    NotNaluPacket,
+    InvalidNaluLengthSize,
+    EmptyNaluPayload,
+    TruncatedNaluLength,
+    ZeroNaluLength,
+    TruncatedNalu,
+    InvalidNaluHeader,
+    UnsupportedAnnexBStartCode,
+}
+
+impl fmt::Display for AvcPayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSequenceHeader => write!(f, "not an AVC sequence header"),
+            Self::SequenceHeaderTooShort => write!(f, "AVC sequence header is too short"),
+            Self::InvalidSequenceHeader => write!(f, "invalid AVC sequence header"),
+            Self::NotNaluPacket => write!(f, "not an AVC NALU packet"),
+            Self::InvalidNaluLengthSize => write!(f, "invalid AVC NALU length size"),
+            Self::EmptyNaluPayload => write!(f, "empty AVC NALU payload"),
+            Self::TruncatedNaluLength => write!(f, "truncated AVC NALU length"),
+            Self::ZeroNaluLength => write!(f, "zero-sized AVC NALU"),
+            Self::TruncatedNalu => write!(f, "truncated AVC NALU payload"),
+            Self::InvalidNaluHeader => write!(f, "invalid H.264 NALU header"),
+            Self::UnsupportedAnnexBStartCode => write!(
+                f,
+                "unsupported H.264 Annex-B start-code framing inside FLV AVC payload"
+            ),
+        }
+    }
+}
+
+pub fn avc_nalu_length_size_from_sequence_header(data: &[u8]) -> Result<usize, AvcPayloadError> {
+    if !is_avc_sequence_header(data) {
+        return Err(AvcPayloadError::NotSequenceHeader);
+    }
+    if data.len() < 10 {
+        return Err(AvcPayloadError::SequenceHeaderTooShort);
+    }
+    if data[5] != 1 {
+        return Err(AvcPayloadError::InvalidSequenceHeader);
+    }
+
+    let length_size = usize::from(data[9] & 0x03) + 1;
+    if length_size == 3 {
+        return Err(AvcPayloadError::InvalidNaluLengthSize);
+    }
+
+    Ok(length_size)
+}
+
+pub fn inspect_avc_nalu_packet(
+    data: &[u8],
+    length_size: usize,
+) -> Result<AvcNaluInspection, AvcPayloadError> {
+    if !is_avc_nalu_packet(data) {
+        return Err(AvcPayloadError::NotNaluPacket);
+    }
+    if !matches!(length_size, 1 | 2 | 4) {
+        return Err(AvcPayloadError::InvalidNaluLengthSize);
+    }
+
+    let payload = &data[5..];
+    let parsed = inspect_length_prefixed_nalus(payload, length_size);
+    if parsed.is_err() && starts_with_annex_b_start_code(payload) {
+        return Err(AvcPayloadError::UnsupportedAnnexBStartCode);
+    }
+    parsed
+}
+
+fn inspect_length_prefixed_nalus(
+    payload: &[u8],
+    length_size: usize,
+) -> Result<AvcNaluInspection, AvcPayloadError> {
+    if payload.is_empty() {
+        return Err(AvcPayloadError::EmptyNaluPayload);
+    }
+
+    let mut offset = 0;
+    let mut inspection = AvcNaluInspection {
+        has_sps: false,
+        has_pps: false,
+    };
+
+    while offset < payload.len() {
+        if payload.len() - offset < length_size {
+            return Err(AvcPayloadError::TruncatedNaluLength);
+        }
+
+        let mut nalu_len = 0usize;
+        for byte in &payload[offset..offset + length_size] {
+            nalu_len = (nalu_len << 8) | usize::from(*byte);
+        }
+        offset += length_size;
+
+        if nalu_len == 0 {
+            return Err(AvcPayloadError::ZeroNaluLength);
+        }
+        if payload.len() - offset < nalu_len {
+            return Err(AvcPayloadError::TruncatedNalu);
+        }
+
+        let first = payload[offset];
+        if (first & 0x80) != 0 {
+            return Err(AvcPayloadError::InvalidNaluHeader);
+        }
+
+        match first & 0x1f {
+            7 => inspection.has_sps = true,
+            8 => inspection.has_pps = true,
+            _ => {}
+        }
+        offset += nalu_len;
+    }
+
+    Ok(inspection)
+}
+
+fn starts_with_annex_b_start_code(payload: &[u8]) -> bool {
+    payload.starts_with(&[0, 0, 1]) || payload.starts_with(&[0, 0, 0, 1])
 }
 
 pub fn is_aac_sequence_header(data: &[u8]) -> bool {
@@ -361,6 +503,73 @@ mod tests {
         assert!(!is_avc_keyframe(&data_inter));
         assert!(is_avc_video_tag(&data_inter));
         assert!(!is_avc_sequence_header(&data_inter));
+    }
+
+    #[test]
+    fn avc_sequence_header_exposes_nalu_length_size() {
+        let mut data = vec![0x17, 0x00, 0, 0, 0, 1, 0x64, 0, 0x1f, 0xff];
+        assert_eq!(avc_nalu_length_size_from_sequence_header(&data), Ok(4));
+
+        data[9] = 0xfc;
+        assert_eq!(avc_nalu_length_size_from_sequence_header(&data), Ok(1));
+
+        data[9] = 0xfe;
+        assert_eq!(
+            avc_nalu_length_size_from_sequence_header(&data),
+            Err(AvcPayloadError::InvalidNaluLengthSize)
+        );
+
+        data[5] = 0;
+        assert_eq!(
+            avc_nalu_length_size_from_sequence_header(&data),
+            Err(AvcPayloadError::InvalidSequenceHeader)
+        );
+
+        let short = [0x17, 0x00, 0, 0, 0];
+        assert_eq!(
+            avc_nalu_length_size_from_sequence_header(&short),
+            Err(AvcPayloadError::SequenceHeaderTooShort)
+        );
+    }
+
+    #[test]
+    fn avc_nalu_packet_inspection_detects_sps_and_pps() {
+        let data = [
+            0x17, 0x01, 0, 0, 0, // FLV AVC video packet prefix
+            0, 0, 0, 2, 0x67, 0x64, // SPS
+            0, 0, 0, 2, 0x68, 0xee, // PPS
+            0, 0, 0, 1, 0x65, // IDR
+        ];
+
+        let inspection = inspect_avc_nalu_packet(&data, 4).unwrap();
+        assert!(inspection.has_sps);
+        assert!(inspection.has_pps);
+    }
+
+    #[test]
+    fn avc_nalu_packet_rejects_malformed_lengths() {
+        let data = [
+            0x17, 0x01, 0, 0, 0, // FLV AVC video packet prefix
+            0, 0, 0, 8, 0x65, 0x88,
+        ];
+
+        assert_eq!(
+            inspect_avc_nalu_packet(&data, 4),
+            Err(AvcPayloadError::TruncatedNalu)
+        );
+    }
+
+    #[test]
+    fn avc_nalu_packet_rejects_start_code_framing() {
+        let data = [
+            0x17, 0x01, 0, 0, 0, // FLV AVC video packet prefix
+            0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee,
+        ];
+
+        assert_eq!(
+            inspect_avc_nalu_packet(&data, 4),
+            Err(AvcPayloadError::UnsupportedAnnexBStartCode)
+        );
     }
 
     #[test]

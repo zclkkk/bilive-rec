@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::recorder::flv::{
-    FlvTag, FlvTagType, is_aac_sequence_header, is_avc_keyframe, is_avc_sequence_header,
+    FlvTag, FlvTagType, avc_nalu_length_size_from_sequence_header, inspect_avc_nalu_packet,
+    is_aac_sequence_header, is_avc_keyframe, is_avc_nalu_packet, is_avc_sequence_header,
     is_avc_video_tag,
 };
 use std::collections::VecDeque;
@@ -10,12 +11,16 @@ const VIDEO_FRAME_DURATION_FALLBACK_MS: u32 = 33;
 const AUDIO_FRAME_DURATION_FALLBACK_MS: u32 = 22;
 const DUPLICATE_HISTORY_LIMIT: usize = 16;
 const DUPLICATE_RECONNECT_THRESHOLD: u32 = 10;
+const IN_BAND_PARAMETER_SET_CONFIRMATIONS: u8 = 2;
 
 #[derive(Debug)]
 pub(super) struct FlvNormalizer {
     pub(super) metadata_tag: Option<FlvTag>,
     pub(super) avc_seq_tag: Option<FlvTag>,
     pub(super) aac_seq_tag: Option<FlvTag>,
+    avc_nalu_length_size: Option<usize>,
+    in_band_parameter_sets_seen: u8,
+    avc_in_band_parameter_sets: bool,
     pending_header_change: bool,
     timestamp: TimestampNormalizer,
 }
@@ -32,6 +37,9 @@ impl FlvNormalizer {
             metadata_tag: None,
             avc_seq_tag: None,
             aac_seq_tag: None,
+            avc_nalu_length_size: None,
+            in_band_parameter_sets_seen: 0,
+            avc_in_band_parameter_sets: false,
             pending_header_change: false,
             timestamp: TimestampNormalizer::new(),
         }
@@ -76,19 +84,44 @@ impl FlvNormalizer {
                 }
 
                 if is_avc_sequence_header(&tag.data) {
-                    if recording
+                    let length_size = avc_nalu_length_size_from_sequence_header(&tag.data)
+                        .map_err(|err| {
+                            AppError::Bilibili(format!("Invalid AVC sequence header: {err}"))
+                        })?;
+                    let header_changed = recording
                         && self
                             .avc_seq_tag
                             .as_ref()
-                            .is_some_and(|old| old.data != tag.data)
-                    {
+                            .is_some_and(|old| old.data != tag.data);
+                    let length_size_changed = self
+                        .avc_nalu_length_size
+                        .is_some_and(|old| old != length_size);
+
+                    if header_changed && (!self.avc_in_band_parameter_sets || length_size_changed) {
                         self.pending_header_change = true;
+                    } else if header_changed {
+                        tracing::warn!(
+                            "AVC sequence header changed while keyframes carry in-band SPS/PPS; updating cached header without segment rotation"
+                        );
                     }
+                    self.avc_nalu_length_size = Some(length_size);
                     self.avc_seq_tag = Some(tag);
                     return Ok(NormalizedAction::Drop);
                 }
 
                 let is_keyframe = is_avc_keyframe(&tag.data);
+                if let Some(length_size) = self.avc_nalu_length_size
+                    && is_avc_nalu_packet(&tag.data)
+                {
+                    let inspection =
+                        inspect_avc_nalu_packet(&tag.data, length_size).map_err(|err| {
+                            AppError::Bilibili(format!("Invalid AVC NALU packet: {err}"))
+                        })?;
+                    if is_keyframe && inspection.has_sps && inspection.has_pps {
+                        self.note_in_band_parameter_sets();
+                    }
+                }
+
                 Ok(NormalizedAction::Write { tag, is_keyframe })
             }
             FlvTagType::Audio => {
@@ -115,6 +148,20 @@ impl FlvNormalizer {
 
     pub(super) fn normalize_media_timestamp(&mut self, tag: &mut FlvTag) {
         self.timestamp.normalize(tag);
+    }
+
+    fn note_in_band_parameter_sets(&mut self) {
+        if self.avc_in_band_parameter_sets {
+            return;
+        }
+
+        self.in_band_parameter_sets_seen = self.in_band_parameter_sets_seen.saturating_add(1);
+        if self.in_band_parameter_sets_seen >= IN_BAND_PARAMETER_SET_CONFIRMATIONS {
+            self.avc_in_band_parameter_sets = true;
+            tracing::warn!(
+                "detected repeated AVC keyframes carrying in-band SPS/PPS; sequence header refreshes will not force segment rotation"
+            );
+        }
     }
 }
 
@@ -383,10 +430,28 @@ mod tests {
         }
     }
 
+    fn avc_sequence_header(marker: u8) -> Vec<u8> {
+        vec![
+            0x17, 0x00, 0, 0, 0, // FLV AVC sequence header prefix
+            1, 0x64, 0, 0x1f, 0xff, // AVCDecoderConfigurationRecord, 4-byte NALU lengths
+            0xe1, 0, 1, marker, // one-byte SPS placeholder
+            1, 0, 1, marker, // one-byte PPS placeholder
+        ]
+    }
+
+    fn avc_keyframe_with_parameter_sets(marker: u8) -> Vec<u8> {
+        vec![
+            0x17, 0x01, 0, 0, 0, // FLV AVC NALU packet prefix
+            0, 0, 0, 2, 0x67, marker, // SPS
+            0, 0, 0, 2, 0x68, marker, // PPS
+            0, 0, 0, 1, 0x65, // IDR
+        ]
+    }
+
     #[test]
     fn same_sequence_header_does_not_mark_pending_change() {
         let mut normalizer = FlvNormalizer::new();
-        let seq = video_tag(0, vec![0x17, 0x00, 0, 0, 0]);
+        let seq = video_tag(0, avc_sequence_header(0));
 
         assert!(matches!(
             normalizer.observe_tag(seq.clone(), false).unwrap(),
@@ -404,13 +469,100 @@ mod tests {
     fn changed_sequence_header_marks_pending_change() {
         let mut normalizer = FlvNormalizer::new();
         normalizer
-            .observe_tag(video_tag(0, vec![0x17, 0x00, 0, 0, 0]), false)
+            .observe_tag(video_tag(0, avc_sequence_header(0)), false)
             .unwrap();
         normalizer
-            .observe_tag(video_tag(0, vec![0x17, 0x00, 9, 9, 9]), true)
+            .observe_tag(video_tag(0, avc_sequence_header(9)), true)
             .unwrap();
 
         assert!(normalizer.has_pending_header_change());
+    }
+
+    #[test]
+    fn in_band_parameter_sets_need_two_keyframe_confirmations() {
+        let mut normalizer = FlvNormalizer::new();
+        normalizer
+            .observe_tag(video_tag(0, avc_sequence_header(0)), false)
+            .unwrap();
+
+        normalizer
+            .observe_tag(video_tag(33, avc_keyframe_with_parameter_sets(1)), true)
+            .unwrap();
+        assert!(!normalizer.avc_in_band_parameter_sets);
+
+        normalizer
+            .observe_tag(video_tag(66, avc_keyframe_with_parameter_sets(2)), true)
+            .unwrap();
+        assert!(normalizer.avc_in_band_parameter_sets);
+    }
+
+    #[test]
+    fn in_band_parameter_sets_suppress_sequence_header_rotation() {
+        let mut normalizer = FlvNormalizer::new();
+        normalizer
+            .observe_tag(video_tag(0, avc_sequence_header(0)), false)
+            .unwrap();
+        normalizer
+            .observe_tag(video_tag(33, avc_keyframe_with_parameter_sets(1)), true)
+            .unwrap();
+        normalizer
+            .observe_tag(video_tag(66, avc_keyframe_with_parameter_sets(2)), true)
+            .unwrap();
+
+        normalizer
+            .observe_tag(video_tag(70, avc_sequence_header(9)), true)
+            .unwrap();
+
+        assert!(!normalizer.has_pending_header_change());
+        assert_eq!(
+            normalizer.avc_seq_tag.as_ref().unwrap().data,
+            avc_sequence_header(9)
+        );
+    }
+
+    #[test]
+    fn in_band_parameter_sets_do_not_suppress_length_size_changes() {
+        let mut normalizer = FlvNormalizer::new();
+        normalizer
+            .observe_tag(video_tag(0, avc_sequence_header(0)), false)
+            .unwrap();
+        normalizer
+            .observe_tag(video_tag(33, avc_keyframe_with_parameter_sets(1)), true)
+            .unwrap();
+        normalizer
+            .observe_tag(video_tag(66, avc_keyframe_with_parameter_sets(2)), true)
+            .unwrap();
+
+        let mut changed = avc_sequence_header(9);
+        changed[9] = 0xfd; // 2-byte NALU lengths.
+        normalizer
+            .observe_tag(video_tag(70, changed), true)
+            .unwrap();
+
+        assert!(normalizer.has_pending_header_change());
+    }
+
+    #[test]
+    fn start_code_framing_is_rejected() {
+        let mut normalizer = FlvNormalizer::new();
+        normalizer
+            .observe_tag(video_tag(0, avc_sequence_header(0)), false)
+            .unwrap();
+
+        let err = normalizer
+            .observe_tag(
+                video_tag(
+                    33,
+                    vec![
+                        0x17, 0x01, 0, 0, 0, // FLV AVC NALU packet prefix
+                        0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee,
+                    ],
+                ),
+                true,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Annex-B start-code"));
     }
 
     #[test]

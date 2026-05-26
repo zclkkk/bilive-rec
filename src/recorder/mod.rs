@@ -757,6 +757,42 @@ mod tests {
         }
     }
 
+    fn avc_sequence_header(marker: u8) -> Vec<u8> {
+        vec![
+            0x17, 0x00, 0, 0, 0, // FLV AVC sequence header prefix
+            1, 0x64, 0, 0x1f, 0xff, // AVCDecoderConfigurationRecord, 4-byte NALU lengths
+            0xe1, 0, 1, marker, // one-byte SPS placeholder
+            1, 0, 1, marker, // one-byte PPS placeholder
+        ]
+    }
+
+    fn avc_sequence_header_tag(timestamp: u32, marker: u8) -> FlvTag {
+        video_tag(timestamp, avc_sequence_header(marker))
+    }
+
+    fn avc_keyframe_data(marker: u8) -> Vec<u8> {
+        vec![
+            0x17, 0x01, 0, 0, 0, // FLV AVC NALU packet prefix
+            0, 0, 0, 2, 0x65, marker, // IDR slice
+        ]
+    }
+
+    fn avc_keyframe_with_parameter_sets_data(marker: u8) -> Vec<u8> {
+        vec![
+            0x17, 0x01, 0, 0, 0, // FLV AVC NALU packet prefix
+            0, 0, 0, 2, 0x67, marker, // SPS
+            0, 0, 0, 2, 0x68, marker, // PPS
+            0, 0, 0, 1, 0x65, // IDR slice
+        ]
+    }
+
+    fn avc_interframe_data(marker: u8) -> Vec<u8> {
+        vec![
+            0x27, 0x01, 0, 0, 0, // FLV AVC NALU packet prefix
+            0, 0, 0, 2, 0x41, marker, // non-IDR slice
+        ]
+    }
+
     async fn start_recording_with_headers(recorder: &mut FlvRecorder<'_>) {
         recorder
             .push_chunk(b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00")
@@ -767,7 +803,7 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(0, vec![0x17, 0x00, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(0, avc_sequence_header(0))))
             .await
             .unwrap();
         recorder
@@ -813,21 +849,22 @@ mod tests {
         // Helper to push an AVC tag
         let push_avc_tag = |is_keyframe: bool| {
             let mut tag_buf = Vec::new();
-            let frame_type = if is_keyframe { 1 } else { 2 };
-            let codec_id = 7;
-            let packet_type = 1; // NALU
-            let first_byte = (frame_type << 4) | codec_id;
+            let data = if is_keyframe {
+                avc_keyframe_data(0)
+            } else {
+                avc_interframe_data(0)
+            };
 
             let tag = FlvTag {
                 header: FlvTagHeader {
                     tag_type: FlvTagType::Video,
-                    data_size: 5,
+                    data_size: data.len() as u32,
                     timestamp: 0,
                     stream_id: 0,
                 },
-                data: vec![first_byte, packet_type, 0, 0, 0],
+                data,
             };
-            tag.write(&mut tag_buf).unwrap(); // 11 + 5 + 4 = 20 bytes
+            tag.write(&mut tag_buf).unwrap();
             tag_buf
         };
 
@@ -847,15 +884,7 @@ mod tests {
             },
             data: vec![0, 1, 2, 3, 4],
         };
-        let avc_seq_tag = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![(1 << 4) | 7, 0, 0, 0, 0], // AVC seq
-        };
+        let avc_seq_tag = avc_sequence_header_tag(0, 0);
         let aac_seq_tag = FlvTag {
             header: FlvTagHeader {
                 tag_type: FlvTagType::Audio,
@@ -954,15 +983,7 @@ mod tests {
             },
             data: vec![0, 1, 2, 3, 4],
         };
-        let avc_seq_tag = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![(1 << 4) | 7, 0, 0, 0, 0], // AVC seq
-        };
+        let avc_seq_tag = avc_sequence_header_tag(0, 0);
         let aac_seq_tag = FlvTag {
             header: FlvTagHeader {
                 tag_type: FlvTagType::Audio,
@@ -979,15 +1000,7 @@ mod tests {
 
         // Push a small keyframe tag to open a segment
         let mut tag_buf = Vec::new();
-        let tag = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![(1 << 4) | 7, 1, 0, 0, 0], // NALU keyframe
-        };
+        let tag = video_tag(0, avc_keyframe_data(0));
         tag.write(&mut tag_buf).unwrap();
         recorder.push_chunk(&tag_buf).await.unwrap();
 
@@ -1023,21 +1036,22 @@ mod tests {
         // Helper to push an AVC tag
         let push_avc_tag = |is_keyframe: bool| {
             let mut tag_buf = Vec::new();
-            let frame_type = if is_keyframe { 1 } else { 2 };
-            let codec_id = 7;
-            let packet_type = 1; // NALU
-            let first_byte = (frame_type << 4) | codec_id;
+            let data = if is_keyframe {
+                avc_keyframe_data(0)
+            } else {
+                avc_interframe_data(0)
+            };
 
             let tag = FlvTag {
                 header: FlvTagHeader {
                     tag_type: FlvTagType::Video,
-                    data_size: 5,
+                    data_size: data.len() as u32,
                     timestamp: 0,
                     stream_id: 0,
                 },
-                data: vec![first_byte, packet_type, 0, 0, 0],
+                data,
             };
-            tag.write(&mut tag_buf).unwrap(); // 11 + 5 + 4 = 20 bytes
+            tag.write(&mut tag_buf).unwrap();
             tag_buf
         };
         let write_tag = |tag: FlvTag| {
@@ -1055,15 +1069,7 @@ mod tests {
             },
             data: vec![0, 1, 2, 3, 4],
         };
-        let avc_seq_tag = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![(1 << 4) | 7, 0, 0, 0, 0],
-        };
+        let avc_seq_tag = avc_sequence_header_tag(0, 0);
         let aac_seq_tag = FlvTag {
             header: FlvTagHeader {
                 tag_type: FlvTagType::Audio,
@@ -1144,15 +1150,7 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(FlvTag {
-                header: FlvTagHeader {
-                    tag_type: FlvTagType::Video,
-                    data_size: 5,
-                    timestamp: 0,
-                    stream_id: 0,
-                },
-                data: vec![(1 << 4) | 7, 0, 0, 0, 0],
-            }))
+            .push_chunk(&write_tag(avc_sequence_header_tag(0, 0)))
             .await
             .unwrap();
         recorder
@@ -1170,15 +1168,7 @@ mod tests {
 
         // Push a complete keyframe tag to open a segment
         let mut valid_tag_buf = Vec::new();
-        let valid_tag = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![(1 << 4) | 7, 1, 0, 0, 0],
-        };
+        let valid_tag = video_tag(0, avc_keyframe_data(0));
         valid_tag.write(&mut valid_tag_buf).unwrap();
         recorder.push_chunk(&valid_tag_buf).await.unwrap();
 
@@ -1219,7 +1209,7 @@ mod tests {
 
         start_recording_with_headers(&mut recorder).await;
         recorder
-            .push_chunk(&write_tag(video_tag(1_000, vec![0x17, 0x01, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(1_000, avc_keyframe_data(0))))
             .await
             .unwrap();
 
@@ -1231,7 +1221,7 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(1_020, vec![0x17, 0x00, 0, 0, 0])))
+            .push_chunk(&write_tag(avc_sequence_header_tag(1_020, 0)))
             .await
             .unwrap();
         recorder
@@ -1239,7 +1229,7 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(1_033, vec![0x17, 0x01, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(1_033, avc_keyframe_data(0))))
             .await
             .unwrap();
 
@@ -1289,15 +1279,15 @@ mod tests {
 
         start_recording_with_headers(&mut recorder).await;
         recorder
-            .push_chunk(&write_tag(video_tag(10_000, vec![0x17, 0x01, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(10_000, avc_keyframe_data(0))))
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(10_033, vec![0x27, 0x01, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(10_033, avc_interframe_data(0))))
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(50_000, vec![0x27, 0x01, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(50_000, avc_interframe_data(0))))
             .await
             .unwrap();
 
@@ -1332,7 +1322,7 @@ mod tests {
             .unwrap();
 
         start_recording_with_headers(&mut recorder).await;
-        let keyframe = video_tag(1_000, vec![0x17, 0x01, 1, 2, 3]);
+        let keyframe = video_tag(1_000, avc_keyframe_data(1));
         recorder
             .push_chunk(&write_tag(keyframe.clone()))
             .await
@@ -1366,7 +1356,7 @@ mod tests {
             .unwrap();
 
         start_recording_with_headers(&mut recorder).await;
-        let keyframe = video_tag(1_000, vec![0x17, 0x01, 1, 2, 3]);
+        let keyframe = video_tag(1_000, avc_keyframe_data(1));
         for _ in 0..12 {
             recorder
                 .push_chunk(&write_tag(keyframe.clone()))
@@ -1406,11 +1396,11 @@ mod tests {
 
         start_recording_with_headers(&mut recorder).await;
         recorder
-            .push_chunk(&write_tag(video_tag(1_000, vec![0x17, 0x01, 1, 2, 3])))
+            .push_chunk(&write_tag(video_tag(1_000, avc_keyframe_data(1))))
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(1_033, vec![0x17, 0x01, 1, 2, 3])))
+            .push_chunk(&write_tag(video_tag(1_033, avc_keyframe_data(1))))
             .await
             .unwrap();
 
@@ -1442,17 +1432,17 @@ mod tests {
 
         start_recording_with_headers(&mut recorder).await;
         recorder
-            .push_chunk(&write_tag(video_tag(1_000, vec![0x17, 0x01, 1, 2, 3])))
+            .push_chunk(&write_tag(video_tag(1_000, avc_keyframe_data(1))))
             .await
             .unwrap();
         for timestamp in [1_400, 1_800, 2_200, 2_600] {
             recorder
-                .push_chunk(&write_tag(video_tag(timestamp, vec![0x27, 0x01, 1, 2, 3])))
+                .push_chunk(&write_tag(video_tag(timestamp, avc_interframe_data(1))))
                 .await
                 .unwrap();
         }
         recorder
-            .push_chunk(&write_tag(video_tag(3_033, vec![0x17, 0x01, 4, 5, 6])))
+            .push_chunk(&write_tag(video_tag(3_033, avc_keyframe_data(4))))
             .await
             .unwrap();
 
@@ -1488,11 +1478,11 @@ mod tests {
 
         start_recording_with_headers(&mut recorder).await;
         recorder
-            .push_chunk(&write_tag(video_tag(1_000, vec![0x17, 0x01, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(1_000, avc_keyframe_data(0))))
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(1_010, vec![0x17, 0x00, 9, 9, 9])))
+            .push_chunk(&write_tag(avc_sequence_header_tag(1_010, 9)))
             .await
             .unwrap();
         recorder
@@ -1500,11 +1490,11 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(1_033, vec![0x27, 0x01, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(1_033, avc_interframe_data(0))))
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(video_tag(1_066, vec![0x17, 0x01, 0, 0, 0])))
+            .push_chunk(&write_tag(video_tag(1_066, avc_keyframe_data(0))))
             .await
             .unwrap();
 
@@ -1530,6 +1520,50 @@ mod tests {
             .map(|tag| tag.header.timestamp)
             .collect();
         assert_eq!(second_media_timestamps, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn test_flv_recorder_does_not_rotate_on_in_band_parameter_set_refresh() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let store = StateStore::open(&db_path).unwrap();
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
+
+        let session_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
+            .await
+            .unwrap();
+
+        start_recording_with_headers(&mut recorder).await;
+        recorder
+            .push_chunk(&write_tag(video_tag(
+                1_000,
+                avc_keyframe_with_parameter_sets_data(1),
+            )))
+            .await
+            .unwrap();
+        recorder
+            .push_chunk(&write_tag(video_tag(
+                1_033,
+                avc_keyframe_with_parameter_sets_data(2),
+            )))
+            .await
+            .unwrap();
+        recorder
+            .push_chunk(&write_tag(avc_sequence_header_tag(1_040, 9)))
+            .await
+            .unwrap();
+        recorder
+            .push_chunk(&write_tag(video_tag(1_066, avc_keyframe_data(3))))
+            .await
+            .unwrap();
+
+        recorder.finalize().await.unwrap();
+
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].status, SegmentStatus::Finalized);
     }
 
     #[tokio::test]
@@ -1567,15 +1601,7 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(FlvTag {
-                header: FlvTagHeader {
-                    tag_type: FlvTagType::Video,
-                    data_size: 5,
-                    timestamp: 0,
-                    stream_id: 0,
-                },
-                data: vec![(1 << 4) | 7, 0, 0, 0, 0],
-            }))
+            .push_chunk(&write_tag(avc_sequence_header_tag(0, 0)))
             .await
             .unwrap();
         recorder
@@ -1592,15 +1618,7 @@ mod tests {
             .unwrap();
 
         let mut tag_buf = Vec::new();
-        let tag = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![0x17, 0x01, 0, 0, 0],
-        };
+        let tag = video_tag(0, avc_keyframe_data(0));
         tag.write(&mut tag_buf).unwrap();
         recorder.push_chunk(&tag_buf).await.unwrap();
 
@@ -1644,15 +1662,7 @@ mod tests {
 
         // Push some P-frames (orphan frames) without headers
         for _ in 0..5 {
-            let p_frame = FlvTag {
-                header: FlvTagHeader {
-                    tag_type: FlvTagType::Video,
-                    data_size: 5,
-                    timestamp: 0,
-                    stream_id: 0,
-                },
-                data: vec![(2 << 4) | 7, 1, 0, 0, 0], // Interframe NALU
-            };
+            let p_frame = video_tag(0, avc_interframe_data(0));
             recorder.push_chunk(&write_tag(p_frame)).await.unwrap();
         }
 
@@ -1674,15 +1684,7 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(FlvTag {
-                header: FlvTagHeader {
-                    tag_type: FlvTagType::Video,
-                    data_size: 5,
-                    timestamp: 0,
-                    stream_id: 0,
-                },
-                data: vec![(1 << 4) | 7, 0, 0, 0, 0],
-            }))
+            .push_chunk(&write_tag(avc_sequence_header_tag(0, 0)))
             .await
             .unwrap();
         recorder
@@ -1702,15 +1704,7 @@ mod tests {
         assert!(matches!(recorder.phase, RecordPhase::WaitSync));
 
         // Push a keyframe, it should transition to Recording and open a segment
-        let keyframe = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![(1 << 4) | 7, 1, 0, 0, 0],
-        };
+        let keyframe = video_tag(0, avc_keyframe_data(0));
         recorder.push_chunk(&write_tag(keyframe)).await.unwrap();
 
         assert!(matches!(recorder.phase, RecordPhase::Recording(_)));
@@ -1753,17 +1747,9 @@ mod tests {
             }))
             .await
             .unwrap();
-        let initial_avc_seq = vec![(1 << 4) | 7, 0, 0, 0, 0];
+        let initial_avc_seq = avc_sequence_header(0);
         recorder
-            .push_chunk(&write_tag(FlvTag {
-                header: FlvTagHeader {
-                    tag_type: FlvTagType::Video,
-                    data_size: 5,
-                    timestamp: 0,
-                    stream_id: 0,
-                },
-                data: initial_avc_seq.clone(),
-            }))
+            .push_chunk(&write_tag(video_tag(0, initial_avc_seq.clone())))
             .await
             .unwrap();
         recorder
@@ -1780,15 +1766,7 @@ mod tests {
             .unwrap();
 
         // 2. Send keyframe to start first segment
-        let keyframe = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![(1 << 4) | 7, 1, 0, 0, 0],
-        };
+        let keyframe = video_tag(0, avc_keyframe_data(0));
         recorder
             .push_chunk(&write_tag(keyframe.clone()))
             .await
@@ -1798,17 +1776,9 @@ mod tests {
         assert!(!recorder.normalizer.has_pending_header_change());
 
         // 3. Send a new AVC seq with different data
-        let new_avc_seq = vec![(1 << 4) | 7, 0, 9, 9, 9];
+        let new_avc_seq = avc_sequence_header(9);
         recorder
-            .push_chunk(&write_tag(FlvTag {
-                header: FlvTagHeader {
-                    tag_type: FlvTagType::Video,
-                    data_size: 5,
-                    timestamp: 0,
-                    stream_id: 0,
-                },
-                data: new_avc_seq.clone(),
-            }))
+            .push_chunk(&write_tag(video_tag(0, new_avc_seq.clone())))
             .await
             .unwrap();
 
@@ -1893,15 +1863,7 @@ mod tests {
             .await
             .unwrap();
         recorder
-            .push_chunk(&write_tag(FlvTag {
-                header: FlvTagHeader {
-                    tag_type: FlvTagType::Video,
-                    data_size: 5,
-                    timestamp: 0,
-                    stream_id: 0,
-                },
-                data: vec![(1 << 4) | 7, 0, 0, 0, 0],
-            }))
+            .push_chunk(&write_tag(avc_sequence_header_tag(0, 0)))
             .await
             .unwrap();
         recorder
@@ -1919,15 +1881,7 @@ mod tests {
 
         // Keyframe → triggers open_new_segment → File::create on the
         // blocking directory → Err.
-        let keyframe = FlvTag {
-            header: FlvTagHeader {
-                tag_type: FlvTagType::Video,
-                data_size: 5,
-                timestamp: 0,
-                stream_id: 0,
-            },
-            data: vec![(1 << 4) | 7, 1, 0, 0, 0],
-        };
+        let keyframe = video_tag(0, avc_keyframe_data(0));
         let err = recorder
             .push_chunk(&write_tag(keyframe))
             .await
