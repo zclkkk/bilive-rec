@@ -183,32 +183,106 @@ fn fallback_delta_for_tag(tag: &FlvTag) -> u32 {
 }
 
 #[derive(Debug)]
-pub(super) struct MediaGroupDeduplicator {
+pub(super) struct MediaGroupBuffer {
+    pending: Vec<FlvTag>,
+    deduplicator: MediaGroupDeduplicator,
+}
+
+#[derive(Debug)]
+pub(super) enum MediaGroupFlush {
+    Empty,
+    Unique(Vec<FlvTag>),
+    Duplicate { reconnect: bool, media_tags: usize },
+}
+
+impl MediaGroupBuffer {
+    pub(super) fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            deduplicator: MediaGroupDeduplicator::new(),
+        }
+    }
+
+    pub(super) fn should_start_new_group(&self, tag: &FlvTag, is_keyframe: bool) -> bool {
+        let Some(last) = self.pending.last() else {
+            return false;
+        };
+
+        if is_keyframe && self.pending.iter().any(is_video_tag) {
+            return true;
+        }
+
+        let diff = i64::from(tag.header.timestamp) - i64::from(last.header.timestamp);
+        !(-24_999..24_999).contains(&diff)
+    }
+
+    pub(super) fn push(&mut self, tag: FlvTag) {
+        self.pending.push(tag);
+    }
+
+    pub(super) fn flush(&mut self) -> MediaGroupFlush {
+        if self.pending.is_empty() {
+            return MediaGroupFlush::Empty;
+        }
+
+        let media_tags = self.pending.len();
+        match self.deduplicator.observe(&self.pending) {
+            MediaGroupDecision::Unique => {
+                MediaGroupFlush::Unique(std::mem::take(&mut self.pending))
+            }
+            MediaGroupDecision::Duplicate => {
+                self.pending.clear();
+                MediaGroupFlush::Duplicate {
+                    reconnect: false,
+                    media_tags,
+                }
+            }
+            MediaGroupDecision::Reconnect => {
+                self.pending.clear();
+                MediaGroupFlush::Duplicate {
+                    reconnect: true,
+                    media_tags,
+                }
+            }
+        }
+    }
+
+    pub(super) fn reset_deduplicator(&mut self) {
+        self.deduplicator.reset();
+    }
+}
+
+fn is_video_tag(tag: &FlvTag) -> bool {
+    tag.header.tag_type == FlvTagType::Video
+}
+
+#[derive(Debug)]
+struct MediaGroupDeduplicator {
     history: VecDeque<u64>,
     duplicate_run: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MediaGroupDecision {
+enum MediaGroupDecision {
     Unique,
     Duplicate,
     Reconnect,
 }
 
 impl MediaGroupDeduplicator {
-    pub(super) fn new() -> Self {
+    fn new() -> Self {
         Self {
             history: VecDeque::with_capacity(DUPLICATE_HISTORY_LIMIT),
             duplicate_run: 0,
         }
     }
 
-    pub(super) fn reset(&mut self) {
+    fn reset(&mut self) {
         self.history.clear();
         self.duplicate_run = 0;
     }
 
-    pub(super) fn observe<'a, I>(&mut self, tags: I) -> MediaGroupDecision
+    fn observe<'a, I>(&mut self, tags: I) -> MediaGroupDecision
     where
         I: IntoIterator<Item = &'a FlvTag>,
     {

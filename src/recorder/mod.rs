@@ -4,10 +4,10 @@ mod flv_pipeline;
 pub mod segment;
 
 use crate::error::{AppError, AppResult};
-use crate::recorder::flv::{FlvHeader, FlvTag, FlvTagHeader, FlvTagType, read_previous_tag_size};
+use crate::recorder::flv::{FlvHeader, FlvTag, FlvTagHeader, read_previous_tag_size};
 use crate::recorder::flv_metadata::{KeyframeIndex, build_metadata_body};
 use crate::recorder::flv_pipeline::{
-    FlvNormalizer, MediaGroupDecision, MediaGroupDeduplicator, NormalizedAction,
+    FlvNormalizer, MediaGroupBuffer, MediaGroupFlush, NormalizedAction,
 };
 use crate::recorder::segment::{
     RecorderPolicy, SegmentEvent, final_path, part_path, should_filter_by_size,
@@ -42,11 +42,6 @@ enum RecordPhase {
     Recording(Box<ActiveSegment>),
 }
 
-#[derive(Debug)]
-struct PendingMediaTag {
-    tag: FlvTag,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum PendingMediaFlush {
     Normal,
@@ -57,10 +52,6 @@ struct InitialSegmentWrite {
     size: u64,
     metadata_source: Vec<u8>,
     metadata_len: usize,
-}
-
-fn is_video(tag: &FlvTag) -> bool {
-    tag.header.tag_type == FlvTagType::Video
 }
 
 const METADATA_BODY_OFFSET: u64 = 13 + 11;
@@ -75,8 +66,7 @@ pub struct FlvRecorder<'a> {
     buffer: Vec<u8>,
     header: Option<FlvHeader>,
     normalizer: FlvNormalizer,
-    pending_media_group: Vec<PendingMediaTag>,
-    deduplicator: MediaGroupDeduplicator,
+    media_group: MediaGroupBuffer,
 
     next_index: u32,
     phase: RecordPhase,
@@ -106,8 +96,7 @@ impl<'a> FlvRecorder<'a> {
             buffer: Vec::new(),
             header: None,
             normalizer: FlvNormalizer::new(),
-            pending_media_group: Vec::new(),
-            deduplicator: MediaGroupDeduplicator::new(),
+            media_group: MediaGroupBuffer::new(),
             next_index: start_index,
             phase: RecordPhase::WaitSync,
         })
@@ -195,7 +184,7 @@ impl<'a> FlvRecorder<'a> {
         is_keyframe: bool,
         allow_keyframe_rotation: bool,
     ) -> AppResult<()> {
-        if self.starts_new_media_group(&tag, is_keyframe) {
+        if self.media_group.should_start_new_group(&tag, is_keyframe) {
             self.flush_pending_media_group(PendingMediaFlush::Normal)
                 .await?;
         }
@@ -204,26 +193,8 @@ impl<'a> FlvRecorder<'a> {
             self.rotate_before_keyframe_if_needed().await?;
         }
 
-        self.pending_media_group.push(PendingMediaTag { tag });
+        self.media_group.push(tag);
         Ok(())
-    }
-
-    fn starts_new_media_group(&self, tag: &FlvTag, is_keyframe: bool) -> bool {
-        let Some(last) = self.pending_media_group.last() else {
-            return false;
-        };
-
-        if is_keyframe
-            && self
-                .pending_media_group
-                .iter()
-                .any(|item| is_video(&item.tag))
-        {
-            return true;
-        }
-
-        let diff = i64::from(tag.header.timestamp) - i64::from(last.tag.header.timestamp);
-        !(-24_999..24_999).contains(&diff)
     }
 
     async fn rotate_before_keyframe_if_needed(&mut self) -> AppResult<()> {
@@ -240,7 +211,7 @@ impl<'a> FlvRecorder<'a> {
         if needs_rotation {
             self.finalize_current_segment().await?;
             if header_change {
-                self.deduplicator.reset();
+                self.media_group.reset_deduplicator();
             }
             self.open_new_segment().await?;
         }
@@ -249,29 +220,27 @@ impl<'a> FlvRecorder<'a> {
     }
 
     async fn flush_pending_media_group(&mut self, mode: PendingMediaFlush) -> AppResult<()> {
-        if self.pending_media_group.is_empty() {
-            return Ok(());
-        }
-
-        match self
-            .deduplicator
-            .observe(self.pending_media_group.iter().map(|item| &item.tag))
-        {
-            MediaGroupDecision::Unique => {}
-            MediaGroupDecision::Duplicate => {
-                tracing::warn!(
-                    media_tags = self.pending_media_group.len(),
-                    "dropping duplicated FLV media group"
-                );
-                self.pending_media_group.clear();
-                return Ok(());
+        match self.media_group.flush() {
+            MediaGroupFlush::Empty => return Ok(()),
+            MediaGroupFlush::Unique(group) => {
+                for tag in group {
+                    self.write_media_tag(tag).await?;
+                }
             }
-            MediaGroupDecision::Reconnect => {
+            MediaGroupFlush::Duplicate {
+                reconnect: false,
+                media_tags,
+            } => {
+                tracing::warn!(media_tags, "dropping duplicated FLV media group");
+            }
+            MediaGroupFlush::Duplicate {
+                reconnect: true,
+                media_tags,
+            } => {
                 tracing::warn!(
-                    media_tags = self.pending_media_group.len(),
+                    media_tags,
                     "dropping duplicated FLV media group after reconnect threshold"
                 );
-                self.pending_media_group.clear();
                 if matches!(mode, PendingMediaFlush::Final) {
                     return Ok(());
                 }
@@ -279,11 +248,6 @@ impl<'a> FlvRecorder<'a> {
                     "received duplicated FLV media groups repeatedly".into(),
                 ));
             }
-        }
-
-        let group = std::mem::take(&mut self.pending_media_group);
-        for PendingMediaTag { tag } in group {
-            self.write_media_tag(tag).await?;
         }
 
         Ok(())
