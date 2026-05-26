@@ -1,9 +1,11 @@
 pub mod flv;
+mod flv_metadata;
 mod flv_pipeline;
 pub mod segment;
 
 use crate::error::{AppError, AppResult};
 use crate::recorder::flv::{FlvHeader, FlvTag, FlvTagHeader, FlvTagType, read_previous_tag_size};
+use crate::recorder::flv_metadata::{KeyframeIndex, build_metadata_body};
 use crate::recorder::flv_pipeline::{
     FlvNormalizer, MediaGroupDecision, MediaGroupDeduplicator, NormalizedAction,
 };
@@ -17,7 +19,7 @@ use crate::state::store::StateStore;
 use reqwest::Response;
 use std::path::PathBuf;
 use std::time::Instant;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -28,12 +30,16 @@ struct ActiveSegment {
     part_path: std::path::PathBuf,
     size: u64,
     start_time: Instant,
+    metadata_source: Vec<u8>,
+    metadata_len: usize,
+    duration_ms: u32,
+    keyframes: Vec<KeyframeIndex>,
 }
 
 #[derive(Debug)]
 enum RecordPhase {
     WaitSync,
-    Recording(ActiveSegment),
+    Recording(Box<ActiveSegment>),
 }
 
 #[derive(Debug)]
@@ -47,9 +53,18 @@ enum PendingMediaFlush {
     Final,
 }
 
+struct InitialSegmentWrite {
+    size: u64,
+    metadata_source: Vec<u8>,
+    metadata_len: usize,
+}
+
 fn is_video(tag: &FlvTag) -> bool {
     tag.header.tag_type == FlvTagType::Video
 }
+
+const METADATA_BODY_OFFSET: u64 = 13 + 11;
+const KEYFRAME_INDEX_MIN_INTERVAL_MS: u32 = 1_900;
 
 pub struct FlvRecorder<'a> {
     session_id: Uuid,
@@ -279,6 +294,9 @@ impl<'a> FlvRecorder<'a> {
         if let RecordPhase::Recording(seg) = &mut self.phase {
             self.normalizer.normalize_media_timestamp(&mut tag);
             let mut buf = Vec::new();
+            let file_position = seg.size;
+            let timestamp = tag.header.timestamp;
+            let is_keyframe = crate::recorder::flv::is_avc_keyframe(&tag.data);
             tag.write(&mut buf)
                 .map_err(|e| AppError::Bilibili(format!("FLV tag write error: {}", e)))?;
             seg.file.write_all(&buf).await.map_err(|e| AppError::Io {
@@ -286,6 +304,17 @@ impl<'a> FlvRecorder<'a> {
                 source: e,
             })?;
             seg.size += buf.len() as u64;
+            seg.duration_ms = seg.duration_ms.max(timestamp);
+            if is_keyframe
+                && seg.keyframes.last().is_none_or(|last| {
+                    timestamp.saturating_sub(last.time_ms) > KEYFRAME_INDEX_MIN_INTERVAL_MS
+                })
+            {
+                seg.keyframes.push(KeyframeIndex {
+                    time_ms: timestamp,
+                    file_position,
+                });
+            }
         }
 
         Ok(())
@@ -297,17 +326,17 @@ impl<'a> FlvRecorder<'a> {
             RecordPhase::WaitSync => return Ok(()),
         };
 
-        if let Err(e) = seg.file.flush().await.map_err(|e| AppError::Io {
-            path: seg.part_path.clone(),
-            source: e,
-        }) {
-            return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
-        }
-        drop(seg.file);
-
         let final_p = final_path(&self.policy.layout, &self.session_id, seg.index);
 
         if should_filter_by_size(seg.size, &self.policy.filter) {
+            if let Err(e) = seg.file.flush().await.map_err(|e| AppError::Io {
+                path: seg.part_path.clone(),
+                source: e,
+            }) {
+                return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+            }
+            drop(seg.file);
+
             let db_seg = Segment {
                 session_id: self.session_id,
                 index: seg.index,
@@ -337,6 +366,18 @@ impl<'a> FlvRecorder<'a> {
             });
             return Ok(());
         }
+
+        if let Err(e) = rewrite_segment_metadata(&mut seg).await {
+            return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+        }
+
+        if let Err(e) = seg.file.flush().await.map_err(|e| AppError::Io {
+            path: seg.part_path.clone(),
+            source: e,
+        }) {
+            return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+        }
+        drop(seg.file);
 
         if let Err(e) = tokio::fs::rename(&seg.part_path, &final_p)
             .await
@@ -441,8 +482,8 @@ impl<'a> FlvRecorder<'a> {
             Err(create_err) => return self.persist_failed_segment(idx, p_path.clone(), create_err),
         };
 
-        let size = match self.write_initial_segment_headers(&mut file, &p_path).await {
-            Ok(size) => size,
+        let initial = match self.write_initial_segment_headers(&mut file, &p_path).await {
+            Ok(initial) => initial,
             Err(write_err) => return self.persist_failed_segment(idx, p_path.clone(), write_err),
         };
 
@@ -458,13 +499,17 @@ impl<'a> FlvRecorder<'a> {
 
         self.normalizer.start_new_file();
 
-        self.phase = RecordPhase::Recording(ActiveSegment {
+        self.phase = RecordPhase::Recording(Box::new(ActiveSegment {
             file,
             index: idx,
             part_path: p_path,
-            size,
+            size: initial.size,
             start_time: Instant::now(),
-        });
+            metadata_source: initial.metadata_source,
+            metadata_len: initial.metadata_len,
+            duration_ms: 0,
+            keyframes: Vec::new(),
+        }));
 
         Ok(())
     }
@@ -473,7 +518,7 @@ impl<'a> FlvRecorder<'a> {
         &self,
         file: &mut tokio::fs::File,
         path: &std::path::Path,
-    ) -> AppResult<u64> {
+    ) -> AppResult<InitialSegmentWrite> {
         let mut size = 0;
         let mut buf = Vec::new();
 
@@ -501,6 +546,10 @@ impl<'a> FlvRecorder<'a> {
             .expect("Invariant violated: Metadata must exist when opening segment");
         let mut meta = meta.clone();
         meta.header.timestamp = 0;
+        meta.data = build_metadata_body(&meta.data, 0, &[]);
+        meta.header.data_size = meta.data.len() as u32;
+        let metadata_source = meta.data.clone();
+        let metadata_len = meta.data.len();
         meta.write(&mut buf)
             .map_err(|e| AppError::Bilibili(format!("FLV metadata write error: {}", e)))?;
 
@@ -532,7 +581,11 @@ impl<'a> FlvRecorder<'a> {
             size += buf.len() as u64;
         }
 
-        Ok(size)
+        Ok(InitialSegmentWrite {
+            size,
+            metadata_source,
+            metadata_len,
+        })
     }
 
     pub async fn finalize(&mut self) -> AppResult<()> {
@@ -564,6 +617,38 @@ impl<'a> FlvRecorder<'a> {
         }
         Ok(())
     }
+}
+
+async fn rewrite_segment_metadata(seg: &mut ActiveSegment) -> AppResult<()> {
+    let body = build_metadata_body(&seg.metadata_source, seg.duration_ms, &seg.keyframes);
+    if body.len() != seg.metadata_len {
+        return Err(AppError::Bilibili(format!(
+            "FLV metadata rewrite size changed: expected {}, got {}",
+            seg.metadata_len,
+            body.len()
+        )));
+    }
+
+    seg.file
+        .seek(std::io::SeekFrom::Start(METADATA_BODY_OFFSET))
+        .await
+        .map_err(|e| AppError::Io {
+            path: seg.part_path.clone(),
+            source: e,
+        })?;
+    seg.file.write_all(&body).await.map_err(|e| AppError::Io {
+        path: seg.part_path.clone(),
+        source: e,
+    })?;
+    seg.file
+        .seek(std::io::SeekFrom::End(0))
+        .await
+        .map_err(|e| AppError::Io {
+            path: seg.part_path.clone(),
+            source: e,
+        })?;
+
+    Ok(())
 }
 
 /// A thin wrapper that reads from an HTTP response and drives the FlvRecorder.
@@ -1379,6 +1464,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_flv_recorder_rewrites_metadata_duration_and_keyframes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let store = StateStore::open(&db_path).unwrap();
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
+
+        let session_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
+            .await
+            .unwrap();
+
+        start_recording_with_headers(&mut recorder).await;
+        recorder
+            .push_chunk(&write_tag(video_tag(1_000, vec![0x17, 0x01, 1, 2, 3])))
+            .await
+            .unwrap();
+        for timestamp in [1_400, 1_800, 2_200, 2_600] {
+            recorder
+                .push_chunk(&write_tag(video_tag(timestamp, vec![0x27, 0x01, 1, 2, 3])))
+                .await
+                .unwrap();
+        }
+        recorder
+            .push_chunk(&write_tag(video_tag(3_033, vec![0x17, 0x01, 4, 5, 6])))
+            .await
+            .unwrap();
+
+        recorder.finalize().await.unwrap();
+
+        let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
+        let metadata = tags
+            .iter()
+            .find(|tag| tag.header.tag_type == FlvTagType::ScriptData)
+            .expect("recorded FLV should have metadata");
+        let duration =
+            crate::recorder::flv_metadata::debug_number_property(&metadata.data, "duration")
+                .expect("metadata should contain duration");
+        let keyframe_times = crate::recorder::flv_metadata::debug_keyframe_times(&metadata.data)
+            .expect("metadata should contain keyframes.times");
+
+        assert_eq!(duration, 2.033);
+        assert_eq!(keyframe_times, vec![0.0, 2.033]);
+    }
+
+    #[tokio::test]
     async fn test_flv_recorder_drops_media_until_keyframe_after_header_change() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
@@ -1882,7 +2013,7 @@ mod tests {
                 timestamp: 0,
                 stream_id: 0,
             },
-            data: vec![(1 << 4) | 7, 0, 0, 0, 0],
+            data: vec![(1 << 4) | 7, 0, 0, 0],
         });
         recorder.normalizer.aac_seq_tag = Some(FlvTag {
             header: FlvTagHeader {
@@ -1897,7 +2028,7 @@ mod tests {
         let err = recorder
             .open_new_segment()
             .await
-            .expect_err("metadata size mismatch should fail initial header writes");
+            .expect_err("AVC sequence size mismatch should fail initial header writes");
         assert!(matches!(err, AppError::Bilibili(_)));
 
         let segments = store.list_segments(session_id).unwrap();
