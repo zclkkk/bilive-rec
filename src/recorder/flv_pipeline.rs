@@ -1,0 +1,258 @@
+use crate::error::{AppError, AppResult};
+use crate::recorder::flv::{
+    FlvTag, FlvTagType, is_aac_sequence_header, is_avc_keyframe, is_avc_sequence_header,
+    is_avc_video_tag,
+};
+
+const TIMESTAMP_JUMP_THRESHOLD_MS: i64 = 500;
+const VIDEO_FRAME_DURATION_FALLBACK_MS: u32 = 33;
+const AUDIO_FRAME_DURATION_FALLBACK_MS: u32 = 22;
+
+#[derive(Debug)]
+pub(super) struct FlvNormalizer {
+    pub(super) metadata_tag: Option<FlvTag>,
+    pub(super) avc_seq_tag: Option<FlvTag>,
+    pub(super) aac_seq_tag: Option<FlvTag>,
+    pending_header_change: bool,
+    timestamp: TimestampNormalizer,
+}
+
+#[derive(Debug)]
+pub(super) enum NormalizedAction {
+    Drop,
+    Write { tag: FlvTag, is_keyframe: bool },
+}
+
+impl FlvNormalizer {
+    pub(super) fn new() -> Self {
+        Self {
+            metadata_tag: None,
+            avc_seq_tag: None,
+            aac_seq_tag: None,
+            pending_header_change: false,
+            timestamp: TimestampNormalizer::new(),
+        }
+    }
+
+    pub(super) fn is_synced(&self) -> bool {
+        self.metadata_tag.is_some() && self.avc_seq_tag.is_some() && self.aac_seq_tag.is_some()
+    }
+
+    pub(super) fn has_pending_header_change(&self) -> bool {
+        self.pending_header_change
+    }
+
+    pub(super) fn start_new_file(&mut self) {
+        self.pending_header_change = false;
+        self.timestamp.reset();
+    }
+
+    pub(super) fn observe_tag(
+        &mut self,
+        tag: FlvTag,
+        recording: bool,
+    ) -> AppResult<NormalizedAction> {
+        match tag.header.tag_type {
+            FlvTagType::ScriptData => {
+                self.metadata_tag = Some(tag);
+                Ok(NormalizedAction::Drop)
+            }
+            FlvTagType::Video => {
+                if !is_avc_video_tag(&tag.data) {
+                    return Err(AppError::Bilibili(
+                        "Unsupported FLV video codec; only AVC is supported".into(),
+                    ));
+                }
+
+                if is_avc_sequence_header(&tag.data) {
+                    if recording
+                        && self
+                            .avc_seq_tag
+                            .as_ref()
+                            .is_some_and(|old| old.data != tag.data)
+                    {
+                        self.pending_header_change = true;
+                    }
+                    self.avc_seq_tag = Some(tag);
+                    return Ok(NormalizedAction::Drop);
+                }
+
+                let is_keyframe = is_avc_keyframe(&tag.data);
+                Ok(NormalizedAction::Write { tag, is_keyframe })
+            }
+            FlvTagType::Audio => {
+                if is_aac_sequence_header(&tag.data) {
+                    if recording
+                        && self
+                            .aac_seq_tag
+                            .as_ref()
+                            .is_some_and(|old| old.data != tag.data)
+                    {
+                        self.pending_header_change = true;
+                    }
+                    self.aac_seq_tag = Some(tag);
+                    return Ok(NormalizedAction::Drop);
+                }
+
+                Ok(NormalizedAction::Write {
+                    tag,
+                    is_keyframe: false,
+                })
+            }
+        }
+    }
+
+    pub(super) fn normalize_media_timestamp(&mut self, tag: &mut FlvTag) {
+        self.timestamp.normalize(tag);
+    }
+}
+
+#[derive(Debug)]
+struct TimestampNormalizer {
+    initialized: bool,
+    current_offset: i64,
+    last_original: u32,
+    last_output: u32,
+}
+
+impl TimestampNormalizer {
+    fn new() -> Self {
+        Self {
+            initialized: false,
+            current_offset: 0,
+            last_original: 0,
+            last_output: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn normalize(&mut self, tag: &mut FlvTag) {
+        let original = tag.header.timestamp;
+
+        if !self.initialized {
+            self.initialized = true;
+            self.current_offset = i64::from(original);
+            self.last_original = original;
+            self.last_output = 0;
+            tag.header.timestamp = 0;
+            return;
+        }
+
+        let diff = i64::from(original) - i64::from(self.last_original);
+        let fallback_delta = fallback_delta_for_tag(tag);
+        let mut output = i64::from(original) - self.current_offset;
+
+        if !(-TIMESTAMP_JUMP_THRESHOLD_MS..=TIMESTAMP_JUMP_THRESHOLD_MS).contains(&diff) {
+            let target = self.last_output.saturating_add(fallback_delta);
+            self.current_offset = i64::from(original) - i64::from(target);
+            output = i64::from(target);
+        }
+
+        if output < 0 {
+            output = 0;
+            self.current_offset = i64::from(original);
+        }
+
+        let output = output.min(i64::from(u32::MAX)) as u32;
+        tag.header.timestamp = output;
+        self.last_original = original;
+        self.last_output = self.last_output.max(output);
+    }
+}
+
+fn fallback_delta_for_tag(tag: &FlvTag) -> u32 {
+    match tag.header.tag_type {
+        FlvTagType::Audio => AUDIO_FRAME_DURATION_FALLBACK_MS,
+        FlvTagType::Video => VIDEO_FRAME_DURATION_FALLBACK_MS,
+        FlvTagType::ScriptData => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::recorder::flv::{FlvTagHeader, FlvTagType};
+
+    fn video_tag(timestamp: u32, data: Vec<u8>) -> FlvTag {
+        FlvTag {
+            header: FlvTagHeader {
+                tag_type: FlvTagType::Video,
+                data_size: data.len() as u32,
+                timestamp,
+                stream_id: 0,
+            },
+            data,
+        }
+    }
+
+    fn audio_tag(timestamp: u32, data: Vec<u8>) -> FlvTag {
+        FlvTag {
+            header: FlvTagHeader {
+                tag_type: FlvTagType::Audio,
+                data_size: data.len() as u32,
+                timestamp,
+                stream_id: 0,
+            },
+            data,
+        }
+    }
+
+    #[test]
+    fn same_sequence_header_does_not_mark_pending_change() {
+        let mut normalizer = FlvNormalizer::new();
+        let seq = video_tag(0, vec![0x17, 0x00, 0, 0, 0]);
+
+        assert!(matches!(
+            normalizer.observe_tag(seq.clone(), false).unwrap(),
+            NormalizedAction::Drop
+        ));
+        assert!(matches!(
+            normalizer.observe_tag(seq, true).unwrap(),
+            NormalizedAction::Drop
+        ));
+
+        assert!(!normalizer.has_pending_header_change());
+    }
+
+    #[test]
+    fn changed_sequence_header_marks_pending_change() {
+        let mut normalizer = FlvNormalizer::new();
+        normalizer
+            .observe_tag(video_tag(0, vec![0x17, 0x00, 0, 0, 0]), false)
+            .unwrap();
+        normalizer
+            .observe_tag(video_tag(0, vec![0x17, 0x00, 9, 9, 9]), true)
+            .unwrap();
+
+        assert!(normalizer.has_pending_header_change());
+    }
+
+    #[test]
+    fn timestamp_jump_is_rebased_to_boring_continuity() {
+        let mut normalizer = FlvNormalizer::new();
+        let mut first = video_tag(10_000, vec![0x17, 0x01, 0, 0, 0]);
+        let mut second = audio_tag(10_021, vec![0xAF, 0x01]);
+        let mut jumped = video_tag(50_000, vec![0x27, 0x01, 0, 0, 0]);
+
+        normalizer.normalize_media_timestamp(&mut first);
+        normalizer.normalize_media_timestamp(&mut second);
+        normalizer.normalize_media_timestamp(&mut jumped);
+
+        assert_eq!(first.header.timestamp, 0);
+        assert_eq!(second.header.timestamp, 21);
+        assert_eq!(jumped.header.timestamp, 54);
+    }
+
+    #[test]
+    fn unsupported_video_codec_is_rejected() {
+        let mut normalizer = FlvNormalizer::new();
+        let err = normalizer
+            .observe_tag(video_tag(0, vec![0x1c, 0x01, 0, 0, 0]), false)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Unsupported FLV video codec"));
+    }
+}
