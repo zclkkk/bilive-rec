@@ -3,8 +3,10 @@ mod flv_pipeline;
 pub mod segment;
 
 use crate::error::{AppError, AppResult};
-use crate::recorder::flv::{FlvHeader, FlvTag, FlvTagHeader, read_previous_tag_size};
-use crate::recorder::flv_pipeline::{FlvNormalizer, NormalizedAction};
+use crate::recorder::flv::{FlvHeader, FlvTag, FlvTagHeader, FlvTagType, read_previous_tag_size};
+use crate::recorder::flv_pipeline::{
+    FlvNormalizer, MediaGroupDecision, MediaGroupDeduplicator, NormalizedAction,
+};
 use crate::recorder::segment::{
     RecorderPolicy, SegmentEvent, final_path, part_path, should_filter_by_size,
     should_rotate_by_elapsed, should_rotate_by_size,
@@ -34,6 +36,21 @@ enum RecordPhase {
     Recording(ActiveSegment),
 }
 
+#[derive(Debug)]
+struct PendingMediaTag {
+    tag: FlvTag,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingMediaFlush {
+    Normal,
+    Final,
+}
+
+fn is_video(tag: &FlvTag) -> bool {
+    tag.header.tag_type == FlvTagType::Video
+}
+
 pub struct FlvRecorder<'a> {
     session_id: Uuid,
     policy: RecorderPolicy,
@@ -43,6 +60,8 @@ pub struct FlvRecorder<'a> {
     buffer: Vec<u8>,
     header: Option<FlvHeader>,
     normalizer: FlvNormalizer,
+    pending_media_group: Vec<PendingMediaTag>,
+    deduplicator: MediaGroupDeduplicator,
 
     next_index: u32,
     phase: RecordPhase,
@@ -72,6 +91,8 @@ impl<'a> FlvRecorder<'a> {
             buffer: Vec::new(),
             header: None,
             normalizer: FlvNormalizer::new(),
+            pending_media_group: Vec::new(),
+            deduplicator: MediaGroupDeduplicator::new(),
             next_index: start_index,
             phase: RecordPhase::WaitSync,
         })
@@ -116,22 +137,23 @@ impl<'a> FlvRecorder<'a> {
             let tag = FlvTag::read(&mut cursor)
                 .map_err(|e| AppError::Bilibili(format!("FLV tag read error: {}", e)))?;
 
+            if self.normalizer.is_cache_tag(&tag) {
+                self.flush_pending_media_group(PendingMediaFlush::Normal)
+                    .await?;
+            }
+
             let recording = matches!(self.phase, RecordPhase::Recording(_));
             let action = self.normalizer.observe_tag(tag, recording)?;
-            let NormalizedAction::Write {
-                mut tag,
-                is_keyframe,
-            } = action
-            else {
+            let NormalizedAction::Write { tag, is_keyframe } = action else {
                 self.buffer.drain(..total_needed);
                 continue;
             };
 
-            let mut just_entered_recording = false;
+            let mut allow_keyframe_rotation = true;
             if matches!(self.phase, RecordPhase::WaitSync) {
                 if self.normalizer.is_synced() && is_keyframe {
                     self.open_new_segment().await?;
-                    just_entered_recording = true;
+                    allow_keyframe_rotation = false;
                 } else {
                     // Drop tags until we sync on a keyframe with all headers.
                     self.buffer.drain(..total_needed);
@@ -144,36 +166,126 @@ impl<'a> FlvRecorder<'a> {
                 continue;
             }
 
-            let mut needs_rotation = false;
-            if !just_entered_recording
-                && is_keyframe
-                && let RecordPhase::Recording(seg) = &self.phase
-                && (self.normalizer.has_pending_header_change()
-                    || should_rotate_by_size(seg.size, &self.policy.segment)
-                    || should_rotate_by_elapsed(seg.start_time.elapsed(), &self.policy.segment))
-            {
-                needs_rotation = true;
-            }
-
-            if needs_rotation {
-                self.finalize_current_segment().await?;
-                self.open_new_segment().await?;
-            }
-
-            // Write current tag
-            if let RecordPhase::Recording(seg) = &mut self.phase {
-                self.normalizer.normalize_media_timestamp(&mut tag);
-                let mut buf = Vec::new();
-                tag.write(&mut buf)
-                    .map_err(|e| AppError::Bilibili(format!("FLV tag write error: {}", e)))?;
-                seg.file.write_all(&buf).await.map_err(|e| AppError::Io {
-                    path: seg.part_path.clone(),
-                    source: e,
-                })?;
-                seg.size += buf.len() as u64;
-            }
-
+            self.queue_media_tag(tag, is_keyframe, allow_keyframe_rotation)
+                .await?;
             self.buffer.drain(..total_needed);
+        }
+
+        Ok(())
+    }
+
+    async fn queue_media_tag(
+        &mut self,
+        tag: FlvTag,
+        is_keyframe: bool,
+        allow_keyframe_rotation: bool,
+    ) -> AppResult<()> {
+        if self.starts_new_media_group(&tag, is_keyframe) {
+            self.flush_pending_media_group(PendingMediaFlush::Normal)
+                .await?;
+        }
+
+        if is_keyframe && allow_keyframe_rotation {
+            self.rotate_before_keyframe_if_needed().await?;
+        }
+
+        self.pending_media_group.push(PendingMediaTag { tag });
+        Ok(())
+    }
+
+    fn starts_new_media_group(&self, tag: &FlvTag, is_keyframe: bool) -> bool {
+        let Some(last) = self.pending_media_group.last() else {
+            return false;
+        };
+
+        if is_keyframe
+            && self
+                .pending_media_group
+                .iter()
+                .any(|item| is_video(&item.tag))
+        {
+            return true;
+        }
+
+        let diff = i64::from(tag.header.timestamp) - i64::from(last.tag.header.timestamp);
+        !(-24_999..24_999).contains(&diff)
+    }
+
+    async fn rotate_before_keyframe_if_needed(&mut self) -> AppResult<()> {
+        let mut needs_rotation = false;
+        let header_change = self.normalizer.has_pending_header_change();
+        if let RecordPhase::Recording(seg) = &self.phase
+            && (header_change
+                || should_rotate_by_size(seg.size, &self.policy.segment)
+                || should_rotate_by_elapsed(seg.start_time.elapsed(), &self.policy.segment))
+        {
+            needs_rotation = true;
+        }
+
+        if needs_rotation {
+            self.finalize_current_segment().await?;
+            if header_change {
+                self.deduplicator.reset();
+            }
+            self.open_new_segment().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn flush_pending_media_group(&mut self, mode: PendingMediaFlush) -> AppResult<()> {
+        if self.pending_media_group.is_empty() {
+            return Ok(());
+        }
+
+        match self
+            .deduplicator
+            .observe(self.pending_media_group.iter().map(|item| &item.tag))
+        {
+            MediaGroupDecision::Unique => {}
+            MediaGroupDecision::Duplicate => {
+                tracing::warn!(
+                    media_tags = self.pending_media_group.len(),
+                    "dropping duplicated FLV media group"
+                );
+                self.pending_media_group.clear();
+                return Ok(());
+            }
+            MediaGroupDecision::Reconnect => {
+                tracing::warn!(
+                    media_tags = self.pending_media_group.len(),
+                    "dropping duplicated FLV media group after reconnect threshold"
+                );
+                self.pending_media_group.clear();
+                if matches!(mode, PendingMediaFlush::Final) {
+                    return Ok(());
+                }
+                return Err(AppError::StreamRepeatedData(
+                    "received duplicated FLV media groups repeatedly".into(),
+                ));
+            }
+        }
+
+        let group = std::mem::take(&mut self.pending_media_group);
+        for PendingMediaTag { tag } in group {
+            self.write_media_tag(tag).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn write_media_tag(&mut self, mut tag: FlvTag) -> AppResult<()> {
+        // Write current tag
+        if let RecordPhase::Recording(seg) = &mut self.phase {
+            self.normalizer.normalize_media_timestamp(&mut tag);
+            let mut buf = Vec::new();
+            tag.write(&mut buf)
+                .map_err(|e| AppError::Bilibili(format!("FLV tag write error: {}", e)))?;
+            seg.file.write_all(&buf).await.map_err(|e| AppError::Io {
+                path: seg.part_path.clone(),
+                source: e,
+            })?;
+            seg.size += buf.len() as u64;
         }
 
         Ok(())
@@ -431,6 +543,8 @@ impl<'a> FlvRecorder<'a> {
             );
             self.buffer.clear();
         }
+        self.flush_pending_media_group(PendingMediaFlush::Final)
+            .await?;
         self.finalize_current_segment().await?;
         Ok(())
     }
@@ -477,7 +591,15 @@ pub async fn record_flv(
             tokio::select! {
                 chunk_res = tokio::time::timeout(std::time::Duration::from_secs(30), resp.chunk()) => {
                     match chunk_res {
-                        Ok(Ok(Some(data))) => recorder.push_chunk(&data).await?,
+                        Ok(Ok(Some(data))) => {
+                            if let Err(error) = recorder.push_chunk(&data).await {
+                                if matches!(error, AppError::StreamRepeatedData(_)) {
+                                    tracing::warn!("{}", error);
+                                    break;
+                                }
+                                return Err(error);
+                            }
+                        }
                         Ok(Ok(None)) => break,
                         Ok(Err(e)) => {
                             tracing::warn!("Stream connection dropped: {}", e);
@@ -1145,6 +1267,115 @@ mod tests {
             .collect();
 
         assert_eq!(media_video_timestamps, vec![0, 33, 66]);
+    }
+
+    #[tokio::test]
+    async fn test_flv_recorder_drops_duplicated_media_group() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let store = StateStore::open(&db_path).unwrap();
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
+
+        let session_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
+            .await
+            .unwrap();
+
+        start_recording_with_headers(&mut recorder).await;
+        let keyframe = video_tag(1_000, vec![0x17, 0x01, 1, 2, 3]);
+        recorder
+            .push_chunk(&write_tag(keyframe.clone()))
+            .await
+            .unwrap();
+        recorder.push_chunk(&write_tag(keyframe)).await.unwrap();
+
+        recorder.finalize().await.unwrap();
+
+        let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
+        let media_video_timestamps: Vec<_> = tags
+            .iter()
+            .filter(|tag| {
+                tag.header.tag_type == FlvTagType::Video && !is_avc_sequence_header(&tag.data)
+            })
+            .map(|tag| tag.header.timestamp)
+            .collect();
+        assert_eq!(media_video_timestamps, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn test_flv_recorder_finalizes_when_duplicate_threshold_hits_on_final_flush() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let store = StateStore::open(&db_path).unwrap();
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
+
+        let session_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
+            .await
+            .unwrap();
+
+        start_recording_with_headers(&mut recorder).await;
+        let keyframe = video_tag(1_000, vec![0x17, 0x01, 1, 2, 3]);
+        for _ in 0..12 {
+            recorder
+                .push_chunk(&write_tag(keyframe.clone()))
+                .await
+                .unwrap();
+        }
+
+        recorder.finalize().await.unwrap();
+
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].status, SegmentStatus::Finalized);
+
+        let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
+        let media_video_timestamps: Vec<_> = tags
+            .iter()
+            .filter(|tag| {
+                tag.header.tag_type == FlvTagType::Video && !is_avc_sequence_header(&tag.data)
+            })
+            .map(|tag| tag.header.timestamp)
+            .collect();
+        assert_eq!(media_video_timestamps, vec![0]);
+    }
+
+    #[tokio::test]
+    async fn test_flv_recorder_keeps_same_media_data_with_new_timestamp() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.redb");
+        let store = StateStore::open(&db_path).unwrap();
+        let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
+
+        let session_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, tx, 1)
+            .await
+            .unwrap();
+
+        start_recording_with_headers(&mut recorder).await;
+        recorder
+            .push_chunk(&write_tag(video_tag(1_000, vec![0x17, 0x01, 1, 2, 3])))
+            .await
+            .unwrap();
+        recorder
+            .push_chunk(&write_tag(video_tag(1_033, vec![0x17, 0x01, 1, 2, 3])))
+            .await
+            .unwrap();
+
+        recorder.finalize().await.unwrap();
+
+        let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
+        let media_video_timestamps: Vec<_> = tags
+            .iter()
+            .filter(|tag| {
+                tag.header.tag_type == FlvTagType::Video && !is_avc_sequence_header(&tag.data)
+            })
+            .map(|tag| tag.header.timestamp)
+            .collect();
+        assert_eq!(media_video_timestamps, vec![0, 33]);
     }
 
     #[tokio::test]

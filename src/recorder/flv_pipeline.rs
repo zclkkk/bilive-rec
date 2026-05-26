@@ -3,10 +3,13 @@ use crate::recorder::flv::{
     FlvTag, FlvTagType, is_aac_sequence_header, is_avc_keyframe, is_avc_sequence_header,
     is_avc_video_tag,
 };
+use std::collections::VecDeque;
 
 const TIMESTAMP_JUMP_THRESHOLD_MS: i64 = 500;
 const VIDEO_FRAME_DURATION_FALLBACK_MS: u32 = 33;
 const AUDIO_FRAME_DURATION_FALLBACK_MS: u32 = 22;
+const DUPLICATE_HISTORY_LIMIT: usize = 16;
+const DUPLICATE_RECONNECT_THRESHOLD: u32 = 10;
 
 #[derive(Debug)]
 pub(super) struct FlvNormalizer {
@@ -40,6 +43,14 @@ impl FlvNormalizer {
 
     pub(super) fn has_pending_header_change(&self) -> bool {
         self.pending_header_change
+    }
+
+    pub(super) fn is_cache_tag(&self, tag: &FlvTag) -> bool {
+        match tag.header.tag_type {
+            FlvTagType::ScriptData => true,
+            FlvTagType::Video => is_avc_sequence_header(&tag.data),
+            FlvTagType::Audio => is_aac_sequence_header(&tag.data),
+        }
     }
 
     pub(super) fn start_new_file(&mut self) {
@@ -168,6 +179,104 @@ fn fallback_delta_for_tag(tag: &FlvTag) -> u32 {
         FlvTagType::Audio => AUDIO_FRAME_DURATION_FALLBACK_MS,
         FlvTagType::Video => VIDEO_FRAME_DURATION_FALLBACK_MS,
         FlvTagType::ScriptData => 0,
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct MediaGroupDeduplicator {
+    history: VecDeque<u64>,
+    duplicate_run: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MediaGroupDecision {
+    Unique,
+    Duplicate,
+    Reconnect,
+}
+
+impl MediaGroupDeduplicator {
+    pub(super) fn new() -> Self {
+        Self {
+            history: VecDeque::with_capacity(DUPLICATE_HISTORY_LIMIT),
+            duplicate_run: 0,
+        }
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.history.clear();
+        self.duplicate_run = 0;
+    }
+
+    pub(super) fn observe<'a, I>(&mut self, tags: I) -> MediaGroupDecision
+    where
+        I: IntoIterator<Item = &'a FlvTag>,
+    {
+        let fingerprint = fingerprint_media_group(tags);
+        if self.history.contains(&fingerprint) {
+            self.duplicate_run = self.duplicate_run.saturating_add(1);
+            if self.duplicate_run > DUPLICATE_RECONNECT_THRESHOLD {
+                return MediaGroupDecision::Reconnect;
+            }
+            return MediaGroupDecision::Duplicate;
+        }
+
+        self.duplicate_run = 0;
+        self.history.push_back(fingerprint);
+        while self.history.len() > DUPLICATE_HISTORY_LIMIT {
+            self.history.pop_front();
+        }
+        MediaGroupDecision::Unique
+    }
+}
+
+fn fingerprint_media_group<'a, I>(tags: I) -> u64
+where
+    I: IntoIterator<Item = &'a FlvTag>,
+{
+    let mut hash = StableHasher::new();
+    let mut count = 0u64;
+
+    for tag in tags {
+        count += 1;
+        hash.write_u8(tag.header.tag_type as u8);
+        hash.write_u32(tag.header.data_size);
+        hash.write_u32(tag.header.timestamp);
+        hash.write_bytes(&tag.data);
+    }
+
+    hash.write_u64(count);
+    hash.finish()
+}
+
+struct StableHasher(u64);
+
+impl StableHasher {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write_bytes(&[value]);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_bytes(&value.to_be_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write_bytes(&value.to_be_bytes());
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
     }
 }
 

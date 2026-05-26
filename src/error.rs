@@ -37,6 +37,9 @@ pub enum AppError {
     #[error("bilibili error: {0}")]
     Bilibili(String),
 
+    #[error("stream repeated media data: {0}")]
+    StreamRepeatedData(String),
+
     #[error("graceful shutdown")]
     GracefulShutdown,
 }
