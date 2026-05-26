@@ -38,8 +38,8 @@ max_backoff_s = 300
 [[rooms]]
 name = "example"
 url = "https://live.bilibili.com/123456"
-title = "{title}"
-description = "{name} 直播录像\n原直播间：{url}"
+title = "{title} {started_at:%Y-%m-%d}"
+description = "{name} 直播录像\n录制开始：{started_at:%Y-%m-%d %H:%M:%S}\n原直播间：{url}"
 # 房间独立账号覆盖（可选）。如果不配置，将使用全局 [record] 和 [upload] 引用的账号。
 # record_credential = "captain"
 # upload_credential = "alt_uploader"

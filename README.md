@@ -48,8 +48,8 @@ cp config.example.toml config.toml
 | **`[[rooms]]`** | **直播间配置（必填，支持配置多个房间组）** | | |
 | `name` | **[必填]** 房间短标识名（用于日志记录和作为变量替换）。 | **(必填)** | `example` |
 | `url` | **[必填]** B站直播间完整的 URL。 | **(必填)** | `https://live.bilibili.com/123` |
-| `title` | 投稿标题模板（支持 `{title}`, `{name}` 等占位符）。 | `无 (可选)` | `{title}` |
-| `description` | 投稿简介模板。 | `无 (可选)` | `{name} 直播录像...` |
+| `title` | 投稿标题模板。支持 `{title}`/`{room_title}`, `{name}`/`{room_name}`, `{room_id}`, `{url}` 以及按本机时区格式化的录制开始时间 `{started_at:%Y-%m-%d %H:%M:%S}`。 | `无 (可选)` | `{title}` |
+| `description` | 投稿简介模板，支持同一组占位符。 | `无 (可选)` | `{name} 直播录像...` |
 | `record_credential`| 专属拉流账号名（用于录制舰长专属直播等），若不配则回退到全局 `[record].credential`。 | `无 (可选)` | `captain` |
 | `upload_credential`| 专属上传账号名，若不配则回退到全局 `[upload].credential`。 | `无 (可选)` | `alt_uploader` |
 

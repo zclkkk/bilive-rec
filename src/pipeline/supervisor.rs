@@ -21,6 +21,7 @@ use crate::state::model::{
     LiveSession, SegmentStatus, SessionStatus, Submission, SubmissionStatus,
 };
 use crate::state::store::StateStore;
+use crate::submission_template::render_room_template;
 use crate::uploader::types::{SubmissionOutcome, SubmissionRequest, Uploader};
 use crate::uploader::validation::{
     PersistedUploadFailure, upload_and_persist_segment, validate_finalized_segment_for_upload,
@@ -51,24 +52,6 @@ fn pipeline_state_requires_active_session(state: PipelineState) -> bool {
             | PipelineState::Uploading
             | PipelineState::Submitting
     )
-}
-
-fn render_room_template(
-    template: &str,
-    room_config: &RoomConfig,
-    session: Option<&LiveSession>,
-    room_id: u64,
-) -> String {
-    let title = session
-        .map(|s| s.title.as_str())
-        .unwrap_or(room_config.name.as_str());
-    template
-        .replace("{title}", title)
-        .replace("{room_title}", title)
-        .replace("{room_name}", &room_config.name)
-        .replace("{name}", &room_config.name)
-        .replace("{room_id}", &room_id.to_string())
-        .replace("{url}", &room_config.url)
 }
 
 fn ensure_session_ready_to_submit(store: &StateStore, session_id: Uuid) -> AppResult<()> {
@@ -881,6 +864,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             self.room_id,
                         )
                     })
+                    .transpose()?
                     .unwrap_or_else(|| session.title.clone());
                 let description = self
                     .room_config
@@ -894,6 +878,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             self.room_id,
                         )
                     })
+                    .transpose()?
                     .unwrap_or_default();
                 let upload_config = self.app_config.upload_config()?;
 

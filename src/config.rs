@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::credential::CredentialIdentity;
 use crate::error::{AppError, AppResult};
+use crate::submission_template::validate_room_template;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -238,6 +239,7 @@ impl AppConfig {
         upload.validate()?;
         for room in &self.rooms {
             self.room_credentials(room)?;
+            room.validate_templates()?;
         }
         Ok(())
     }
@@ -389,6 +391,27 @@ impl UploadConfig {
     }
 }
 
+impl RoomConfig {
+    pub fn validate_templates(&self) -> AppResult<()> {
+        if let Some(template) = &self.title {
+            self.validate_template_field("title", template)?;
+        }
+        if let Some(template) = &self.description {
+            self.validate_template_field("description", template)?;
+        }
+        Ok(())
+    }
+
+    fn validate_template_field(&self, field: &str, template: &str) -> AppResult<()> {
+        validate_room_template(template).map_err(|err| match err {
+            AppError::Config(message) => {
+                AppError::Config(format!("rooms[{}].{field}: {message}", self.name))
+            }
+            err => err,
+        })
+    }
+}
+
 fn validate_cookie_file_path(path: &Path, label: &str) -> AppResult<()> {
     if !path.exists() {
         return Err(AppError::Config(format!(
@@ -513,10 +536,13 @@ mod tests {
         assert_eq!(config.pipeline.max_backoff_s, 300);
         assert_eq!(config.rooms.len(), 1);
         assert_eq!(config.rooms[0].name, "example");
-        assert_eq!(config.rooms[0].title.as_deref(), Some("{title}"));
+        assert_eq!(
+            config.rooms[0].title.as_deref(),
+            Some("{title} {started_at:%Y-%m-%d}")
+        );
         assert_eq!(
             config.rooms[0].description.as_deref(),
-            Some("{name} 直播录像\n原直播间：{url}")
+            Some("{name} 直播录像\n录制开始：{started_at:%Y-%m-%d %H:%M:%S}\n原直播间：{url}")
         );
     }
 
@@ -654,6 +680,30 @@ url = "https://live.bilibili.com/1"
 
         let err = config.validate_for_run().unwrap_err();
         assert!(err.to_string().contains("[upload]"));
+    }
+
+    #[test]
+    fn run_validation_rejects_invalid_room_template() {
+        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[credentials.main]
+cookie_file = "{}"
+
+[upload]
+credential = "main"
+
+[[rooms]]
+name = "test"
+url = "https://live.bilibili.com/1"
+title = "{{started_at:%}}"
+"#,
+            cookie.path().display()
+        );
+        let config = AppConfig::parse(&toml).unwrap();
+
+        let err = config.validate_for_run().unwrap_err();
+        assert!(err.to_string().contains("invalid started_at format"));
     }
 
     #[test]

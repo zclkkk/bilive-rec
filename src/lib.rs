@@ -6,4 +6,5 @@ pub mod error;
 pub mod pipeline;
 pub mod recorder;
 pub mod state;
+mod submission_template;
 pub mod uploader;
