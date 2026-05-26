@@ -3,7 +3,7 @@ use std::process;
 use bilive_rec::bilibili;
 use bilive_rec::bilibili::client::BiliClient;
 use bilive_rec::cli::{Cli, Command, ResolveOutcome, StateAction};
-use bilive_rec::config::{AppConfig, RecordConfig};
+use bilive_rec::config::AppConfig;
 use bilive_rec::error::AppResult;
 use bilive_rec::state;
 use bilive_rec::state::store::StateStore;
@@ -63,10 +63,9 @@ fn init_tracing() {
 
 async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
-    config.validate_for_run()?;
+    let run_config = config.resolve_for_run()?;
     tracing::info!("config loaded from {}", config_path.display());
 
-    use bilive_rec::credential::CredentialIdentity;
     use bilive_rec::pipeline::state_machine::PipelineState;
     use bilive_rec::pipeline::supervisor::{RoomSupervisor, RoomSupervisorDeps};
     use bilive_rec::uploader::biliup_adapter::BiliupUploader;
@@ -74,29 +73,21 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     use std::sync::Arc;
     use tokio::time::Duration;
 
-    let db_path = config.data.dir.join("state.redb");
+    let db_path = run_config.data.dir.join("state.redb");
     let store = Arc::new(StateStore::open(&db_path)?);
     let store_clone = store.clone();
-    let upload_config = config.upload_config()?.clone();
     use bilive_rec::uploader::types::Uploader;
 
-    let app_config = Arc::new(config.clone());
+    let pipeline_config = run_config.pipeline.clone();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let mut handles = futures::stream::FuturesUnordered::new();
-    let prepared_rooms: Vec<_> = config
-        .rooms
-        .iter()
-        .cloned()
-        .map(|room_config| {
-            let credentials = config.room_credentials(&room_config)?;
-            Ok((room_config, credentials))
-        })
-        .collect::<AppResult<_>>()?;
+    let prepared_rooms = run_config.rooms;
 
     let mut uploaders = HashMap::new();
-    for (_, room_credentials) in &prepared_rooms {
+    for room_config in &prepared_rooms {
+        let room_credentials = room_config.credentials();
         if uploaders.contains_key(&room_credentials.upload) {
             continue;
         }
@@ -106,19 +97,21 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
         );
         let uploader = Arc::new(BiliupUploader::new(
             room_credentials.upload.cookie_file.clone(),
-            upload_config.line.clone(),
-            upload_config.threads,
-            upload_config.submit_api.clone(),
+            run_config.upload.line.clone(),
+            run_config.upload.threads,
+            run_config.upload.submit_api.clone(),
         ));
         uploader.check_login().await?;
         uploaders.insert(room_credentials.upload.clone(), uploader);
     }
 
-    let mut clients: HashMap<Option<CredentialIdentity>, Arc<BiliClient>> = HashMap::new();
+    let mut clients: HashMap<Option<bilive_rec::credential::CredentialIdentity>, Arc<BiliClient>> =
+        HashMap::new();
 
-    for (room_config, room_credentials) in prepared_rooms {
+    for room_config in prepared_rooms {
         let room_url = room_config.url.clone();
         let store = store_clone.clone();
+        let room_credentials = room_config.credentials();
 
         let record_credential = room_credentials.record.clone();
         let client = if let Some(client) = clients.get(&record_credential) {
@@ -148,8 +141,8 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
             })?
             .clone();
 
-        let app_config = app_config.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let pipeline_config = pipeline_config.clone();
 
         let handle = tokio::spawn(async move {
             let room_id =
@@ -166,13 +159,12 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
             let mut loop_shutdown_rx = shutdown_rx.clone();
             let mut supervisor = RoomSupervisor::new(
                 room_id,
-                app_config.pipeline.clone(),
+                pipeline_config.clone(),
                 room_config,
                 RoomSupervisorDeps {
                     store,
                     client,
                     uploader,
-                    app_config: app_config.clone(),
                 },
                 shutdown_rx,
             )?;
@@ -201,10 +193,10 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                 let state = supervisor.session.state;
                 let sleep_duration = match state {
                     PipelineState::Idle => {
-                        Some(Duration::from_secs(app_config.pipeline.poll_interval_s))
+                        Some(Duration::from_secs(pipeline_config.poll_interval_s))
                     }
                     PipelineState::Failed | PipelineState::Offline => {
-                        Some(Duration::from_secs(app_config.pipeline.poll_interval_s))
+                        Some(Duration::from_secs(pipeline_config.poll_interval_s))
                     }
                     PipelineState::WaitingReconnect | PipelineState::ReResolving => {
                         Some(supervisor.reconnect_delay())
@@ -515,8 +507,7 @@ async fn state_recover_cmd(
 
     if apply {
         if state::recovery::plan_has_upload_actions(&plan) {
-            config.validate_for_upload_actions()?;
-            let upload_config = config.upload_config()?.clone();
+            let upload_recovery = config.resolve_for_upload_recovery()?;
             let mut uploaders_by_credential: std::collections::HashMap<
                 bilive_rec::credential::CredentialIdentity,
                 std::sync::Arc<bilive_rec::uploader::biliup_adapter::BiliupUploader>,
@@ -567,9 +558,9 @@ async fn state_recover_cmd(
                     let uploader = std::sync::Arc::new(
                         bilive_rec::uploader::biliup_adapter::BiliupUploader::new(
                             session_upload_credential.cookie_file.clone(),
-                            upload_config.line.clone(),
-                            upload_config.threads,
-                            upload_config.submit_api.clone(),
+                            upload_recovery.upload.line.clone(),
+                            upload_recovery.upload.threads,
+                            upload_recovery.upload.submit_api.clone(),
                         ),
                     );
                     uploaders_by_credential.insert(session_upload_credential, uploader.clone());
@@ -649,22 +640,22 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
         None => {
             let default_path = std::path::Path::new("config.toml");
             if default_path.exists() {
-                Some(AppConfig::load(default_path)?)
+                AppConfig::load(default_path)?
             } else {
-                None
+                AppConfig::parse("")?
             }
         }
-        Some(path) => Some(AppConfig::load(path)?),
+        Some(path) => AppConfig::load(path)?,
     };
 
-    let (record_config, client) = if let Some(config) = config {
-        config.validate_for_check()?;
-        let record_cookie_file = config.record_cookie_file()?;
-        let client = BiliClient::from_optional_cookie_file(record_cookie_file.as_deref())?;
-        (config.record, client)
-    } else {
-        (RecordConfig::default(), BiliClient::new(None)?)
-    };
+    let check_config = config.resolve_for_check()?;
+    let client = BiliClient::from_optional_cookie_file(
+        check_config
+            .record
+            .credential
+            .as_ref()
+            .map(|credential| credential.cookie_file()),
+    )?;
 
     let room_id = bilibili::room::resolve_room_id(&client, room_url).await?;
     let room_info = bilibili::room::fetch_room_info(&client, room_id).await?;
@@ -675,7 +666,8 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
         println!("room_id = {}", room_info.room_id);
 
         let play_info_resp =
-            bilibili::stream::fetch_play_info(&client, room_info.room_id, record_config.qn).await?;
+            bilibili::stream::fetch_play_info(&client, room_info.room_id, check_config.record.qn)
+                .await?;
         let candidates = bilibili::stream::parse_stream_candidates(&play_info_resp)?;
 
         println!("candidates = {}", candidates.len());
@@ -689,9 +681,12 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
             );
         }
 
-        let selected =
-            bilibili::stream::select_healthy_stream_candidate(&candidates, &record_config, &client)
-                .await?;
+        let selected = bilibili::stream::select_healthy_stream_candidate(
+            &candidates,
+            &check_config.record,
+            &client,
+        )
+        .await?;
         if let Some(ref sel) = selected {
             println!("selected = {}", sel.url);
         } else {
@@ -730,9 +725,9 @@ async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> Ap
         }
         Some(path) => AppConfig::load(path)?,
     };
-    config.validate_for_check()?;
+    let check_config = config.resolve_for_check()?;
 
-    let record_credential = config.record_credential_identity()?;
+    let record_credential = check_config.record.credential.clone();
     let client = BiliClient::from_optional_cookie_file(
         record_credential
             .as_ref()
@@ -749,14 +744,16 @@ async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> Ap
     }
 
     let play_info_resp =
-        bilibili::stream::fetch_play_info(&client, room_info.room_id, config.record.qn).await?;
+        bilibili::stream::fetch_play_info(&client, room_info.room_id, check_config.record.qn)
+            .await?;
     let candidates = bilibili::stream::parse_stream_candidates(&play_info_resp)?;
-    let candidate =
-        bilibili::stream::select_healthy_stream_candidate(&candidates, &config.record, &client)
-            .await?
-            .ok_or_else(|| {
-                bilive_rec::error::AppError::Bilibili("no healthy stream candidates".into())
-            })?;
+    let candidate = bilibili::stream::select_healthy_stream_candidate(
+        &candidates,
+        &check_config.record,
+        &client,
+    )
+    .await?
+    .ok_or_else(|| bilive_rec::error::AppError::Bilibili("no healthy stream candidates".into()))?;
 
     tracing::info!(
         room_id = room_info.room_id,
@@ -767,7 +764,7 @@ async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> Ap
     // Persist truth before risk: create the LiveSession row before we open
     // the network stream. If the process dies mid-record, `state inspect`
     // can still see the session and its segments.
-    let db_path = config.data.dir.join("state.redb");
+    let db_path = check_config.data.dir.join("state.redb");
     let store = Arc::new(bilive_rec::state::store::StateStore::open(&db_path)?);
 
     let session_id = Uuid::new_v4();
@@ -785,14 +782,14 @@ async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> Ap
 
     let policy = RecorderPolicy {
         layout: SegmentLayout {
-            output_dir: config.record.output_dir.clone(),
+            output_dir: check_config.record.output_dir.clone(),
         },
         segment: SegmentPolicy {
-            segment_time: config.record.segment_time_duration()?,
-            segment_size: config.record.segment_size_bytes()?,
+            segment_time: check_config.record.segment_time,
+            segment_size: check_config.record.segment_size,
         },
         filter: SegmentFilter {
-            min_segment_size: config.record.min_segment_size_bytes()?,
+            min_segment_size: check_config.record.min_segment_size,
         },
     };
 
@@ -902,9 +899,7 @@ async fn upload_cmd(
         }
         Some(path) => AppConfig::load(path)?,
     };
-    config.validate_for_upload()?;
-    let upload_config = config.upload_config()?.clone();
-    let upload_credential = config.upload_credential_identity()?;
+    let upload_command = config.resolve_for_upload()?;
 
     if files.is_empty() {
         return Err(bilive_rec::error::AppError::Config(
@@ -938,15 +933,15 @@ async fn upload_cmd(
 
     println!("Checking login...");
     let uploader = BiliupUploader::new(
-        upload_credential.cookie_file.clone(),
-        upload_config.line.clone(),
-        upload_config.threads,
-        upload_config.submit_api.clone(),
+        upload_command.upload.credential.cookie_file.clone(),
+        upload_command.upload.line.clone(),
+        upload_command.upload.threads,
+        upload_command.upload.submit_api.clone(),
     );
     uploader.check_login().await?;
 
     // Open store
-    let db_path = config.data.dir.join("state.redb");
+    let db_path = upload_command.data.dir.join("state.redb");
     let store = StateStore::open(&db_path)?;
 
     let session_id = Uuid::new_v4();
@@ -984,19 +979,27 @@ async fn upload_cmd(
     }
 
     println!("Submitting...");
+    let submit = upload_command.submit;
     let submit_req = SubmissionRequest {
         title: display_title,
         description: String::new(),
-        tid: upload_config.tid,
-        copyright: upload_config.copyright,
-        tags: upload_config.tags,
-        source: upload_config.source.clone(),
+        category_id: submit.category_id,
+        copyright: submit.copyright,
+        tags: submit.tags,
+        source: submit.source,
+        private: submit.private,
+        dynamic: submit.dynamic,
+        forbid_reprint: submit.forbid_reprint,
+        charging_panel: submit.charging_panel,
+        close_reply: submit.close_reply,
+        close_danmu: submit.close_danmu,
+        featured_reply: submit.featured_reply,
         parts: uploaded_parts,
     };
 
     let mut submission = Submission {
         session_id,
-        upload_credential,
+        upload_credential: upload_command.upload.credential,
         status: SubmissionStatus::Pending,
         aid: None,
         bvid: None,
@@ -1055,7 +1058,7 @@ mod tests {
     async fn test_run_cmd_empty_rooms() {
         use std::io::Write;
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
-        let toml_str = "[upload]\ncredential=\"main\"\ntid=1\nline=\"auto\"\n";
+        let toml_str = "[upload]\ncredential=\"main\"\nline=\"auto\"\n";
         temp_file.write_all(toml_str.as_bytes()).unwrap();
 
         let res = run_cmd(temp_file.path()).await;
@@ -1069,7 +1072,7 @@ mod tests {
     async fn test_run_cmd_zero_poll_interval() {
         use std::io::Write;
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
-        let toml_str = "[upload]\ncredential=\"main\"\ntid=1\nline=\"auto\"\n\n[pipeline]\npoll_interval_s = 0\n\n[[rooms]]\nname = \"test\"\nurl = \"http://bilibili.com/123\"\n";
+        let toml_str = "[upload]\ncredential=\"main\"\nline=\"auto\"\n\n[pipeline]\npoll_interval_s = 0\n\n[rooms.test]\nurl = \"http://bilibili.com/123\"\n";
         temp_file.write_all(toml_str.as_bytes()).unwrap();
 
         let res = run_cmd(temp_file.path()).await;
@@ -1087,7 +1090,7 @@ mod tests {
     async fn test_run_cmd_zero_backoff() {
         use std::io::Write;
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
-        let toml_str = "[upload]\ncredential=\"main\"\ntid=1\nline=\"auto\"\n\n[pipeline]\nbackoff_s = 0\n\n[[rooms]]\nname = \"test\"\nurl = \"http://bilibili.com/123\"\n";
+        let toml_str = "[upload]\ncredential=\"main\"\nline=\"auto\"\n\n[pipeline]\nbackoff_s = 0\n\n[rooms.test]\nurl = \"http://bilibili.com/123\"\n";
         temp_file.write_all(toml_str.as_bytes()).unwrap();
 
         let res = run_cmd(temp_file.path()).await;

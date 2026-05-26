@@ -1,3 +1,4 @@
+use crate::config::Copyright;
 use crate::error::AppResult;
 use crate::state::model::UploadedPart;
 use std::path::PathBuf;
@@ -15,10 +16,17 @@ pub struct UploadRequest {
 pub struct SubmissionRequest {
     pub title: String,
     pub description: String,
-    pub tid: u16,
-    pub copyright: u8,
+    pub category_id: u16,
+    pub copyright: Copyright,
     pub tags: Vec<String>,
     pub source: String,
+    pub private: bool,
+    pub dynamic: String,
+    pub forbid_reprint: bool,
+    pub charging_panel: bool,
+    pub close_reply: bool,
+    pub close_danmu: bool,
+    pub featured_reply: bool,
     pub parts: Vec<UploadedPart>,
 }
 

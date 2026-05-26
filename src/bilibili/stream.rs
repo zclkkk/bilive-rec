@@ -4,7 +4,7 @@ use crate::bilibili::cdn::check_stream_health;
 use crate::bilibili::client::BiliClient;
 use crate::bilibili::types::{Codec, PlayInfoResponse, StreamCandidate};
 use crate::bilibili::wbi::{mix_wbi_keys, sign_wbi_query};
-use crate::config::RecordConfig;
+use crate::config::ResolvedRecordConfig;
 use crate::error::{AppError, AppResult};
 
 /// Fetches play info using `/xlive/web-room/v2/index/getRoomPlayInfo`.
@@ -135,7 +135,7 @@ pub fn extract_cdn_name(extra: &str) -> String {
 /// Selects the best stream candidate from a list based on configured and fallback policies.
 pub fn select_stream_candidate(
     candidates: &[StreamCandidate],
-    config: &RecordConfig,
+    config: &ResolvedRecordConfig,
 ) -> Option<StreamCandidate> {
     if candidates.is_empty() {
         return None;
@@ -156,7 +156,7 @@ pub fn select_stream_candidate(
 /// and verifies its health. Returns the first healthy candidate.
 pub async fn select_healthy_stream_candidate(
     candidates: &[StreamCandidate],
-    config: &RecordConfig,
+    config: &ResolvedRecordConfig,
     client: &BiliClient,
 ) -> AppResult<Option<StreamCandidate>> {
     if candidates.is_empty() {
@@ -201,7 +201,7 @@ pub async fn select_healthy_stream_candidate(
 fn compare_candidates(
     a: &StreamCandidate,
     b: &StreamCandidate,
-    config: &RecordConfig,
+    config: &ResolvedRecordConfig,
 ) -> std::cmp::Ordering {
     // 1. QN ranking logic
     let qn_ord = compare_qn(a.qn, b.qn, config.qn);
@@ -302,13 +302,13 @@ mod tests {
         }
     }
 
-    fn default_config() -> RecordConfig {
-        RecordConfig {
+    fn default_config() -> ResolvedRecordConfig {
+        ResolvedRecordConfig {
             credential: None,
             output_dir: PathBuf::from("rec"),
             segment_time: None,
             segment_size: None,
-            min_segment_size: "20MiB".to_string(),
+            min_segment_size: 20 * 1024 * 1024,
             qn: 10000,
             cdn: vec![],
         }

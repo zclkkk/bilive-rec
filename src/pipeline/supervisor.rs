@@ -11,7 +11,7 @@ use crate::bilibili::stream::{
     fetch_play_info, parse_stream_candidates, select_healthy_stream_candidate,
 };
 use crate::bilibili::types::LiveStatus;
-use crate::config::{AppConfig, PipelineConfig, RoomConfig, RoomCredentials};
+use crate::config::{PipelineConfig, ResolvedRoomConfig, RoomCredentials};
 use crate::error::{AppError, AppResult};
 use crate::pipeline::session::PipelineSession;
 use crate::pipeline::state_machine::PipelineState;
@@ -40,7 +40,6 @@ pub struct RoomSupervisorDeps<U: Uploader + Send + Sync + 'static> {
     pub store: Arc<StateStore>,
     pub client: Arc<BiliClient>,
     pub uploader: Arc<U>,
-    pub app_config: Arc<AppConfig>,
 }
 
 fn pipeline_state_requires_active_session(state: PipelineState) -> bool {
@@ -134,7 +133,7 @@ pub struct RoomSupervisor<U: Uploader + Send + Sync + 'static> {
     pub room_id: u64,
     pub session: PipelineSession,
     pub config: PipelineConfig,
-    pub room_config: RoomConfig,
+    pub room_config: ResolvedRoomConfig,
     pub store: Arc<StateStore>,
     pub client: Arc<BiliClient>,
     pub uploader: Arc<U>,
@@ -142,7 +141,6 @@ pub struct RoomSupervisor<U: Uploader + Send + Sync + 'static> {
     upload_tasks: Vec<JoinHandle<BackgroundUploadResult>>,
     pub offline_since: Option<Instant>,
     reconnect_attempt: u32,
-    pub app_config: Arc<AppConfig>,
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -150,11 +148,11 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
     pub fn new(
         room_id: u64,
         config: PipelineConfig,
-        room_config: RoomConfig,
+        room_config: ResolvedRoomConfig,
         deps: RoomSupervisorDeps<U>,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> AppResult<Self> {
-        let expected_credentials = deps.app_config.room_credentials(&room_config)?;
+        let expected_credentials = room_config.credentials();
         let mut supervisor = Self {
             room_id,
             session: PipelineSession::new(room_id),
@@ -167,7 +165,6 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             upload_tasks: Vec::new(),
             offline_since: None,
             reconnect_attempt: 0,
-            app_config: deps.app_config,
             shutdown_rx,
         };
 
@@ -300,8 +297,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         if info.live_status == LiveStatus::Live {
                             if self.session.state == PipelineState::Resolving {
                                 let session_id = Uuid::new_v4();
-                                let room_credentials =
-                                    self.app_config.room_credentials(&self.room_config)?;
+                                let room_credentials = self.room_config.credentials();
 
                                 let live_session = LiveSession {
                                     id: session_id,
@@ -361,19 +357,19 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                 let policy = RecorderPolicy {
                     layout: SegmentLayout {
-                        output_dir: self.app_config.record.output_dir.clone(),
+                        output_dir: self.room_config.record.output_dir.clone(),
                     },
                     segment: SegmentPolicy {
-                        segment_time: self.app_config.record.segment_time_duration()?,
-                        segment_size: self.app_config.record.segment_size_bytes()?,
+                        segment_time: self.room_config.record.segment_time,
+                        segment_size: self.room_config.record.segment_size,
                     },
                     filter: SegmentFilter {
-                        min_segment_size: self.app_config.record.min_segment_size_bytes()?,
+                        min_segment_size: self.room_config.record.min_segment_size,
                     },
                 };
 
                 let play_info =
-                    match fetch_play_info(&self.client, self.room_id, self.app_config.record.qn)
+                    match fetch_play_info(&self.client, self.room_id, self.room_config.record.qn)
                         .await
                     {
                         Ok(info) => info,
@@ -395,7 +391,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                 let cand_opt = match select_healthy_stream_candidate(
                     &candidates,
-                    &self.app_config.record,
+                    &self.room_config.record,
                     &self.client,
                 )
                 .await
@@ -854,12 +850,14 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                 let title = self
                     .room_config
+                    .submit
                     .title
                     .as_deref()
                     .map(|template| {
                         render_room_template(
                             template,
-                            &self.room_config,
+                            &self.room_config.name,
+                            &self.room_config.url,
                             Some(&session),
                             self.room_id,
                         )
@@ -868,27 +866,36 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     .unwrap_or_else(|| session.title.clone());
                 let description = self
                     .room_config
+                    .submit
                     .description
                     .as_deref()
                     .map(|template| {
                         render_room_template(
                             template,
-                            &self.room_config,
+                            &self.room_config.name,
+                            &self.room_config.url,
                             Some(&session),
                             self.room_id,
                         )
                     })
                     .transpose()?
                     .unwrap_or_default();
-                let upload_config = self.app_config.upload_config()?;
+                let submit = &self.room_config.submit;
 
                 let req = SubmissionRequest {
                     title,
                     description,
-                    tid: upload_config.tid,
-                    copyright: upload_config.copyright,
-                    tags: upload_config.tags.clone(),
-                    source: upload_config.source.clone(),
+                    category_id: submit.category_id,
+                    copyright: submit.copyright,
+                    tags: submit.tags.clone(),
+                    source: submit.source.clone(),
+                    private: submit.private,
+                    dynamic: submit.dynamic.clone(),
+                    forbid_reprint: submit.forbid_reprint,
+                    charging_panel: submit.charging_panel,
+                    close_reply: submit.close_reply,
+                    close_danmu: submit.close_danmu,
+                    featured_reply: submit.featured_reply,
                     parts,
                 };
 
@@ -1047,42 +1054,49 @@ mod tests {
         }
     }
 
-    fn test_app_config() -> AppConfig {
-        AppConfig::parse(
-            "[credentials.main]\ncookie_file=\"Cargo.toml\"\n\n[credentials.test]\ncookie_file=\"Cargo.toml\"\n\n[upload]\ncredential=\"main\"\ntid=1\nline=\"auto\"",
-        )
-        .unwrap()
-    }
-
-    fn test_credentials() -> std::collections::HashMap<String, crate::config::CredentialConfig> {
-        let mut credentials = std::collections::HashMap::new();
-        credentials.insert(
-            "main".into(),
-            crate::config::CredentialConfig {
-                cookie_file: "Cargo.toml".into(),
-            },
-        );
-        credentials.insert(
-            "test".into(),
-            crate::config::CredentialConfig {
-                cookie_file: "Cargo.toml".into(),
-            },
-        );
-        credentials
-    }
-
     fn test_upload_credential() -> crate::credential::CredentialIdentity {
         crate::credential::CredentialIdentity::new("main", "Cargo.toml")
     }
 
-    fn test_room_config() -> RoomConfig {
-        RoomConfig {
-            name: "test-room".into(),
-            url: "https://live.bilibili.com/1".into(),
+    fn test_record_config() -> crate::config::ResolvedRecordConfig {
+        crate::config::ResolvedRecordConfig {
+            credential: None,
+            output_dir: "./data/recordings".into(),
+            segment_time: None,
+            segment_size: None,
+            min_segment_size: 20 * 1024 * 1024,
+            qn: 10000,
+            cdn: Vec::new(),
+        }
+    }
+
+    fn test_submit_config() -> crate::config::ResolvedSubmitConfig {
+        crate::config::ResolvedSubmitConfig {
             title: None,
             description: None,
-            record_credential: None,
-            upload_credential: None,
+            category_id: 171,
+            copyright: crate::config::Copyright::Reprint,
+            source: "source".into(),
+            tags: Vec::new(),
+            private: false,
+            dynamic: String::new(),
+            forbid_reprint: false,
+            charging_panel: false,
+            close_reply: false,
+            close_danmu: false,
+            featured_reply: false,
+        }
+    }
+
+    fn test_room_config() -> ResolvedRoomConfig {
+        ResolvedRoomConfig {
+            name: "test-room".into(),
+            url: "https://live.bilibili.com/1".into(),
+            record: test_record_config(),
+            upload: crate::config::ResolvedRoomUploadConfig {
+                credential: test_upload_credential(),
+            },
+            submit: test_submit_config(),
         }
     }
 
@@ -1114,7 +1128,6 @@ mod tests {
                 store,
                 client: Arc::new(BiliClient::new(None).unwrap()),
                 uploader: Arc::new(FakeUploader::new()),
-                app_config: Arc::new(test_app_config()),
             },
             rx,
         )
@@ -1124,16 +1137,14 @@ mod tests {
     fn supervisor_with(
         store: Arc<StateStore>,
         uploader: Arc<FakeUploader>,
-        config: AppConfig,
     ) -> RoomSupervisor<FakeUploader> {
-        supervisor_with_room(store, uploader, config, test_room_config())
+        supervisor_with_room(store, uploader, test_room_config())
     }
 
     fn supervisor_with_room(
         store: Arc<StateStore>,
         uploader: Arc<FakeUploader>,
-        config: AppConfig,
-        room_config: RoomConfig,
+        room_config: ResolvedRoomConfig,
     ) -> RoomSupervisor<FakeUploader> {
         let (_, shutdown_rx) = tokio::sync::watch::channel(false);
         RoomSupervisor::new(
@@ -1144,7 +1155,6 @@ mod tests {
                 store,
                 client: Arc::new(BiliClient::new(None).unwrap()),
                 uploader,
-                app_config: Arc::new(config),
             },
             shutdown_rx,
         )
@@ -1303,24 +1313,7 @@ mod tests {
         let store = std::sync::Arc::new(
             StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
         );
-        let config = crate::config::AppConfig {
-            data: Default::default(),
-            credentials: test_credentials(),
-            record: Default::default(),
-            upload: Some(crate::config::UploadConfig {
-                credential: Some("test".into()),
-                line: "auto".into(),
-                threads: 1,
-                submit_api: Default::default(),
-                tid: 171,
-                copyright: 2,
-                source: "source".into(),
-                tags: vec![],
-            }),
-            pipeline: Default::default(),
-            rooms: vec![],
-        };
-        let mut supervisor = supervisor_with(store.clone(), Arc::new(FakeUploader::new()), config);
+        let mut supervisor = supervisor_with(store.clone(), Arc::new(FakeUploader::new()));
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1346,24 +1339,7 @@ mod tests {
         let store = std::sync::Arc::new(
             StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
         );
-        let config = crate::config::AppConfig {
-            data: Default::default(),
-            credentials: test_credentials(),
-            record: Default::default(),
-            upload: Some(crate::config::UploadConfig {
-                credential: Some("test".into()),
-                line: "auto".into(),
-                threads: 1,
-                submit_api: Default::default(),
-                tid: 171,
-                copyright: 2,
-                source: "source".into(),
-                tags: vec![],
-            }),
-            pipeline: Default::default(),
-            rooms: vec![],
-        };
-        let mut supervisor = supervisor_with(store.clone(), Arc::new(FakeUploader::new()), config);
+        let mut supervisor = supervisor_with(store.clone(), Arc::new(FakeUploader::new()));
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1399,7 +1375,7 @@ mod tests {
         let store =
             Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
         let uploader = Arc::new(FakeUploader::new());
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1430,7 +1406,7 @@ mod tests {
         let store =
             Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
         let uploader = Arc::new(FakeUploader::new());
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1479,7 +1455,6 @@ mod tests {
                 store,
                 client: Arc::new(BiliClient::new(None).unwrap()),
                 uploader: Arc::new(FakeUploader::new()),
-                app_config: Arc::new(test_app_config()),
             },
             rx,
         );
@@ -1517,7 +1492,6 @@ mod tests {
                 store,
                 client: Arc::new(BiliClient::new(None).unwrap()),
                 uploader: Arc::new(FakeUploader::new()),
-                app_config: Arc::new(test_app_config()),
             },
             rx,
         )
@@ -1558,7 +1532,6 @@ mod tests {
                 store,
                 client: Arc::new(BiliClient::new(None).unwrap()),
                 uploader: Arc::new(FakeUploader::new()),
-                app_config: Arc::new(test_app_config()),
             },
             rx,
         );
@@ -1567,60 +1540,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recording_invalid_segment_config() {
-        use crate::state::store::StateStore;
-
-        let store = std::sync::Arc::new(
-            StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
-        );
-        let mut config = crate::config::AppConfig {
-            data: Default::default(),
-            credentials: test_credentials(),
-            record: Default::default(),
-            upload: Some(crate::config::UploadConfig {
-                credential: Some("test".into()),
-                line: "auto".into(),
-                threads: 1,
-                submit_api: Default::default(),
-                tid: 171,
-                copyright: 2,
-                source: "source".into(),
-                tags: vec![],
-            }),
-            pipeline: Default::default(),
-            rooms: vec![],
-        };
-
-        config.record.segment_time = Some("invalid_time".into());
-
-        let mut supervisor =
-            supervisor_with(store.clone(), Arc::new(FakeUploader::new()), config.clone());
-
-        supervisor.session.state = PipelineState::Recording;
-        supervisor.active_session_id = Some(put_recording_session(&store, 1));
-
-        let err = supervisor.run_step().await.unwrap_err();
-        assert!(matches!(err, AppError::Config(_)));
-
-        config.record.segment_time = None;
-        config.record.segment_size = Some("invalid_size".into());
-        let mut supervisor2 = supervisor_with(store.clone(), Arc::new(FakeUploader::new()), config);
-        supervisor2.session.state = PipelineState::Recording;
-        supervisor2.active_session_id = Some(put_recording_session(&store, 1));
-
-        let err2 = supervisor2.run_step().await.unwrap_err();
-        assert!(matches!(err2, AppError::Config(_)));
-    }
-    #[tokio::test]
     async fn test_submitting_idempotent_submitted() {
         let db_dir = tempfile::tempdir().unwrap();
         let store =
             std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config = test_app_config();
-        config.upload.as_mut().unwrap().tid = 123;
-
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
+        let mut room_config = test_room_config();
+        room_config.submit.category_id = 123;
+        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1651,20 +1578,11 @@ mod tests {
         let db_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = Arc::new(FakeUploader::new());
-        let room_config = RoomConfig {
-            name: "room-name".into(),
-            url: "https://live.bilibili.com/1".into(),
-            title: Some("Archive {title} #{room_id}".into()),
-            description: Some("From {name}: {url}".into()),
-            record_credential: None,
-            upload_credential: None,
-        };
-        let mut supervisor = supervisor_with_room(
-            store.clone(),
-            uploader.clone(),
-            test_app_config(),
-            room_config,
-        );
+        let mut room_config = test_room_config();
+        room_config.name = "room-name".into();
+        room_config.submit.title = Some("Archive {title} #{room_id}".into());
+        room_config.submit.description = Some("From {name}: {url}".into());
+        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1696,7 +1614,7 @@ mod tests {
         let db_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = Arc::new(FakeUploader::new());
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1725,10 +1643,9 @@ mod tests {
         let store =
             std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config = test_app_config();
-        config.upload.as_mut().unwrap().tid = 123;
-
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
+        let mut room_config = test_room_config();
+        room_config.submit.category_id = 123;
+        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1761,10 +1678,9 @@ mod tests {
         let store =
             std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut config = test_app_config();
-        config.upload.as_mut().unwrap().tid = 123;
-
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), config);
+        let mut room_config = test_room_config();
+        room_config.submit.category_id = 123;
+        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1809,7 +1725,7 @@ mod tests {
             reason: "code=0 but no aid/bvid".into(),
         });
 
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1844,7 +1760,7 @@ mod tests {
         let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = Arc::new(FakeUploader::new());
 
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
@@ -1881,7 +1797,7 @@ mod tests {
         let uploader = Arc::new(FakeUploader::new());
         uploader.set_submit_behavior(SubmitBehavior::Err("network reset".into()));
 
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone(), test_app_config());
+        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);

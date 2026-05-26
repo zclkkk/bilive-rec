@@ -105,48 +105,7 @@ impl Uploader for BiliupUploader {
     async fn submit(&self, req: SubmissionRequest) -> AppResult<SubmissionOutcome> {
         let bili = self.get_bilibili().await?;
 
-        let mut videos = Vec::new();
-        for part in req.parts {
-            let mut video = Video::new(&part.bili_filename);
-            video.title = Some(part.part_title);
-            videos.push(video);
-        }
-
-        // Construct Studio by explicit field assignment. The previous
-        // implementation hopped through serde_json::from_value(json!({...}))
-        // which let biliup's Studio shape leak in via untyped JSON — if
-        // biliup renamed a field or changed a type we'd silently send the
-        // wrong thing. With named-field construction the compiler breaks
-        // loudly when the upstream schema moves, and the boundary stays
-        // explicit at this one site.
-        let studio = biliup::uploader::bilibili::Studio {
-            copyright: req.copyright,
-            source: req.source,
-            tid: req.tid,
-            cover: String::new(),
-            title: req.title,
-            desc_format_id: 0,
-            desc: req.description,
-            desc_v2: None,
-            dynamic: String::new(),
-            subtitle: biliup::uploader::bilibili::Subtitle::default(),
-            tag: req.tags.join(","),
-            videos,
-            dtime: None,
-            open_subtitle: false,
-            interactive: 0,
-            mission_id: None,
-            dolby: 0,
-            lossless_music: 0,
-            no_reprint: 0,
-            is_only_self: None,
-            charging_pay: 0,
-            aid: None,
-            up_selection_reply: false,
-            up_close_reply: false,
-            up_close_danmu: false,
-            extra_fields: None,
-        };
+        let studio = studio_from_submission(req);
 
         let res = match self.submit_api {
             SubmitApi::App => match bili.submit_by_app(&studio, None).await {
@@ -192,6 +151,51 @@ impl Uploader for BiliupUploader {
     }
 }
 
+fn studio_from_submission(req: SubmissionRequest) -> biliup::uploader::bilibili::Studio {
+    let mut videos = Vec::new();
+    for part in req.parts {
+        let mut video = Video::new(&part.bili_filename);
+        video.title = Some(part.part_title);
+        videos.push(video);
+    }
+
+    // Construct Studio by explicit field assignment. The previous
+    // implementation hopped through serde_json::from_value(json!({...}))
+    // which let biliup's Studio shape leak in via untyped JSON — if
+    // biliup renamed a field or changed a type we'd silently send the
+    // wrong thing. With named-field construction the compiler breaks
+    // loudly when the upstream schema moves, and the boundary stays
+    // explicit at this one site.
+    biliup::uploader::bilibili::Studio {
+        copyright: req.copyright.as_biliup_code(),
+        source: req.source,
+        tid: req.category_id,
+        cover: String::new(),
+        title: req.title,
+        desc_format_id: 0,
+        desc: req.description,
+        desc_v2: None,
+        dynamic: req.dynamic,
+        subtitle: biliup::uploader::bilibili::Subtitle::default(),
+        tag: req.tags.join(","),
+        videos,
+        dtime: None,
+        open_subtitle: false,
+        interactive: 0,
+        mission_id: None,
+        dolby: 0,
+        lossless_music: 0,
+        no_reprint: req.forbid_reprint as u8,
+        is_only_self: req.private.then_some(1),
+        charging_pay: req.charging_panel as u8,
+        aid: None,
+        up_selection_reply: req.featured_reply,
+        up_close_reply: req.close_reply,
+        up_close_danmu: req.close_danmu,
+        extra_fields: None,
+    }
+}
+
 fn submit_error_to_outcome(api: &str, error: BiliupError) -> AppResult<SubmissionOutcome> {
     match error {
         BiliupError::Reqwest(error) => Ok(SubmissionOutcome::Ambiguous {
@@ -211,6 +215,33 @@ fn submit_error_to_outcome(api: &str, error: BiliupError) -> AppResult<Submissio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Copyright;
+    use crate::state::model::UploadedPart;
+    use uuid::Uuid;
+
+    fn submission_request() -> SubmissionRequest {
+        SubmissionRequest {
+            title: "title".into(),
+            description: "description".into(),
+            category_id: 171,
+            copyright: Copyright::Reprint,
+            tags: vec!["tag-a".into(), "tag-b".into()],
+            source: "source".into(),
+            private: true,
+            dynamic: "dynamic".into(),
+            forbid_reprint: true,
+            charging_panel: true,
+            close_reply: true,
+            close_danmu: true,
+            featured_reply: true,
+            parts: vec![UploadedPart {
+                session_id: Uuid::new_v4(),
+                segment_index: 0,
+                bili_filename: "bili-file".into(),
+                part_title: "part-title".into(),
+            }],
+        }
+    }
 
     #[test]
     fn submit_response_parse_error_is_ambiguous() {
@@ -233,6 +264,25 @@ mod tests {
 
         assert!(err.to_string().contains("Submission (app) failed"));
         assert!(err.to_string().contains("code=-1"));
+    }
+
+    #[test]
+    fn submission_request_maps_to_biliup_studio_fields() {
+        let studio = studio_from_submission(submission_request());
+
+        assert_eq!(studio.tid, 171);
+        assert_eq!(studio.copyright, 2);
+        assert_eq!(studio.source, "source");
+        assert_eq!(studio.tag, "tag-a,tag-b");
+        assert_eq!(studio.dynamic, "dynamic");
+        assert_eq!(studio.no_reprint, 1);
+        assert_eq!(studio.is_only_self, Some(1));
+        assert_eq!(studio.charging_pay, 1);
+        assert!(studio.up_close_reply);
+        assert!(studio.up_close_danmu);
+        assert!(studio.up_selection_reply);
+        assert_eq!(studio.videos.len(), 1);
+        assert_eq!(studio.videos[0].title.as_deref(), Some("part-title"));
     }
 
     /// Failed login must not poison the OnceCell — a corrected cookie file

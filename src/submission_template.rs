@@ -1,6 +1,5 @@
 use jiff::{fmt::strtime, tz::TimeZone};
 
-use crate::config::RoomConfig;
 use crate::error::{AppError, AppResult};
 use crate::state::model::LiveSession;
 
@@ -14,12 +13,13 @@ pub(crate) fn validate_room_template(template: &str) -> AppResult<()> {
 
 pub(crate) fn render_room_template(
     template: &str,
-    room_config: &RoomConfig,
+    room_name: &str,
+    room_url: &str,
     session: Option<&LiveSession>,
     room_id: u64,
 ) -> AppResult<String> {
     parse_room_template(template, |placeholder| {
-        render_room_template_placeholder(placeholder, room_config, session, room_id)
+        render_room_template_placeholder(placeholder, room_name, room_url, session, room_id)
     })
 }
 
@@ -89,18 +89,17 @@ fn parse_placeholder(placeholder: &str) -> AppResult<TemplatePlaceholder<'_>> {
 
 fn render_room_template_placeholder(
     placeholder: &str,
-    room_config: &RoomConfig,
+    room_name: &str,
+    room_url: &str,
     session: Option<&LiveSession>,
     room_id: u64,
 ) -> AppResult<String> {
-    let title = session
-        .map(|s| s.title.as_str())
-        .unwrap_or(room_config.name.as_str());
+    let title = session.map(|s| s.title.as_str()).unwrap_or(room_name);
     match parse_placeholder(placeholder)? {
         TemplatePlaceholder::Title => Ok(title.to_string()),
-        TemplatePlaceholder::RoomName => Ok(room_config.name.clone()),
+        TemplatePlaceholder::RoomName => Ok(room_name.to_string()),
         TemplatePlaceholder::RoomId => Ok(room_id.to_string()),
-        TemplatePlaceholder::Url => Ok(room_config.url.clone()),
+        TemplatePlaceholder::Url => Ok(room_url.to_string()),
         TemplatePlaceholder::StartedAt(format) => {
             let session = session.ok_or_else(|| {
                 AppError::Config(
@@ -150,17 +149,6 @@ mod tests {
     use crate::state::model::SessionStatus;
     use uuid::Uuid;
 
-    fn test_room_config() -> RoomConfig {
-        RoomConfig {
-            name: "test-room".into(),
-            url: "https://live.bilibili.com/1".into(),
-            title: None,
-            description: None,
-            record_credential: None,
-            upload_credential: None,
-        }
-    }
-
     fn test_live_session_with_started_at(started_at: jiff::Timestamp) -> LiveSession {
         LiveSession {
             id: Uuid::new_v4(),
@@ -179,7 +167,8 @@ mod tests {
         let session = test_live_session_with_started_at(started_at);
         let rendered = render_room_template(
             "Archive {title} at {started_at:%s}",
-            &test_room_config(),
+            "test-room",
+            "https://live.bilibili.com/1",
             Some(&session),
             1,
         )

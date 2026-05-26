@@ -17,6 +17,9 @@ segment_time = "01:00:00"
 segment_size = "2GiB"
 min_segment_size = "20MiB"
 qn = 10000
+# CDN preference list. Use the `cdn=...` names printed by `bilive-rec check`,
+# for example "cn-gotcha04". This is a preference order, not a whitelist:
+# unavailable or unhealthy candidates are skipped.
 cdn = []
 
 [upload]
@@ -24,10 +27,21 @@ credential = "main"
 line = "auto"
 threads = 3
 submit_api = "app"
-tid = 171
-copyright = 2
+
+[submit]
+title = "{title} {started_at:%Y-%m-%d}"
+description = "{name} 直播录像\n录制开始：{started_at:%Y-%m-%d %H:%M:%S}\n原直播间：{url}"
+category_id = 171
+copyright = "reprint"
 source = "直播录像"
 tags = ["直播录像"]
+private = false
+dynamic = ""
+forbid_reprint = false
+charging_panel = false
+close_reply = false
+close_danmu = false
+featured_reply = false
 
 [pipeline]
 poll_interval_s = 60
@@ -35,11 +49,21 @@ offline_grace_s = 60
 backoff_s = 15
 max_backoff_s = 300
 
-[[rooms]]
-name = "example"
+[rooms.example]
 url = "https://live.bilibili.com/123456"
-title = "{title} {started_at:%Y-%m-%d}"
-description = "{name} 直播录像\n录制开始：{started_at:%Y-%m-%d %H:%M:%S}\n原直播间：{url}"
-# 房间独立账号覆盖（可选）。如果不配置，将使用全局 [record] 和 [upload] 引用的账号。
-# record_credential = "captain"
-# upload_credential = "alt_uploader"
+
+# Per-room recording override (optional). Missing fields inherit [record].
+# [rooms.example.record]
+# credential = "captain"
+# qn = 10000
+# cdn = ["cn-gotcha04", "cn-gotcha01"]
+
+# Per-room upload override (optional). Missing fields inherit [upload].
+# [rooms.example.upload]
+# credential = "alt_uploader"
+
+# Per-room submission metadata override (optional). Missing fields inherit [submit].
+# [rooms.example.submit]
+# category_id = 65
+# tags = ["直播录像", "example"]
+# private = true
