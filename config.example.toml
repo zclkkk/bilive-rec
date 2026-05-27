@@ -21,6 +21,12 @@ qn = 10000
 # for example "cn-gotcha04". This is a preference order, not a whitelist:
 # unavailable or unhealthy candidates are skipped.
 cdn = []
+# Delete local .flv files after Bilibili returns a confirmed submission
+# (aid/bvid). This does not mean the video has passed Bilibili review.
+# Keep this false unless you accept that a later review rejection may leave
+# you without the local recording. Ambiguous or failed submissions are never
+# cleaned.
+delete_after_submit = false
 
 [upload]
 credential = "main"
@@ -57,6 +63,7 @@ url = "https://live.bilibili.com/123456"
 # credential = "captain"
 # qn = 10000
 # cdn = ["cn-gotcha04", "cn-gotcha01"]
+# delete_after_submit = true
 
 # Per-room upload override (optional). Missing fields inherit [upload].
 # [rooms.example.upload]

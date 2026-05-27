@@ -72,6 +72,8 @@ pub struct RecordConfig {
     pub qn: u32,
     #[serde(default)]
     pub cdn: Vec<String>,
+    #[serde(default)]
+    pub delete_after_submit: bool,
 }
 
 impl Default for RecordConfig {
@@ -84,6 +86,7 @@ impl Default for RecordConfig {
             min_segment_size: defaults::min_segment_size(),
             qn: defaults::qn(),
             cdn: Vec::new(),
+            delete_after_submit: false,
         }
     }
 }
@@ -173,6 +176,8 @@ pub struct RoomRecordConfig {
     pub qn: Option<u32>,
     #[serde(default)]
     pub cdn: Option<Vec<String>>,
+    #[serde(default)]
+    pub delete_after_submit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -401,6 +406,9 @@ impl AppConfig {
         let cdn = room
             .and_then(|room| room.cdn.clone())
             .unwrap_or_else(|| self.record.cdn.clone());
+        let delete_after_submit = room
+            .and_then(|room| room.delete_after_submit)
+            .unwrap_or(self.record.delete_after_submit);
 
         Ok(ResolvedRecordConfig {
             credential,
@@ -410,6 +418,7 @@ impl AppConfig {
             min_segment_size,
             qn,
             cdn,
+            delete_after_submit,
         })
     }
 
@@ -640,6 +649,7 @@ mod tests {
         assert_eq!(room.url, "https://live.bilibili.com/123456");
         assert_eq!(room.record.qn, 10000);
         assert!(room.record.cdn.is_empty());
+        assert!(!room.record.delete_after_submit);
         assert_eq!(
             room.submit.title.as_deref(),
             Some("{title} {started_at:%Y-%m-%d}")
@@ -684,6 +694,7 @@ cookie_file = "{}"
 [record]
 credential = "main"
 cdn = ["global"]
+delete_after_submit = true
 
 [upload]
 credential = "main"
@@ -702,6 +713,7 @@ url = "https://live.bilibili.com/1"
 credential = "record_alt"
 qn = 400
 cdn = []
+delete_after_submit = false
 
 [rooms.test.upload]
 credential = "upload_alt"
@@ -736,6 +748,7 @@ featured_reply = true
         );
         assert_eq!(room.record.qn, 400);
         assert!(room.record.cdn.is_empty());
+        assert!(!room.record.delete_after_submit);
         assert_eq!(room.upload.credential.name, "upload_alt");
         assert_eq!(room.upload.credential.cookie_file, upload_cookie.path());
         assert_eq!(room.submit.category_id, 65);

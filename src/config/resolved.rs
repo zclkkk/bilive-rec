@@ -74,6 +74,7 @@ pub struct ResolvedRecordConfig {
     pub min_segment_size: u64,
     pub qn: u32,
     pub cdn: Vec<String>,
+    pub delete_after_submit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

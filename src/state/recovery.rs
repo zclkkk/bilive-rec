@@ -203,7 +203,7 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                     ),
                 });
             }
-            SegmentStatus::Uploaded => {
+            SegmentStatus::Uploaded | SegmentStatus::Cleaned => {
                 let has_upload = uploaded_by_session
                     .get(&segment.session_id)
                     .map(|indices| indices.contains(&segment.index))
@@ -213,8 +213,8 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                     anomalies.push(Anomaly {
                         kind: AnomalyKind::AmbiguousUpload,
                         description: format!(
-                            "Segment {}/{} is Uploaded but has no UploadedPart — remote filename is missing",
-                            segment.session_id, segment.index
+                            "Segment {}/{} is {:?} but has no UploadedPart — remote filename is missing",
+                            segment.session_id, segment.index, segment.status
                         ),
                     });
                 }
@@ -552,14 +552,17 @@ pub fn plan_recovery(
     for segment in &segments {
         if matches!(
             segment.status,
-            SegmentStatus::Uploading | SegmentStatus::Uploaded
+            SegmentStatus::Uploading | SegmentStatus::Uploaded | SegmentStatus::Cleaned
         ) {
             let has_upload = uploaded_by_session
                 .get(&segment.session_id)
                 .map(|indices| indices.contains(&segment.index))
                 .unwrap_or(false);
             if segment.status == SegmentStatus::Uploading
-                || (segment.status == SegmentStatus::Uploaded && !has_upload)
+                || (matches!(
+                    segment.status,
+                    SegmentStatus::Uploaded | SegmentStatus::Cleaned
+                ) && !has_upload)
             {
                 actions.push(RecoveryAction::LeaveAsIs {
                     reason: format!(

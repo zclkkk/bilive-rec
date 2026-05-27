@@ -35,6 +35,7 @@ cp config.example.toml config.toml
 | `min_segment_size` | 最小切片大小。小于此大小的分段会被过滤（防止碎片）。 | `20MiB` | |
 | `qn` | 视频画质档位（10000 对应原画/蓝光）。 | `10000` | |
 | `cdn` | CDN 偏好列表。填写 `bilive-rec check` 输出中的 `cdn=...` 名字，例如 `cn-gotcha04`；它只影响候选排序，不是硬性白名单，不可用或健康检查失败的候选会被跳过。 | `[]` | `["cn-gotcha04", "cn-gotcha01"]` |
+| `delete_after_submit` | B站返回 `aid/bvid` 后删除本地 `.flv` 文件，并把分段状态记为 `Cleaned`。默认关闭；`Pending` / `Ambiguous` / `Failed` 投稿不会触发删除。注意：这里的“成功”只代表提交接口确认创建稿件，不代表审核通过；如果后续审核失败，本地源文件可能已经无法找回。 | `false` | `true` |
 | **`[upload]`** | **上传执行配置 (`run` / `upload` / 上传恢复必需；`check` / `record` 不需要)** | | |
 | `credential` | 默认上传账号名。`upload` 命令必填；`run` 可由每个房间的 `[rooms.<name>.upload]` 覆盖。 | `无 (按命令校验)` | `main` |
 | `line` | B站上传线路选择（可选 `auto` 或 `bda2`）。 | `auto` | |
@@ -60,7 +61,7 @@ cp config.example.toml config.toml
 | **`[rooms.<name>]`** | **命名直播间配置（必填，支持配置多个房间）** | | |
 | `url` | **[必填]** B站直播间完整的 URL。 | **(必填)** | `https://live.bilibili.com/123` |
 | **`[rooms.<name>.record]`** | **当前房间录制覆盖（可选）** | | |
-| `credential` / `qn` / `cdn` | 覆盖当前房间的拉流账号、画质和 CDN 偏好；缺省字段继承 `[record]`。`cdn` 同样使用 `check` 输出里的 CDN 名字。 | `继承 [record]` | |
+| `credential` / `qn` / `cdn` / `delete_after_submit` | 覆盖当前房间的拉流账号、画质、CDN 偏好和投稿确认后清理策略；缺省字段继承 `[record]`。`cdn` 同样使用 `check` 输出里的 CDN 名字。 | `继承 [record]` | |
 | **`[rooms.<name>.upload]`** | **当前房间上传覆盖（可选）** | | |
 | `credential` | 覆盖当前房间的上传账号；缺省继承 `[upload].credential`。 | `继承 [upload]` | |
 | **`[rooms.<name>.submit]`** | **当前房间投稿覆盖（可选）** | | |

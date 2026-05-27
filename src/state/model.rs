@@ -71,6 +71,7 @@ pub enum SegmentStatus {
     Filtered,
     Uploading,
     Uploaded,
+    Cleaned,
     Failed,
 }
 
@@ -115,6 +116,7 @@ mod tests {
             SegmentStatus::Filtered,
             SegmentStatus::Uploading,
             SegmentStatus::Uploaded,
+            SegmentStatus::Cleaned,
             SegmentStatus::Failed,
         ];
         for status in variants {

@@ -89,11 +89,111 @@ fn ensure_session_ready_to_submit(store: &StateStore, session_id: Uuid) -> AppRe
                     segment.index
                 )));
             }
+            SegmentStatus::Cleaned => {
+                return Err(AppError::State(format!(
+                    "Segment {} was cleaned before submission; refusing submission",
+                    segment.index
+                )));
+            }
             SegmentStatus::Filtered => {}
         }
     }
 
     Ok(())
+}
+
+async fn cleanup_submitted_session_recordings(
+    store: &StateStore,
+    session_id: Uuid,
+) -> AppResult<usize> {
+    let session = store
+        .get_session(session_id)?
+        .ok_or_else(|| AppError::State(format!("Session {session_id} not found")))?;
+    if session.status != SessionStatus::Finalized {
+        return Err(AppError::State(format!(
+            "Session {session_id} is {:?}, not Finalized; refusing recording cleanup",
+            session.status
+        )));
+    }
+
+    let submission = store
+        .get_submission(session_id)?
+        .ok_or_else(|| AppError::State(format!("Session {session_id} has no submission")))?;
+    if submission.status != SubmissionStatus::Submitted {
+        return Err(AppError::State(format!(
+            "Session {session_id} submission is {:?}, not Submitted; refusing recording cleanup",
+            submission.status
+        )));
+    }
+
+    let uploaded_indices: std::collections::HashSet<u32> = store
+        .list_uploaded_parts(session_id)?
+        .into_iter()
+        .map(|part| part.segment_index)
+        .collect();
+    let segments = store.list_segments(session_id)?;
+    let mut cleaned = 0;
+
+    for segment in segments {
+        match segment.status {
+            SegmentStatus::Cleaned | SegmentStatus::Filtered => {}
+            SegmentStatus::Uploaded | SegmentStatus::Finalized => {
+                if !uploaded_indices.contains(&segment.index) {
+                    return Err(AppError::State(format!(
+                        "Segment {}/{} is {:?} but has no UploadedPart; refusing recording cleanup",
+                        segment.session_id, segment.index, segment.status
+                    )));
+                }
+
+                match tokio::fs::metadata(&segment.path).await {
+                    Ok(metadata) => {
+                        if !metadata.is_file() {
+                            return Err(AppError::State(format!(
+                                "Segment {}/{} path is not a regular file: {}",
+                                segment.session_id,
+                                segment.index,
+                                segment.path.display()
+                            )));
+                        }
+                        match tokio::fs::remove_file(&segment.path).await {
+                            Ok(()) => {}
+                            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                                // Crash or concurrent cleanup after metadata but before remove:
+                                // deletion is already true, so the state can still be advanced.
+                            }
+                            Err(source) => {
+                                return Err(AppError::Io {
+                                    path: segment.path.clone(),
+                                    source,
+                                });
+                            }
+                        }
+                    }
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(AppError::Io {
+                            path: segment.path.clone(),
+                            source,
+                        });
+                    }
+                }
+
+                let mut cleaned_segment = segment;
+                cleaned_segment.status = SegmentStatus::Cleaned;
+                cleaned_segment.error = None;
+                store.put_segment(&cleaned_segment)?;
+                cleaned += 1;
+            }
+            SegmentStatus::Recording | SegmentStatus::Uploading | SegmentStatus::Failed => {
+                return Err(AppError::State(format!(
+                    "Segment {}/{} is {:?}; refusing recording cleanup",
+                    segment.session_id, segment.index, segment.status
+                )));
+            }
+        }
+    }
+
+    Ok(cleaned)
 }
 
 fn validate_session_credentials(
@@ -740,8 +840,13 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             );
                             reconciliation_failed = true;
                         }
-                        SegmentStatus::Uploaded if !uploaded_indices.contains(&seg.index) => {
-                            error!("Segment {} is Uploaded but lacks UploadedPart", seg.index);
+                        SegmentStatus::Uploaded | SegmentStatus::Cleaned
+                            if !uploaded_indices.contains(&seg.index) =>
+                        {
+                            error!(
+                                "Segment {} is {:?} but lacks UploadedPart",
+                                seg.index, seg.status
+                            );
                             reconciliation_failed = true;
                         }
                         SegmentStatus::Recording | SegmentStatus::Failed => {
@@ -753,6 +858,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         }
                         SegmentStatus::Finalized
                         | SegmentStatus::Uploaded
+                        | SegmentStatus::Cleaned
                         | SegmentStatus::Filtered => {}
                     }
                 }
@@ -763,7 +869,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
                 for seg in &segments {
                     match seg.status {
-                        SegmentStatus::Finalized | SegmentStatus::Uploaded => {
+                        SegmentStatus::Finalized
+                        | SegmentStatus::Uploaded
+                        | SegmentStatus::Cleaned => {
                             if !final_indices.contains(&seg.index) {
                                 error!(
                                     "Segment {} is {:?} but still lacks UploadedPart after reconciliation",
@@ -799,6 +907,20 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 if let Some(existing_sub) = self.store.get_submission(active_session)? {
                     match existing_sub.status {
                         SubmissionStatus::Submitted => {
+                            if self.room_config.record.delete_after_submit {
+                                let cleaned = cleanup_submitted_session_recordings(
+                                    &self.store,
+                                    active_session,
+                                )
+                                .await?;
+                                if cleaned > 0 {
+                                    info!(
+                                        session_id = %active_session,
+                                        cleaned,
+                                        "Deleted local recordings after confirmed submission"
+                                    );
+                                }
+                            }
                             self.transition(PipelineState::Submitted)?;
                             return Ok(());
                         }
@@ -927,6 +1049,18 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         sub.aid = aid;
                         sub.bvid = bvid;
                         self.store.put_submission(&sub)?;
+                        if self.room_config.record.delete_after_submit {
+                            let cleaned =
+                                cleanup_submitted_session_recordings(&self.store, active_session)
+                                    .await?;
+                            if cleaned > 0 {
+                                info!(
+                                    session_id = %active_session,
+                                    cleaned,
+                                    "Deleted local recordings after confirmed submission"
+                                );
+                            }
+                        }
                         self.transition(PipelineState::Submitted)?;
                     }
                     Ok(SubmissionOutcome::Ambiguous { reason }) => {
@@ -1067,6 +1201,7 @@ mod tests {
             min_segment_size: 20 * 1024 * 1024,
             qn: 10000,
             cdn: Vec::new(),
+            delete_after_submit: false,
         }
     }
 
@@ -1574,6 +1709,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_submitting_deletes_uploaded_recordings_after_confirmed_submission() {
+        use crate::state::model::{Segment, SegmentStatus};
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let file_dir = tempfile::tempdir().unwrap();
+        let file_path = file_dir.path().join("segment.flv");
+        std::fs::write(&file_path, b"FLV").unwrap();
+
+        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let uploader = Arc::new(FakeUploader::new());
+        let mut room_config = test_room_config();
+        room_config.record.delete_after_submit = true;
+        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
+
+        let session_id = put_recording_session(&store, 1);
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: file_path.clone(),
+                status: SegmentStatus::Uploaded,
+                error: None,
+            })
+            .unwrap();
+        store
+            .put_uploaded_part(&UploadedPart {
+                session_id,
+                segment_index: 0,
+                bili_filename: "fake_file".into(),
+                part_title: "part 0".into(),
+            })
+            .unwrap();
+
+        supervisor.run_step().await.unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::Submitted);
+        assert!(!file_path.exists());
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments[0].status, SegmentStatus::Cleaned);
+        let sub = store.get_submission(session_id).unwrap().unwrap();
+        assert_eq!(sub.status, SubmissionStatus::Submitted);
+    }
+
+    #[tokio::test]
+    async fn test_submitting_existing_submitted_retries_recording_cleanup() {
+        use crate::state::model::{Segment, SegmentStatus};
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let file_dir = tempfile::tempdir().unwrap();
+        let file_path = file_dir.path().join("segment.flv");
+        std::fs::write(&file_path, b"FLV").unwrap();
+
+        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
+        let uploader = Arc::new(FakeUploader::new());
+        let mut room_config = test_room_config();
+        room_config.record.delete_after_submit = true;
+        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
+
+        let session_id = put_recording_session(&store, 1);
+        let mut session = store.get_session(session_id).unwrap().unwrap();
+        session.status = SessionStatus::Finalized;
+        store.put_session(&session).unwrap();
+
+        supervisor.active_session_id = Some(session_id);
+        supervisor.session.state = PipelineState::Submitting;
+
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: file_path.clone(),
+                status: SegmentStatus::Uploaded,
+                error: None,
+            })
+            .unwrap();
+        store
+            .put_uploaded_part(&UploadedPart {
+                session_id,
+                segment_index: 0,
+                bili_filename: "fake_file".into(),
+                part_title: "part 0".into(),
+            })
+            .unwrap();
+        store
+            .put_submission(&Submission {
+                session_id,
+                upload_credential: test_upload_credential(),
+                status: SubmissionStatus::Submitted,
+                aid: Some(1),
+                bvid: Some("bv1".into()),
+                error: None,
+            })
+            .unwrap();
+
+        supervisor.run_step().await.unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::Submitted);
+        assert_eq!(uploader.get_submit_count(), 0);
+        assert!(!file_path.exists());
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments[0].status, SegmentStatus::Cleaned);
+    }
+
+    #[tokio::test]
     async fn test_submitting_uses_room_title_and_description_templates() {
         let db_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
@@ -1718,19 +1960,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_submitting_records_ambiguous_outcome() {
+        use crate::state::model::{Segment, SegmentStatus};
+
         let db_dir = tempfile::tempdir().unwrap();
+        let file_dir = tempfile::tempdir().unwrap();
+        let file_path = file_dir.path().join("segment.flv");
+        std::fs::write(&file_path, b"FLV").unwrap();
         let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = Arc::new(FakeUploader::new());
         uploader.set_submit_behavior(SubmitBehavior::Ambiguous {
             reason: "code=0 but no aid/bvid".into(),
         });
 
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
+        let mut room_config = test_room_config();
+        room_config.record.delete_after_submit = true;
+        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
 
         let session_id = put_recording_session(&store, 1);
         supervisor.active_session_id = Some(session_id);
         supervisor.session.state = PipelineState::Submitting;
 
+        store
+            .put_segment(&Segment {
+                session_id,
+                index: 0,
+                path: file_path.clone(),
+                status: SegmentStatus::Uploaded,
+                error: None,
+            })
+            .unwrap();
         store
             .put_uploaded_part(&UploadedPart {
                 session_id,
@@ -1752,6 +2010,9 @@ mod tests {
         assert!(sub.aid.is_none());
         assert!(sub.bvid.is_none());
         assert!(sub.error.as_deref().unwrap().contains("no aid/bvid"));
+        assert!(file_path.exists());
+        let segments = store.list_segments(session_id).unwrap();
+        assert_eq!(segments[0].status, SegmentStatus::Uploaded);
     }
 
     #[tokio::test]

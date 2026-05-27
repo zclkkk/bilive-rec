@@ -311,6 +311,7 @@ mod tests {
             min_segment_size: 20 * 1024 * 1024,
             qn: 10000,
             cdn: vec![],
+            delete_after_submit: false,
         }
     }
 
