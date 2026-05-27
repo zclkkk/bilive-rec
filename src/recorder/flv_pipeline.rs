@@ -1,8 +1,8 @@
 use crate::error::{AppError, AppResult};
 use crate::recorder::flv::{
-    FlvTag, FlvTagType, avc_nalu_length_size_from_sequence_header, inspect_avc_nalu_packet,
-    is_aac_sequence_header, is_avc_keyframe, is_avc_nalu_packet, is_avc_sequence_header,
-    is_avc_video_tag,
+    FlvTag, FlvTagType, avc_nalu_length_size_from_sequence_header, is_aac_sequence_header,
+    is_avc_keyframe, is_avc_nalu_packet, is_avc_sequence_header, is_avc_video_tag,
+    remove_avc_filler_nalus,
 };
 use std::collections::VecDeque;
 
@@ -68,7 +68,7 @@ impl FlvNormalizer {
 
     pub(super) fn observe_tag(
         &mut self,
-        tag: FlvTag,
+        mut tag: FlvTag,
         recording: bool,
     ) -> AppResult<NormalizedAction> {
         match tag.header.tag_type {
@@ -113,10 +113,27 @@ impl FlvNormalizer {
                 if let Some(length_size) = self.avc_nalu_length_size
                     && is_avc_nalu_packet(&tag.data)
                 {
-                    let inspection =
-                        inspect_avc_nalu_packet(&tag.data, length_size).map_err(|err| {
+                    let removal =
+                        remove_avc_filler_nalus(&tag.data, length_size).map_err(|err| {
                             AppError::Bilibili(format!("Invalid AVC NALU packet: {err}"))
                         })?;
+                    if removal.changed() {
+                        tracing::debug!(
+                            removed_nalus = removal.removed_filler_nalus,
+                            removed_payload_bytes = removal.removed_filler_payload_bytes,
+                            removed_total_bytes = removal.removed_filler_total_bytes,
+                            retained_nalus = removal.retained_nalus,
+                            "removed H.264 filler data from AVC video tag"
+                        );
+                    }
+                    if removal.empty_after_removal() {
+                        return Ok(NormalizedAction::Drop);
+                    }
+                    let inspection = removal.inspection;
+                    if let Some(cleaned_data) = removal.cleaned_data {
+                        tag.header.data_size = cleaned_data.len() as u32;
+                        tag.data = cleaned_data;
+                    }
                     if is_keyframe && inspection.has_sps && inspection.has_pps {
                         self.note_in_band_parameter_sets();
                     }
@@ -448,6 +465,21 @@ mod tests {
         ]
     }
 
+    fn avc_keyframe_with_filler() -> Vec<u8> {
+        vec![
+            0x17, 0x01, 0, 0, 0, // FLV AVC NALU packet prefix
+            0, 0, 0, 3, 0x0c, 0xaa, 0xbb, // Filler data
+            0, 0, 0, 1, 0x65, // IDR
+        ]
+    }
+
+    fn avc_filler_only_interframe() -> Vec<u8> {
+        vec![
+            0x27, 0x01, 0, 0, 0, // FLV AVC NALU packet prefix
+            0, 0, 0, 3, 0x0c, 0xaa, 0xbb, // Filler data
+        ]
+    }
+
     #[test]
     fn same_sequence_header_does_not_mark_pending_change() {
         let mut normalizer = FlvNormalizer::new();
@@ -563,6 +595,43 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Annex-B start-code"));
+    }
+
+    #[test]
+    fn avc_filler_data_is_removed_before_writing() {
+        let mut normalizer = FlvNormalizer::new();
+        normalizer
+            .observe_tag(video_tag(0, avc_sequence_header(0)), false)
+            .unwrap();
+
+        let action = normalizer
+            .observe_tag(video_tag(33, avc_keyframe_with_filler()), true)
+            .unwrap();
+
+        let NormalizedAction::Write { tag, is_keyframe } = action else {
+            panic!("cleaned keyframe should still be written");
+        };
+        let expected = vec![
+            0x17, 0x01, 0, 0, 0, // FLV AVC NALU packet prefix
+            0, 0, 0, 1, 0x65, // IDR
+        ];
+        assert!(is_keyframe);
+        assert_eq!(tag.header.data_size, expected.len() as u32);
+        assert_eq!(tag.data, expected);
+    }
+
+    #[test]
+    fn avc_filler_only_packet_is_dropped() {
+        let mut normalizer = FlvNormalizer::new();
+        normalizer
+            .observe_tag(video_tag(0, avc_sequence_header(0)), false)
+            .unwrap();
+
+        let action = normalizer
+            .observe_tag(video_tag(33, avc_filler_only_interframe()), true)
+            .unwrap();
+
+        assert!(matches!(action, NormalizedAction::Drop));
     }
 
     #[test]
