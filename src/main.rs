@@ -811,15 +811,26 @@ async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> Ap
                     println!("started segment {index} at {}", part_path.display());
                 }
                 SegmentEvent::Finalized {
-                    index, path, size, ..
+                    index,
+                    path,
+                    size,
+                    close_reason,
+                    ..
                 } => {
                     println!(
-                        "finalized segment {index} ({size} bytes) at {}",
+                        "finalized segment {index} ({size} bytes, reason={close_reason}) at {}",
                         path.display()
                     );
                 }
-                SegmentEvent::Filtered { index, size, .. } => {
-                    println!("filtered segment {index} (too small: {size} bytes)");
+                SegmentEvent::Filtered {
+                    index,
+                    size,
+                    close_reason,
+                    ..
+                } => {
+                    println!(
+                        "filtered segment {index} (too small: {size} bytes, reason={close_reason})"
+                    );
                 }
             }
         }

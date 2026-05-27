@@ -547,8 +547,12 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                 index,
                                 path,
                                 size: _,
+                                close_reason,
                             } => {
-                                info!("Segment finalized: idx={}, path={:?}", index, path);
+                                info!(
+                                    "Segment finalized: idx={}, path={:?}, reason={}",
+                                    index, path, close_reason
+                                );
                                 let segment = match validate_finalized_segment_for_upload(
                                     &store_clone,
                                     session_id,
@@ -1487,6 +1491,7 @@ mod tests {
                 index: 1,
                 path: file_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1522,6 +1527,7 @@ mod tests {
                 index: 1,
                 path: std::path::PathBuf::from("missing.flv"),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1553,6 +1559,7 @@ mod tests {
                 index: 1,
                 path: std::path::PathBuf::from("ambiguous.flv"),
                 status: SegmentStatus::Uploading,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1733,6 +1740,7 @@ mod tests {
                 index: 0,
                 path: file_path.clone(),
                 status: SegmentStatus::Uploaded,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1784,6 +1792,7 @@ mod tests {
                 index: 0,
                 path: file_path.clone(),
                 status: SegmentStatus::Uploaded,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1868,6 +1877,7 @@ mod tests {
                 index: 0,
                 path: std::path::PathBuf::from("ambiguous.flv"),
                 status: SegmentStatus::Uploading,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1986,6 +1996,7 @@ mod tests {
                 index: 0,
                 path: file_path.clone(),
                 status: SegmentStatus::Uploaded,
+                close_reason: None,
                 error: None,
             })
             .unwrap();

@@ -2,6 +2,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::state::model::SegmentCloseReason;
+
 /// Defines where segment files are written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentLayout {
@@ -44,6 +46,7 @@ pub enum SegmentEvent {
         index: u32,
         path: PathBuf,
         size: u64,
+        close_reason: SegmentCloseReason,
     },
     /// A segment finished but was too small (e.g. < min_segment_size).
     Filtered {
@@ -51,6 +54,7 @@ pub enum SegmentEvent {
         index: u32,
         path: PathBuf,
         size: u64,
+        close_reason: SegmentCloseReason,
     },
 }
 

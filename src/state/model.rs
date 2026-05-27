@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use uuid::Uuid;
 
 use crate::credential::CredentialIdentity;
@@ -23,6 +24,8 @@ pub struct Segment {
     pub index: u32,
     pub path: std::path::PathBuf,
     pub status: SegmentStatus,
+    #[serde(default)]
+    pub close_reason: Option<SegmentCloseReason>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -73,6 +76,75 @@ pub enum SegmentStatus {
     Uploaded,
     Cleaned,
     Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SegmentCloseReason {
+    Rotation {
+        triggers: Vec<SegmentRotationTrigger>,
+    },
+    StreamEnded,
+    ConnectionDropped,
+    IdleTimeout {
+        seconds: u64,
+    },
+    GracefulShutdown,
+    RepeatedMediaData,
+}
+
+impl fmt::Display for SegmentCloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rotation { triggers } => {
+                write!(f, "rotation(")?;
+                for (idx, trigger) in triggers.iter().enumerate() {
+                    if idx > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{trigger}")?;
+                }
+                write!(f, ")")
+            }
+            Self::StreamEnded => write!(f, "stream_ended"),
+            Self::ConnectionDropped => write!(f, "connection_dropped"),
+            Self::IdleTimeout { seconds } => write!(f, "idle_timeout({seconds}s)"),
+            Self::GracefulShutdown => write!(f, "graceful_shutdown"),
+            Self::RepeatedMediaData => write!(f, "repeated_media_data"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SegmentRotationTrigger {
+    HeaderChanged,
+    SizeLimit { current_size: u64, limit: u64 },
+    TimeLimit { elapsed_ms: u64, limit_ms: u64 },
+}
+
+impl fmt::Display for SegmentRotationTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderChanged => write!(f, "header_changed"),
+            Self::SizeLimit {
+                current_size,
+                limit,
+            } => {
+                write!(f, "size_limit(current={current_size}, limit={limit})")
+            }
+            Self::TimeLimit {
+                elapsed_ms,
+                limit_ms,
+            } => {
+                write!(
+                    f,
+                    "time_limit(elapsed={}ms, limit={}ms)",
+                    elapsed_ms, limit_ms
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +213,31 @@ mod tests {
     }
 
     #[test]
+    fn segment_close_reason_serde_roundtrip() {
+        let reason = SegmentCloseReason::Rotation {
+            triggers: vec![
+                SegmentRotationTrigger::HeaderChanged,
+                SegmentRotationTrigger::SizeLimit {
+                    current_size: 2048,
+                    limit: 1024,
+                },
+                SegmentRotationTrigger::TimeLimit {
+                    elapsed_ms: 61_000,
+                    limit_ms: 60_000,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&reason).unwrap();
+        let decoded: SegmentCloseReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, reason);
+        assert_eq!(
+            decoded.to_string(),
+            "rotation(header_changed, size_limit(current=2048, limit=1024), time_limit(elapsed=61000ms, limit=60000ms))"
+        );
+    }
+
+    #[test]
     fn live_session_serde_roundtrip() {
         let session = LiveSession {
             id: Uuid::new_v4(),
@@ -166,11 +263,13 @@ mod tests {
             index: 0,
             path: PathBuf::from("/tmp/test.flv"),
             status: SegmentStatus::Finalized,
+            close_reason: Some(SegmentCloseReason::StreamEnded),
             error: Some("test error".to_string()),
         };
         let json = serde_json::to_string(&seg).unwrap();
         let decoded: Segment = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.index, 0);
+        assert_eq!(decoded.close_reason, Some(SegmentCloseReason::StreamEnded));
         assert_eq!(decoded.error.as_deref(), Some("test error"));
     }
 }

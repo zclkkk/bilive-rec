@@ -1091,6 +1091,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1127,6 +1128,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1167,6 +1169,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1207,6 +1210,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1234,6 +1238,7 @@ mod tests {
                 index: 0,
                 path: flv_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1259,6 +1264,7 @@ mod tests {
                 index: 0,
                 path: flv_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1291,6 +1297,7 @@ mod tests {
                 index: 0,
                 path: PathBuf::from("/nonexistent/path/test.flv"),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1480,6 +1487,7 @@ mod tests {
                 index: 0,
                 path: dir.path().join("segment.flv"),
                 status: SegmentStatus::Uploading,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1533,6 +1541,7 @@ mod tests {
                 index: 3,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1573,6 +1582,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1616,6 +1626,7 @@ mod tests {
                 index: 1,
                 path: flv_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1641,6 +1652,7 @@ mod tests {
                 index: 1,
                 path: flv_path.clone(),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1670,6 +1682,7 @@ mod tests {
                 index: 2,
                 path: PathBuf::from("/nonexistent/seg.flv"),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1697,6 +1710,7 @@ mod tests {
                 index: 3,
                 path: part_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1724,6 +1738,7 @@ mod tests {
                 index: 0,
                 path: flv_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1751,6 +1766,7 @@ mod tests {
                 index: 0,
                 path: dir.path().join("segment.flv"),
                 status: SegmentStatus::Uploading,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1912,6 +1928,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -1949,6 +1966,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Failed,
+                close_reason: None,
                 error: Some("already failed".to_string()),
             })
             .unwrap();
@@ -2021,6 +2039,7 @@ mod tests {
                 index: 1,
                 path: flv_path.clone(),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2058,6 +2077,7 @@ mod tests {
                 index: 1,
                 path: flv_path.clone(),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2102,6 +2122,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2161,6 +2182,7 @@ mod tests {
                 index: 0,
                 path: part_path,
                 status: SegmentStatus::Recording,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2215,6 +2237,7 @@ mod tests {
                 index: 1,
                 path: flv_path.clone(),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2449,6 +2472,7 @@ mod tests {
                 index: 1,
                 path: flv_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2495,6 +2519,7 @@ mod tests {
                 index: 1,
                 path: flv_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2541,6 +2566,7 @@ mod tests {
                 index: 1,
                 path: flv_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2667,6 +2693,7 @@ mod tests {
                 index: 1,
                 path: flv_path.clone(),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2716,6 +2743,7 @@ mod tests {
                 index: 1,
                 path: flv_path.clone(),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2765,6 +2793,7 @@ mod tests {
                 index: 1,
                 path: flv_path.clone(),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();
@@ -2819,6 +2848,7 @@ mod tests {
                 index: 1,
                 path: real_path,
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             })
             .unwrap();

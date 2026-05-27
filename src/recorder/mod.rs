@@ -13,7 +13,7 @@ use crate::recorder::segment::{
     RecorderPolicy, SegmentEvent, final_path, part_path, should_filter_by_size,
     should_rotate_by_elapsed, should_rotate_by_size,
 };
-use crate::state::model::{Segment, SegmentStatus};
+use crate::state::model::{Segment, SegmentCloseReason, SegmentRotationTrigger, SegmentStatus};
 use crate::state::store::StateStore;
 
 use reqwest::Response;
@@ -56,6 +56,11 @@ struct InitialSegmentWrite {
 
 const METADATA_BODY_OFFSET: u64 = 13 + 11;
 const KEYFRAME_INDEX_MIN_INTERVAL_MS: u32 = 1_900;
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 30;
+
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
 
 pub struct FlvRecorder<'a> {
     session_id: Uuid,
@@ -198,19 +203,48 @@ impl<'a> FlvRecorder<'a> {
     }
 
     async fn rotate_before_keyframe_if_needed(&mut self) -> AppResult<()> {
-        let mut needs_rotation = false;
-        let header_change = self.normalizer.has_pending_header_change();
-        if let RecordPhase::Recording(seg) = &self.phase
-            && (header_change
-                || should_rotate_by_size(seg.size, &self.policy.segment)
-                || should_rotate_by_elapsed(seg.start_time.elapsed(), &self.policy.segment))
-        {
-            needs_rotation = true;
-        }
+        let rotation_reason = if let RecordPhase::Recording(seg) = &self.phase {
+            let mut triggers = Vec::new();
+            if self.normalizer.has_pending_header_change() {
+                triggers.push(SegmentRotationTrigger::HeaderChanged);
+            }
+            if let Some(limit) = self.policy.segment.segment_size
+                && should_rotate_by_size(seg.size, &self.policy.segment)
+            {
+                triggers.push(SegmentRotationTrigger::SizeLimit {
+                    current_size: seg.size,
+                    limit,
+                });
+            }
+            if let Some(limit) = self.policy.segment.segment_time {
+                let elapsed = seg.start_time.elapsed();
+                if should_rotate_by_elapsed(elapsed, &self.policy.segment) {
+                    triggers.push(SegmentRotationTrigger::TimeLimit {
+                        elapsed_ms: duration_millis_u64(elapsed),
+                        limit_ms: duration_millis_u64(limit),
+                    });
+                }
+            }
 
-        if needs_rotation {
-            self.finalize_current_segment().await?;
-            if header_change {
+            if triggers.is_empty() {
+                None
+            } else {
+                Some(SegmentCloseReason::Rotation { triggers })
+            }
+        } else {
+            None
+        };
+
+        if let Some(reason) = rotation_reason {
+            let reset_deduplicator = matches!(
+                &reason,
+                SegmentCloseReason::Rotation { triggers }
+                    if triggers
+                        .iter()
+                        .any(|trigger| matches!(trigger, SegmentRotationTrigger::HeaderChanged))
+            );
+            self.finalize_current_segment(reason).await?;
+            if reset_deduplicator {
                 self.media_group.reset_deduplicator();
             }
             self.open_new_segment().await?;
@@ -284,7 +318,10 @@ impl<'a> FlvRecorder<'a> {
         Ok(())
     }
 
-    async fn finalize_current_segment(&mut self) -> AppResult<()> {
+    async fn finalize_current_segment(
+        &mut self,
+        close_reason: SegmentCloseReason,
+    ) -> AppResult<()> {
         let mut seg = match std::mem::replace(&mut self.phase, RecordPhase::WaitSync) {
             RecordPhase::Recording(s) => s,
             RecordPhase::WaitSync => return Ok(()),
@@ -306,6 +343,7 @@ impl<'a> FlvRecorder<'a> {
                 index: seg.index,
                 path: final_p.clone(),
                 status: SegmentStatus::Filtered,
+                close_reason: Some(close_reason.clone()),
                 error: None,
             };
             if let Err(e) = self.store.put_segment(&db_seg) {
@@ -327,6 +365,7 @@ impl<'a> FlvRecorder<'a> {
                 index: seg.index,
                 path: final_p,
                 size: seg.size,
+                close_reason,
             });
             return Ok(());
         }
@@ -358,6 +397,7 @@ impl<'a> FlvRecorder<'a> {
             index: seg.index,
             path: final_p.clone(),
             status: SegmentStatus::Finalized,
+            close_reason: Some(close_reason.clone()),
             error: None,
         };
         if let Err(e) = self.store.put_segment(&db_seg) {
@@ -390,6 +430,7 @@ impl<'a> FlvRecorder<'a> {
             index: seg.index,
             path: final_p,
             size: seg.size,
+            close_reason,
         });
 
         Ok(())
@@ -407,6 +448,7 @@ impl<'a> FlvRecorder<'a> {
             index,
             path,
             status: SegmentStatus::Failed,
+            close_reason: None,
             error: Some(original_msg.clone()),
         };
         self.store.put_segment(&db_seg).map_err(|persist_err| {
@@ -432,6 +474,7 @@ impl<'a> FlvRecorder<'a> {
             index: idx,
             path: p_path.clone(),
             status: SegmentStatus::Recording,
+            close_reason: None,
             error: None,
         };
         self.store.put_segment(&db_seg)?;
@@ -552,7 +595,7 @@ impl<'a> FlvRecorder<'a> {
         })
     }
 
-    pub async fn finalize(&mut self) -> AppResult<()> {
+    pub async fn finalize(&mut self, close_reason: SegmentCloseReason) -> AppResult<()> {
         if !self.buffer.is_empty() {
             tracing::warn!(
                 leftover_bytes = self.buffer.len(),
@@ -562,7 +605,7 @@ impl<'a> FlvRecorder<'a> {
         }
         self.flush_pending_media_group(PendingMediaFlush::Final)
             .await?;
-        self.finalize_current_segment().await?;
+        self.finalize_current_segment(close_reason).await?;
         Ok(())
     }
 
@@ -575,6 +618,7 @@ impl<'a> FlvRecorder<'a> {
                 index: seg.index,
                 path: seg.part_path.clone(),
                 status: SegmentStatus::Failed,
+                close_reason: None,
                 error: Some(err_msg.to_string()),
             };
             self.store.put_segment(&db_seg)?;
@@ -636,38 +680,45 @@ pub async fn record_flv(
 
     let mut graceful_shutdown = false;
     let result: AppResult<()> = async {
-        loop {
+        let close_reason = loop {
             tokio::select! {
-                chunk_res = tokio::time::timeout(std::time::Duration::from_secs(30), resp.chunk()) => {
+                chunk_res = tokio::time::timeout(std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS), resp.chunk()) => {
                     match chunk_res {
                         Ok(Ok(Some(data))) => {
                             if let Err(error) = recorder.push_chunk(&data).await {
                                 if matches!(error, AppError::StreamRepeatedData(_)) {
                                     tracing::warn!("{}", error);
-                                    break;
+                                    break SegmentCloseReason::RepeatedMediaData;
                                 }
                                 return Err(error);
                             }
                         }
-                        Ok(Ok(None)) => break,
+                        Ok(Ok(None)) => {
+                            break SegmentCloseReason::StreamEnded;
+                        }
                         Ok(Err(e)) => {
                             tracing::warn!("Stream connection dropped: {}", e);
-                            break;
+                            break SegmentCloseReason::ConnectionDropped;
                         }
                         Err(_) => {
-                            tracing::warn!("Stream idle timeout: no data received for 30s");
-                            break;
+                            tracing::warn!(
+                                "Stream idle timeout: no data received for {}s",
+                                STREAM_IDLE_TIMEOUT_SECS
+                            );
+                            break SegmentCloseReason::IdleTimeout {
+                                seconds: STREAM_IDLE_TIMEOUT_SECS,
+                            };
                         }
                     }
                 }
                 _ = shutdown_rx.changed() => {
                     tracing::info!("Graceful shutdown requested, finalizing segment");
                     graceful_shutdown = true;
-                    break;
+                    break SegmentCloseReason::GracefulShutdown;
                 }
             }
-        }
-        recorder.finalize().await?;
+        };
+        recorder.finalize(close_reason).await?;
         if graceful_shutdown {
             return Err(AppError::GracefulShutdown);
         }
@@ -913,7 +964,10 @@ mod tests {
         assert_eq!(recorder.normalizer.metadata_tag, Some(metadata_tag));
 
         // Finish
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         // Verify events
         let ev1 = rx.recv().await.unwrap();
@@ -924,9 +978,15 @@ mod tests {
 
         let ev2 = rx.recv().await.unwrap();
         match ev2 {
-            SegmentEvent::Finalized { index, size, .. } => {
+            SegmentEvent::Finalized {
+                index,
+                size,
+                close_reason,
+                ..
+            } => {
                 assert_eq!(index, 1);
                 assert!(size > 0);
+                assert_eq!(close_reason, SegmentCloseReason::StreamEnded);
             }
             _ => panic!("Expected Finalized event"),
         }
@@ -1004,7 +1064,10 @@ mod tests {
         tag.write(&mut tag_buf).unwrap();
         recorder.push_chunk(&tag_buf).await.unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let part_p = part_path(&policy.layout, &session_id, 1);
         let final_p = final_path(&policy.layout, &session_id, 1);
@@ -1097,7 +1160,10 @@ mod tests {
         // Should rotate before writing Tag 3.
         recorder.push_chunk(&push_avc_tag(true)).await.unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         // Expect events:
         // Started 1, Finalized 1, Started 2, Finalized 2
@@ -1111,6 +1177,17 @@ mod tests {
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 2);
+        assert!(matches!(
+            segments[0].close_reason.as_ref(),
+            Some(SegmentCloseReason::Rotation { triggers })
+                if triggers
+                    .iter()
+                    .any(|trigger| matches!(trigger, SegmentRotationTrigger::SizeLimit { .. }))
+        ));
+        assert_eq!(
+            segments[1].close_reason,
+            Some(SegmentCloseReason::StreamEnded)
+        );
     }
 
     #[tokio::test]
@@ -1187,7 +1264,10 @@ mod tests {
 
         recorder.push_chunk(&tag_buf[..5]).await.unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
@@ -1233,7 +1313,10 @@ mod tests {
             .await
             .unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
@@ -1291,7 +1374,10 @@ mod tests {
             .await
             .unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
@@ -1329,7 +1415,10 @@ mod tests {
             .unwrap();
         recorder.push_chunk(&write_tag(keyframe)).await.unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
         let media_video_timestamps: Vec<_> = tags
@@ -1364,7 +1453,10 @@ mod tests {
                 .unwrap();
         }
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
@@ -1404,7 +1496,10 @@ mod tests {
             .await
             .unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
         let media_video_timestamps: Vec<_> = tags
@@ -1446,7 +1541,10 @@ mod tests {
             .await
             .unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
         let metadata = tags
@@ -1498,7 +1596,10 @@ mod tests {
             .await
             .unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let first_tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
         let first_media_count = first_tags
@@ -1559,7 +1660,10 @@ mod tests {
             .await
             .unwrap();
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
@@ -1626,7 +1730,10 @@ mod tests {
         let final_p = final_path(&policy.layout, &session_id, 1);
         std::fs::create_dir(&final_p).unwrap();
 
-        let err = recorder.finalize().await.unwrap_err();
+        let err = recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains(&final_p.display().to_string()));
 
         let segments = store.list_segments(session_id).unwrap();
@@ -1804,7 +1911,10 @@ mod tests {
             new_avc_seq
         );
 
-        recorder.finalize().await.unwrap();
+        recorder
+            .finalize(SegmentCloseReason::StreamEnded)
+            .await
+            .unwrap();
 
         // Verify rotation event
         let mut segments = 0;
@@ -1814,6 +1924,14 @@ mod tests {
             }
         }
         assert_eq!(segments, 2);
+        let stored = store.list_segments(session_id).unwrap();
+        assert!(matches!(
+            stored[0].close_reason.as_ref(),
+            Some(SegmentCloseReason::Rotation { triggers })
+                if triggers
+                    .iter()
+                    .any(|trigger| matches!(trigger, SegmentRotationTrigger::HeaderChanged))
+        ));
     }
 
     /// If File::create fails while opening a new segment, the segment row

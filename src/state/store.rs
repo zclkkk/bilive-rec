@@ -439,6 +439,7 @@ mod tests {
             index: 0,
             path: PathBuf::from("/tmp/seg0.flv"),
             status: SegmentStatus::Finalized,
+            close_reason: None,
             error: None,
         };
         let seg1 = Segment {
@@ -446,6 +447,7 @@ mod tests {
             index: 1,
             path: PathBuf::from("/tmp/seg1.flv"),
             status: SegmentStatus::Recording,
+            close_reason: None,
             error: None,
         };
         store.put_segment(&seg0).unwrap();
@@ -487,6 +489,7 @@ mod tests {
             index: 0,
             path: PathBuf::from("/tmp/a.flv"),
             status: SegmentStatus::Finalized,
+            close_reason: None,
             error: None,
         };
         store.put_segment(&seg).unwrap();
@@ -508,6 +511,7 @@ mod tests {
                 index,
                 path: PathBuf::from(format!("/tmp/seg{index}.flv")),
                 status: SegmentStatus::Finalized,
+                close_reason: None,
                 error: None,
             };
             store.put_segment(&seg).unwrap();
