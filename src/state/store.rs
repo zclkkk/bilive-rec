@@ -380,7 +380,10 @@ fn decode_room_pipeline_state(bytes: &[u8]) -> AppResult<RoomPipelineState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::model::{LiveSession, Segment, SegmentStatus, SessionStatus};
+    use crate::state::model::{
+        LiveSession, SessionStatus,
+        fixtures::{finalized_segment, recording_segment},
+    };
     use jiff::Timestamp;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -434,22 +437,8 @@ mod tests {
     fn put_and_list_segments() {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
-        let seg0 = Segment {
-            session_id,
-            index: 0,
-            path: PathBuf::from("/tmp/seg0.flv"),
-            status: SegmentStatus::Finalized,
-            close_reason: None,
-            error: None,
-        };
-        let seg1 = Segment {
-            session_id,
-            index: 1,
-            path: PathBuf::from("/tmp/seg1.flv"),
-            status: SegmentStatus::Recording,
-            close_reason: None,
-            error: None,
-        };
+        let seg0 = finalized_segment(session_id, 0, PathBuf::from("/tmp/seg0.flv"));
+        let seg1 = recording_segment(session_id, 1, PathBuf::from("/tmp/seg1.flv"));
         store.put_segment(&seg0).unwrap();
         store.put_segment(&seg1).unwrap();
 
@@ -484,14 +473,7 @@ mod tests {
         };
         store.put_session(&session).unwrap();
 
-        let seg = Segment {
-            session_id: session.id,
-            index: 0,
-            path: PathBuf::from("/tmp/a.flv"),
-            status: SegmentStatus::Finalized,
-            close_reason: None,
-            error: None,
-        };
+        let seg = finalized_segment(session.id, 0, PathBuf::from("/tmp/a.flv"));
         store.put_segment(&seg).unwrap();
 
         let s = store.summary().unwrap();
@@ -506,14 +488,11 @@ mod tests {
 
         // Insert in reverse numeric order; lexicographic "10" < "2" would break naive sorting.
         for index in [10u32, 2] {
-            let seg = Segment {
+            let seg = finalized_segment(
                 session_id,
                 index,
-                path: PathBuf::from(format!("/tmp/seg{index}.flv")),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            };
+                PathBuf::from(format!("/tmp/seg{index}.flv")),
+            );
             store.put_segment(&seg).unwrap();
         }
 

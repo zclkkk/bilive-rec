@@ -162,6 +162,73 @@ pub enum SubmissionStatus {
 }
 
 #[cfg(test)]
+pub(crate) mod fixtures {
+    use super::{Segment, SegmentStatus};
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn segment(
+        session_id: Uuid,
+        index: u32,
+        path: impl Into<PathBuf>,
+        status: SegmentStatus,
+    ) -> Segment {
+        Segment {
+            session_id,
+            index,
+            path: path.into(),
+            status,
+            close_reason: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn recording_segment(
+        session_id: Uuid,
+        index: u32,
+        path: impl Into<PathBuf>,
+    ) -> Segment {
+        segment(session_id, index, path, SegmentStatus::Recording)
+    }
+
+    pub(crate) fn finalized_segment(
+        session_id: Uuid,
+        index: u32,
+        path: impl Into<PathBuf>,
+    ) -> Segment {
+        segment(session_id, index, path, SegmentStatus::Finalized)
+    }
+
+    pub(crate) fn uploading_segment(
+        session_id: Uuid,
+        index: u32,
+        path: impl Into<PathBuf>,
+    ) -> Segment {
+        segment(session_id, index, path, SegmentStatus::Uploading)
+    }
+
+    pub(crate) fn uploaded_segment(
+        session_id: Uuid,
+        index: u32,
+        path: impl Into<PathBuf>,
+    ) -> Segment {
+        segment(session_id, index, path, SegmentStatus::Uploaded)
+    }
+
+    pub(crate) fn failed_segment(
+        session_id: Uuid,
+        index: u32,
+        path: impl Into<PathBuf>,
+        error: impl Into<String>,
+    ) -> Segment {
+        Segment {
+            error: Some(error.into()),
+            ..segment(session_id, index, path, SegmentStatus::Failed)
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use jiff::Timestamp;

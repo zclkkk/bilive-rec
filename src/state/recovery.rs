@@ -909,8 +909,8 @@ pub async fn apply_recovery<U: Uploader>(
 mod tests {
     use super::*;
     use crate::state::model::{
-        LiveSession, Segment, SegmentStatus, SessionStatus, Submission, SubmissionStatus,
-        UploadedPart,
+        LiveSession, SegmentStatus, SessionStatus, Submission, SubmissionStatus, UploadedPart,
+        fixtures::{failed_segment, finalized_segment, recording_segment, uploading_segment},
     };
     use crate::uploader::types::UploadRequest;
     use jiff::Timestamp;
@@ -1086,14 +1086,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 0, part_path))
             .unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
@@ -1123,14 +1116,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 0, part_path))
             .unwrap();
 
         store
@@ -1164,14 +1150,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 0, part_path))
             .unwrap();
 
         store
@@ -1205,14 +1184,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 0, part_path))
             .unwrap();
 
         store.put_pipeline_state(555, PipelineState::Idle).unwrap();
@@ -1233,14 +1205,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: flv_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 0, flv_path))
             .unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
@@ -1259,14 +1224,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: flv_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 0, flv_path))
             .unwrap();
 
         store
@@ -1292,14 +1250,11 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         store
-            .put_segment(&Segment {
+            .put_segment(&finalized_segment(
                 session_id,
-                index: 0,
-                path: PathBuf::from("/nonexistent/path/test.flv"),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+                0,
+                PathBuf::from("/nonexistent/path/test.flv"),
+            ))
             .unwrap();
 
         store
@@ -1482,14 +1437,11 @@ mod tests {
         let (store, dir) = test_store();
         let session_id = Uuid::new_v4();
         store
-            .put_segment(&Segment {
+            .put_segment(&uploading_segment(
                 session_id,
-                index: 0,
-                path: dir.path().join("segment.flv"),
-                status: SegmentStatus::Uploading,
-                close_reason: None,
-                error: None,
-            })
+                0,
+                dir.path().join("segment.flv"),
+            ))
             .unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
@@ -1536,14 +1488,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 3,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 3, part_path))
             .unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
@@ -1577,14 +1522,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 0, part_path))
             .unwrap();
 
         store
@@ -1621,14 +1559,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake flv data").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path))
             .unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
@@ -1647,14 +1578,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake flv data").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path.clone(),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path.clone()))
             .unwrap();
 
         let mut retry_uploads = HashSet::new();
@@ -1677,14 +1601,11 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         store
-            .put_segment(&Segment {
+            .put_segment(&finalized_segment(
                 session_id,
-                index: 2,
-                path: PathBuf::from("/nonexistent/seg.flv"),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+                2,
+                PathBuf::from("/nonexistent/seg.flv"),
+            ))
             .unwrap();
 
         let mut retry_uploads = HashSet::new();
@@ -1705,14 +1626,7 @@ mod tests {
         std::fs::write(&part_path, b"fake part data").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 3,
-                path: part_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 3, part_path))
             .unwrap();
 
         let mut retry_uploads = HashSet::new();
@@ -1733,14 +1647,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: flv_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 0, flv_path))
             .unwrap();
 
         store
@@ -1761,14 +1668,11 @@ mod tests {
         let (store, dir) = test_store();
         let session_id = Uuid::new_v4();
         store
-            .put_segment(&Segment {
+            .put_segment(&uploading_segment(
                 session_id,
-                index: 0,
-                path: dir.path().join("segment.flv"),
-                status: SegmentStatus::Uploading,
-                close_reason: None,
-                error: None,
-            })
+                0,
+                dir.path().join("segment.flv"),
+            ))
             .unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
@@ -1923,14 +1827,7 @@ mod tests {
         let part_path = dir.path().join("test.part");
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 0, part_path))
             .unwrap();
 
         let plan = RecoveryPlan {
@@ -1961,14 +1858,7 @@ mod tests {
         let part_path = dir.path().join("test.part");
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Failed,
-                close_reason: None,
-                error: Some("already failed".to_string()),
-            })
+            .put_segment(&failed_segment(session_id, 0, part_path, "already failed"))
             .unwrap();
 
         let plan = RecoveryPlan {
@@ -2034,14 +1924,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake flv").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path.clone(),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path.clone()))
             .unwrap();
 
         let plan = RecoveryPlan {
@@ -2072,14 +1955,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake flv").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path.clone(),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path.clone()))
             .unwrap();
 
         store
@@ -2117,14 +1993,7 @@ mod tests {
         let part_path = dir.path().join("seg.part");
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 0, part_path))
             .unwrap();
 
         let plan = RecoveryPlan {
@@ -2177,14 +2046,7 @@ mod tests {
         let part_path = dir.path().join("test.part");
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: part_path,
-                status: SegmentStatus::Recording,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&recording_segment(session_id, 0, part_path))
             .unwrap();
 
         let plan = RecoveryPlan {
@@ -2232,14 +2094,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake flv").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path.clone(),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path.clone()))
             .unwrap();
 
         let plan = RecoveryPlan {
@@ -2467,14 +2322,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path))
             .unwrap();
 
         store
@@ -2514,14 +2362,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path))
             .unwrap();
 
         store
@@ -2561,14 +2402,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path))
             .unwrap();
 
         store
@@ -2688,14 +2522,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake flv").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path.clone(),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path.clone()))
             .unwrap();
 
         store
@@ -2738,14 +2565,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake flv").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path.clone(),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path.clone()))
             .unwrap();
 
         store
@@ -2788,14 +2608,7 @@ mod tests {
         std::fs::write(&flv_path, b"fake flv").unwrap();
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: flv_path.clone(),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, flv_path.clone()))
             .unwrap();
 
         store
@@ -2843,14 +2656,7 @@ mod tests {
 
         // Store has real_path
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: real_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, real_path))
             .unwrap();
 
         // Plan has stale_path

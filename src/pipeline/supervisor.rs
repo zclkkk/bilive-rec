@@ -550,8 +550,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                 close_reason,
                             } => {
                                 info!(
-                                    "Segment finalized: idx={}, path={:?}, reason={}",
-                                    index, path, close_reason
+                                    segment_index = index,
+                                    segment_path = %path.display(),
+                                    close_reason = %close_reason,
+                                    "segment finalized"
                                 );
                                 let segment = match validate_finalized_segment_for_upload(
                                     &store_clone,
@@ -1111,7 +1113,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::model::UploadedPart;
+    use crate::state::model::{
+        UploadedPart,
+        fixtures::{finalized_segment, uploaded_segment, uploading_segment},
+    };
     use crate::uploader::types::UploadRequest;
 
     /// What the FakeUploader should do on the next `submit` call.
@@ -1468,7 +1473,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_uploading_reconciles_missing_parts() {
-        use crate::state::model::{Segment, SegmentStatus};
         use crate::state::store::StateStore;
 
         let file_dir = tempfile::tempdir().unwrap();
@@ -1486,14 +1490,7 @@ mod tests {
 
         // Add a finalized segment with no uploaded part
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 1,
-                path: file_path,
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&finalized_segment(session_id, 1, file_path))
             .unwrap();
 
         supervisor.run_step().await.unwrap();
@@ -1509,7 +1506,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_uploading_refuses_missing_finalized_file() {
-        use crate::state::model::{Segment, SegmentStatus};
         use crate::state::store::StateStore;
 
         let store =
@@ -1522,14 +1518,11 @@ mod tests {
         supervisor.session.state = PipelineState::Uploading;
 
         store
-            .put_segment(&Segment {
+            .put_segment(&finalized_segment(
                 session_id,
-                index: 1,
-                path: std::path::PathBuf::from("missing.flv"),
-                status: SegmentStatus::Finalized,
-                close_reason: None,
-                error: None,
-            })
+                1,
+                std::path::PathBuf::from("missing.flv"),
+            ))
             .unwrap();
 
         supervisor.run_step().await.unwrap();
@@ -1541,7 +1534,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_uploading_refuses_ambiguous_uploading_segment() {
-        use crate::state::model::{Segment, SegmentStatus};
         use crate::state::store::StateStore;
 
         let store =
@@ -1554,14 +1546,11 @@ mod tests {
         supervisor.session.state = PipelineState::Uploading;
 
         store
-            .put_segment(&Segment {
+            .put_segment(&uploading_segment(
                 session_id,
-                index: 1,
-                path: std::path::PathBuf::from("ambiguous.flv"),
-                status: SegmentStatus::Uploading,
-                close_reason: None,
-                error: None,
-            })
+                1,
+                std::path::PathBuf::from("ambiguous.flv"),
+            ))
             .unwrap();
 
         supervisor.run_step().await.unwrap();
@@ -1717,8 +1706,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_submitting_deletes_uploaded_recordings_after_confirmed_submission() {
-        use crate::state::model::{Segment, SegmentStatus};
-
         let db_dir = tempfile::tempdir().unwrap();
         let file_dir = tempfile::tempdir().unwrap();
         let file_path = file_dir.path().join("segment.flv");
@@ -1735,14 +1722,7 @@ mod tests {
         supervisor.session.state = PipelineState::Submitting;
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: file_path.clone(),
-                status: SegmentStatus::Uploaded,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&uploaded_segment(session_id, 0, file_path.clone()))
             .unwrap();
         store
             .put_uploaded_part(&UploadedPart {
@@ -1765,8 +1745,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_submitting_existing_submitted_retries_recording_cleanup() {
-        use crate::state::model::{Segment, SegmentStatus};
-
         let db_dir = tempfile::tempdir().unwrap();
         let file_dir = tempfile::tempdir().unwrap();
         let file_path = file_dir.path().join("segment.flv");
@@ -1787,14 +1765,7 @@ mod tests {
         supervisor.session.state = PipelineState::Submitting;
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: file_path.clone(),
-                status: SegmentStatus::Uploaded,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&uploaded_segment(session_id, 0, file_path.clone()))
             .unwrap();
         store
             .put_uploaded_part(&UploadedPart {
@@ -1860,8 +1831,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_submitting_refuses_ambiguous_uploading_segment() {
-        use crate::state::model::{Segment, SegmentStatus};
-
         let db_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
         let uploader = Arc::new(FakeUploader::new());
@@ -1872,14 +1841,11 @@ mod tests {
         supervisor.session.state = PipelineState::Submitting;
 
         store
-            .put_segment(&Segment {
+            .put_segment(&uploading_segment(
                 session_id,
-                index: 0,
-                path: std::path::PathBuf::from("ambiguous.flv"),
-                status: SegmentStatus::Uploading,
-                close_reason: None,
-                error: None,
-            })
+                0,
+                std::path::PathBuf::from("ambiguous.flv"),
+            ))
             .unwrap();
 
         let err = supervisor.run_step().await.unwrap_err();
@@ -1970,8 +1936,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_submitting_records_ambiguous_outcome() {
-        use crate::state::model::{Segment, SegmentStatus};
-
         let db_dir = tempfile::tempdir().unwrap();
         let file_dir = tempfile::tempdir().unwrap();
         let file_path = file_dir.path().join("segment.flv");
@@ -1991,14 +1955,7 @@ mod tests {
         supervisor.session.state = PipelineState::Submitting;
 
         store
-            .put_segment(&Segment {
-                session_id,
-                index: 0,
-                path: file_path.clone(),
-                status: SegmentStatus::Uploaded,
-                close_reason: None,
-                error: None,
-            })
+            .put_segment(&uploaded_segment(session_id, 0, file_path.clone()))
             .unwrap();
         store
             .put_uploaded_part(&UploadedPart {
