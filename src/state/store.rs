@@ -164,6 +164,20 @@ impl StateStore {
         self.write(|txn| txn.put_segment(segment))
     }
 
+    pub fn get_segment(&self, session_id: Uuid, index: u32) -> AppResult<Option<Segment>> {
+        let key = format!("{}:{:010}", session_id, index);
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SEGMENTS)?;
+        match table.get(key.as_str())? {
+            Some(v) => {
+                let segment: Segment = serde_json::from_slice(v.value())
+                    .map_err(|e| AppError::State(format!("deserialize segment: {e}")))?;
+                Ok(Some(segment))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn list_segments(&self, session_id: Uuid) -> AppResult<Vec<Segment>> {
         let prefix = format!("{session_id}:");
         let read_txn = self.db.begin_read()?;

@@ -124,11 +124,7 @@ pub fn validate_finalized_segment_for_upload(
         )));
     }
 
-    let segments = store.list_segments(session_id)?;
-    let Some(segment) = segments
-        .iter()
-        .find(|segment| segment.index == segment_index)
-    else {
+    let Some(segment) = store.get_segment(session_id, segment_index)? else {
         return Ok(Err(format!(
             "segment {session_id}/{segment_index} not found"
         )));
