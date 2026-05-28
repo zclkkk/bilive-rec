@@ -75,17 +75,32 @@ impl StateStore {
         }
     }
 
-    pub fn put_session(&self, session: &LiveSession) -> AppResult<()> {
-        let key = session.id.to_string();
-        let value = serde_json::to_vec(session)
-            .map_err(|e| AppError::State(format!("serialize session: {e}")))?;
+    /// Run `f` inside a single write transaction. Every row write performed via
+    /// the provided [`StoreTxn`] commits atomically; if `f` returns `Err` the
+    /// transaction is aborted and nothing is persisted. This is how callers
+    /// express "change these N rows together or not at all".
+    pub fn write<R>(&self, f: impl FnOnce(&StoreTxn<'_>) -> AppResult<R>) -> AppResult<R> {
         let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SESSIONS)?;
-            table.insert(key.as_str(), value.as_slice())?;
+        let result = {
+            let store_txn = StoreTxn { txn: &write_txn };
+            f(&store_txn)
+        };
+        match result {
+            Ok(value) => {
+                write_txn.commit()?;
+                Ok(value)
+            }
+            Err(e) => {
+                // Abort explicitly so the partial writes never reach disk; the
+                // original error is what the caller needs to see.
+                let _ = write_txn.abort();
+                Err(e)
+            }
         }
-        write_txn.commit()?;
-        Ok(())
+    }
+
+    pub fn put_session(&self, session: &LiveSession) -> AppResult<()> {
+        self.write(|txn| txn.put_session(session))
     }
 
     pub fn put_session_and_pipeline_state(
@@ -94,30 +109,14 @@ impl StateStore {
         room_id: u64,
         state: PipelineState,
     ) -> AppResult<()> {
-        let key = session.id.to_string();
-        let session_value = serde_json::to_vec(session)
-            .map_err(|e| AppError::State(format!("serialize session: {e}")))?;
-        let room_state = RoomPipelineState {
-            state,
-            active_session_id: Some(session.id),
-        };
-        let state_value =
-            serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut sessions_table = write_txn.open_table(SESSIONS)?;
-            sessions_table.insert(key.as_str(), session_value.as_slice())?;
-
-            let mut states_table = write_txn.open_table(PIPELINE_STATES)?;
-            states_table.insert(room_id, state_value.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.write(|txn| {
+            txn.put_session(session)?;
+            txn.put_room_pipeline_state(room_id, state, Some(session.id))
+        })
     }
 
     pub fn put_pipeline_state(&self, room_id: u64, state: PipelineState) -> AppResult<()> {
-        self.put_room_pipeline_state(room_id, state, None)
+        self.write(|txn| txn.put_room_pipeline_state(room_id, state, None))
     }
 
     pub fn put_room_pipeline_state(
@@ -126,19 +125,7 @@ impl StateStore {
         state: PipelineState,
         active_session_id: Option<Uuid>,
     ) -> AppResult<()> {
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(PIPELINE_STATES)?;
-            let room_state = RoomPipelineState {
-                state,
-                active_session_id,
-            };
-            let value =
-                serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
-            table.insert(room_id, value.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.write(|txn| txn.put_room_pipeline_state(room_id, state, active_session_id))
     }
 
     pub fn get_pipeline_state(&self, room_id: u64) -> AppResult<Option<PipelineState>> {
@@ -174,16 +161,7 @@ impl StateStore {
     }
 
     pub fn put_segment(&self, segment: &Segment) -> AppResult<()> {
-        let key = format!("{}:{:010}", segment.session_id, segment.index);
-        let value = serde_json::to_vec(segment)
-            .map_err(|e| AppError::State(format!("serialize segment: {e}")))?;
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SEGMENTS)?;
-            table.insert(key.as_str(), value.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.write(|txn| txn.put_segment(segment))
     }
 
     pub fn list_segments(&self, session_id: Uuid) -> AppResult<Vec<Segment>> {
@@ -305,29 +283,11 @@ impl StateStore {
     }
 
     pub fn put_uploaded_part(&self, part: &UploadedPart) -> AppResult<()> {
-        let key = format!("{}:{:010}", part.session_id, part.segment_index);
-        let value = serde_json::to_vec(part)
-            .map_err(|e| AppError::State(format!("serialize uploaded part: {e}")))?;
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(UPLOADED_PARTS)?;
-            table.insert(key.as_str(), value.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.write(|txn| txn.put_uploaded_part(part))
     }
 
     pub fn put_submission(&self, submission: &Submission) -> AppResult<()> {
-        let key = submission.session_id.to_string();
-        let value = serde_json::to_vec(submission)
-            .map_err(|e| AppError::State(format!("serialize submission: {e}")))?;
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(SUBMISSIONS)?;
-            table.insert(key.as_str(), value.as_slice())?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        self.write(|txn| txn.put_submission(submission))
     }
 
     pub fn list_uploaded_parts(&self, session_id: Uuid) -> AppResult<Vec<UploadedPart>> {
@@ -358,6 +318,82 @@ impl StateStore {
                 let submission: Submission = serde_json::from_slice(v.value())
                     .map_err(|e| AppError::State(format!("deserialize submission: {e}")))?;
                 Ok(Some(submission))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// A handle to an in-progress write transaction, handed to the closure passed
+/// to [`StateStore::write`]. Each method opens its table, inserts, and releases
+/// it, so multiple calls compose into one atomic commit. Reads still go through
+/// `StateStore` directly.
+pub struct StoreTxn<'a> {
+    txn: &'a redb::WriteTransaction,
+}
+
+impl StoreTxn<'_> {
+    pub fn put_session(&self, session: &LiveSession) -> AppResult<()> {
+        let key = session.id.to_string();
+        let value = serde_json::to_vec(session)
+            .map_err(|e| AppError::State(format!("serialize session: {e}")))?;
+        let mut table = self.txn.open_table(SESSIONS)?;
+        table.insert(key.as_str(), value.as_slice())?;
+        Ok(())
+    }
+
+    pub fn put_segment(&self, segment: &Segment) -> AppResult<()> {
+        let key = format!("{}:{:010}", segment.session_id, segment.index);
+        let value = serde_json::to_vec(segment)
+            .map_err(|e| AppError::State(format!("serialize segment: {e}")))?;
+        let mut table = self.txn.open_table(SEGMENTS)?;
+        table.insert(key.as_str(), value.as_slice())?;
+        Ok(())
+    }
+
+    pub fn put_uploaded_part(&self, part: &UploadedPart) -> AppResult<()> {
+        let key = format!("{}:{:010}", part.session_id, part.segment_index);
+        let value = serde_json::to_vec(part)
+            .map_err(|e| AppError::State(format!("serialize uploaded part: {e}")))?;
+        let mut table = self.txn.open_table(UPLOADED_PARTS)?;
+        table.insert(key.as_str(), value.as_slice())?;
+        Ok(())
+    }
+
+    pub fn put_submission(&self, submission: &Submission) -> AppResult<()> {
+        let key = submission.session_id.to_string();
+        let value = serde_json::to_vec(submission)
+            .map_err(|e| AppError::State(format!("serialize submission: {e}")))?;
+        let mut table = self.txn.open_table(SUBMISSIONS)?;
+        table.insert(key.as_str(), value.as_slice())?;
+        Ok(())
+    }
+
+    pub fn put_room_pipeline_state(
+        &self,
+        room_id: u64,
+        state: PipelineState,
+        active_session_id: Option<Uuid>,
+    ) -> AppResult<()> {
+        let room_state = RoomPipelineState {
+            state,
+            active_session_id,
+        };
+        let value =
+            serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
+        let mut table = self.txn.open_table(PIPELINE_STATES)?;
+        table.insert(room_id, value.as_slice())?;
+        Ok(())
+    }
+
+    pub fn get_segment(&self, session_id: Uuid, index: u32) -> AppResult<Option<Segment>> {
+        let key = format!("{}:{:010}", session_id, index);
+        let table = self.txn.open_table(SEGMENTS)?;
+        match table.get(key.as_str())? {
+            Some(v) => {
+                let segment: Segment = serde_json::from_slice(v.value())
+                    .map_err(|e| AppError::State(format!("deserialize segment: {e}")))?;
+                Ok(Some(segment))
             }
             None => Ok(None),
         }
@@ -573,5 +609,62 @@ mod tests {
         let loaded = store.get_room_pipeline_state(42).unwrap().unwrap();
         assert_eq!(loaded.state, PipelineState::Recording);
         assert_eq!(loaded.active_session_id, Some(session_id));
+    }
+
+    #[test]
+    fn write_commits_all_rows_atomically() {
+        let (store, _dir) = test_store();
+        let session = LiveSession {
+            id: Uuid::new_v4(),
+            room_key: "atomic".to_string(),
+            title: "t".to_string(),
+            started_at: Timestamp::now(),
+            status: SessionStatus::Recording,
+            record_credential: None,
+            upload_credential: None,
+        };
+        let seg = finalized_segment(session.id, 0, PathBuf::from("/tmp/a.flv"));
+
+        store
+            .write(|txn| {
+                txn.put_session(&session)?;
+                txn.put_segment(&seg)?;
+                txn.put_room_pipeline_state(7, PipelineState::Recording, Some(session.id))
+            })
+            .unwrap();
+
+        assert!(store.get_session(session.id).unwrap().is_some());
+        assert_eq!(store.list_segments(session.id).unwrap().len(), 1);
+        assert_eq!(
+            store.get_pipeline_state(7).unwrap(),
+            Some(PipelineState::Recording)
+        );
+    }
+
+    #[test]
+    fn write_rolls_back_every_row_when_closure_errors() {
+        let (store, _dir) = test_store();
+        let session = LiveSession {
+            id: Uuid::new_v4(),
+            room_key: "rollback".to_string(),
+            title: "t".to_string(),
+            started_at: Timestamp::now(),
+            status: SessionStatus::Recording,
+            record_credential: None,
+            upload_credential: None,
+        };
+        let seg = finalized_segment(session.id, 0, PathBuf::from("/tmp/a.flv"));
+
+        let result = store.write(|txn| {
+            // First two writes succeed within the transaction, but the closure
+            // then refuses: nothing it wrote should survive the abort.
+            txn.put_session(&session)?;
+            txn.put_segment(&seg)?;
+            Err::<(), _>(AppError::State("deliberate failure".to_string()))
+        });
+
+        assert!(result.is_err());
+        assert!(store.get_session(session.id).unwrap().is_none());
+        assert!(store.list_segments(session.id).unwrap().is_empty());
     }
 }

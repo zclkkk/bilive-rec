@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::error::AppResult;
-use crate::state::model::{SegmentStatus, SubmissionStatus, UploadedPart};
-use crate::state::store::StateStore;
+use crate::state::model::{Segment, SegmentStatus, SubmissionStatus, UploadedPart};
+use crate::state::store::{StateStore, StoreTxn};
 use crate::uploader::types::{UploadRequest, Uploader};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,16 +39,21 @@ pub async fn upload_and_persist_segment<U: Uploader + ?Sized>(
     part_title: String,
 ) -> Result<UploadedPart, PersistedUploadFailure> {
     let index = segment.segment_index;
-    set_segment_status(store, &segment, SegmentStatus::Uploading, None).map_err(|error| {
-        PersistedUploadFailure::StateBeforeRemote {
+
+    // Atomic: flip to Uploading before the remote call.
+    store
+        .write(|txn| set_segment_status_txn(txn, &segment, SegmentStatus::Uploading, None))
+        .map_err(|error| PersistedUploadFailure::StateBeforeRemote {
             index,
             error: error.to_string(),
-        }
-    })?;
+        })?;
 
     let req = segment.clone().into_request(part_title);
     let uploaded_part = uploader.upload_segment(req).await.map_err(|error| {
-        let reset_result = set_segment_status(store, &segment, SegmentStatus::Finalized, None);
+        // Best-effort rollback; if the store is broken too, report both.
+        let reset_result = store.write(|txn| {
+            set_segment_status_txn(txn, &segment, SegmentStatus::Finalized, None)
+        });
         match reset_result {
             Ok(()) => PersistedUploadFailure::Remote {
                 index,
@@ -63,39 +68,32 @@ pub async fn upload_and_persist_segment<U: Uploader + ?Sized>(
         }
     })?;
 
-    store.put_uploaded_part(&uploaded_part).map_err(|error| {
-        PersistedUploadFailure::StateAfterRemote {
+    // Atomic: persist the uploaded part and advance the segment status in one
+    // transaction so recovery always sees a consistent pair.
+    store
+        .write(|txn| {
+            txn.put_uploaded_part(&uploaded_part)?;
+            set_segment_status_txn(txn, &segment, SegmentStatus::Uploaded, None)
+        })
+        .map_err(|error| PersistedUploadFailure::StateAfterRemote {
             index,
             error: format!(
                 "remote filename {}, persistence error: {}",
                 uploaded_part.bili_filename, error
             ),
-        }
-    })?;
-
-    set_segment_status(store, &segment, SegmentStatus::Uploaded, None).map_err(|error| {
-        PersistedUploadFailure::StateAfterRemote {
-            index,
-            error: format!(
-                "remote filename {} persisted, but segment status update failed: {}",
-                uploaded_part.bili_filename, error
-            ),
-        }
-    })?;
+        })?;
 
     Ok(uploaded_part)
 }
 
-fn set_segment_status(
-    store: &StateStore,
+fn set_segment_status_txn(
+    txn: &StoreTxn<'_>,
     segment: &FinalizedSegmentForUpload,
     status: SegmentStatus,
     error: Option<String>,
 ) -> AppResult<()> {
-    let segments = store.list_segments(segment.session_id)?;
-    let mut stored = segments
-        .into_iter()
-        .find(|stored| stored.index == segment.segment_index)
+    let mut stored = txn
+        .get_segment(segment.session_id, segment.segment_index)?
         .ok_or_else(|| {
             crate::error::AppError::State(format!(
                 "segment {}/{} not found",
@@ -104,7 +102,7 @@ fn set_segment_status(
         })?;
     stored.status = status;
     stored.error = error;
-    store.put_segment(&stored)
+    txn.put_segment(&stored)
 }
 
 pub fn validate_finalized_segment_for_upload(
