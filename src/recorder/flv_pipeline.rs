@@ -256,7 +256,10 @@ pub(super) struct MediaGroupBuffer {
 pub(super) enum MediaGroupFlush {
     Empty,
     Unique(Vec<FlvTag>),
-    Duplicate { threshold_exceeded: bool, media_tags: usize },
+    Duplicate {
+        threshold_exceeded: bool,
+        media_tags: usize,
+    },
 }
 
 impl MediaGroupBuffer {

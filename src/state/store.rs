@@ -393,8 +393,7 @@ impl StoreTxn<'_> {
             state,
             active_session_id,
         };
-        let value =
-            serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
+        let value = serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
         let mut table = self.txn.open_table(PIPELINE_STATES)?;
         table.insert(room_id, value.as_slice())?;
         Ok(())
