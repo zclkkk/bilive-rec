@@ -147,6 +147,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "biliup"
 version = "0.2.4"
+source = "git+https://github.com/biliup/biliup.git?rev=62bd16de8e952328d9c1b84eeb555cdbdf024b35#62bd16de8e952328d9c1b84eeb555cdbdf024b35"
 dependencies = [
  "async-trait",
  "base64",

@@ -18,7 +18,7 @@ jiff = { version = "0.2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 md5 = "0.7"
-biliup = { version = "0.2.4", path = "vendor/biliup/crates/biliup" }
+biliup = { git = "https://github.com/biliup/biliup.git", rev = "62bd16de8e952328d9c1b84eeb555cdbdf024b35" }
 futures = "0.3.32"
 
 [dev-dependencies]
