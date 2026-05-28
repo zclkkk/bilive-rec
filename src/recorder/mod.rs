@@ -69,6 +69,11 @@ pub struct FlvRecorder<'a> {
     event_tx: mpsc::UnboundedSender<SegmentEvent>,
 
     buffer: Vec<u8>,
+    /// Number of leading bytes in `buffer` already parsed into tags. Advancing
+    /// this is O(1); the consumed prefix is compacted away in one drain at the
+    /// end of `push_chunk` instead of draining from the front per tag (which is
+    /// O(n) each and O(n²) across a chunk).
+    read_pos: usize,
     header: Option<FlvHeader>,
     normalizer: FlvNormalizer,
     media_group: MediaGroupBuffer,
@@ -99,6 +104,7 @@ impl<'a> FlvRecorder<'a> {
             store,
             event_tx,
             buffer: Vec::new(),
+            read_pos: 0,
             header: None,
             normalizer: FlvNormalizer::new(),
             media_group: MediaGroupBuffer::new(),
@@ -111,8 +117,8 @@ impl<'a> FlvRecorder<'a> {
         self.buffer.extend_from_slice(chunk);
 
         if self.header.is_none() {
-            if self.buffer.len() >= 13 {
-                let mut cursor = std::io::Cursor::new(&self.buffer);
+            if self.buffer.len() - self.read_pos >= 13 {
+                let mut cursor = std::io::Cursor::new(&self.buffer[self.read_pos..]);
                 let h = FlvHeader::read(&mut cursor)
                     .map_err(|e| AppError::Bilibili(format!("FLV header error: {}", e)))?;
                 let prev_size = read_previous_tag_size(&mut cursor)
@@ -124,27 +130,31 @@ impl<'a> FlvRecorder<'a> {
                     )));
                 }
                 self.header = Some(h);
-                self.buffer.drain(..13);
+                self.read_pos += 13;
             } else {
                 return Ok(());
             }
         }
 
-        while self.buffer.len() >= 11 {
-            let mut cursor = std::io::Cursor::new(&self.buffer);
+        while self.buffer.len() - self.read_pos >= 11 {
+            let mut cursor = std::io::Cursor::new(&self.buffer[self.read_pos..]);
             let tag_header = match FlvTagHeader::read(&mut cursor) {
                 Ok(th) => th,
                 Err(e) => return Err(AppError::Bilibili(format!("FLV tag header error: {}", e))),
             };
 
             let total_needed = 11 + (tag_header.data_size as usize) + 4;
-            if self.buffer.len() < total_needed {
+            if self.buffer.len() - self.read_pos < total_needed {
                 break;
             }
 
             cursor.set_position(0);
             let tag = FlvTag::read(&mut cursor)
                 .map_err(|e| AppError::Bilibili(format!("FLV tag read error: {}", e)))?;
+            // The tag is fully parsed; advance past it before any fallible work
+            // so all paths (including `continue` and `?`) leave the cursor
+            // consistent. The consumed prefix is compacted once below.
+            self.read_pos += total_needed;
 
             if self.normalizer.is_cache_tag(&tag) {
                 self.flush_pending_media_group(PendingMediaFlush::Normal)
@@ -154,7 +164,6 @@ impl<'a> FlvRecorder<'a> {
             let recording = matches!(self.phase, RecordPhase::Recording(_));
             let action = self.normalizer.observe_tag(tag, recording)?;
             let NormalizedAction::Write { tag, is_keyframe } = action else {
-                self.buffer.drain(..total_needed);
                 continue;
             };
 
@@ -165,22 +174,29 @@ impl<'a> FlvRecorder<'a> {
                     allow_keyframe_rotation = false;
                 } else {
                     // Drop tags until we sync on a keyframe with all headers.
-                    self.buffer.drain(..total_needed);
                     continue;
                 }
             }
 
             if self.normalizer.has_pending_header_change() && !is_keyframe {
-                self.buffer.drain(..total_needed);
                 continue;
             }
 
             self.queue_media_tag(tag, is_keyframe, allow_keyframe_rotation)
                 .await?;
-            self.buffer.drain(..total_needed);
         }
 
+        self.compact_buffer();
         Ok(())
+    }
+
+    /// Drop the already-parsed prefix of `buffer`, keeping only the bytes of an
+    /// incomplete trailing tag. Runs in one O(remaining) move per chunk.
+    fn compact_buffer(&mut self) {
+        if self.read_pos > 0 {
+            self.buffer.drain(..self.read_pos);
+            self.read_pos = 0;
+        }
     }
 
     async fn queue_media_tag(
@@ -596,6 +612,10 @@ impl<'a> FlvRecorder<'a> {
     }
 
     pub async fn finalize(&mut self, close_reason: SegmentCloseReason) -> AppResult<()> {
+        // If `push_chunk` returned mid-loop (e.g. repeated-data break), the
+        // parsed prefix may not have been compacted yet. Drop it first so the
+        // warning reflects only the incomplete trailing tag.
+        self.compact_buffer();
         if !self.buffer.is_empty() {
             tracing::warn!(
                 leftover_bytes = self.buffer.len(),
