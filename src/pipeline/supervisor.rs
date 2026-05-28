@@ -278,6 +278,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 validate_session_credentials(&session, &expected_credentials)?;
                 supervisor.active_session_id = Some(session_id);
             }
+            if room_state.state == PipelineState::WaitingReconnect {
+                supervisor.offline_since = Some(Instant::now());
+            }
         }
 
         Ok(supervisor)
@@ -327,15 +330,20 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         }
         if next == PipelineState::WaitingReconnect && prev != PipelineState::WaitingReconnect {
             self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+            self.offline_since.get_or_insert_with(Instant::now);
         }
         if matches!(
             next,
             PipelineState::Recording
                 | PipelineState::Uploading
+                | PipelineState::Resolving
+                | PipelineState::Offline
                 | PipelineState::Submitted
+                | PipelineState::Failed
                 | PipelineState::Idle
         ) {
             self.reconnect_attempt = 0;
+            self.offline_since = None;
         }
         self.session.state = next;
         info!(room_id = self.room_id, from = ?prev, to = ?next, "Pipeline state transition");
@@ -402,9 +410,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         )?;
                         self.active_session_id = Some(session_id);
                         self.apply_transition(PipelineState::Recording)?;
-                        self.offline_since = None;
                     } else {
-                        self.offline_since = None;
                         self.transition(PipelineState::Recording)?;
                     }
                 } else if self.session.state == PipelineState::Resolving {
@@ -652,20 +658,13 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
     /// Decide whether to keep retrying the stream or give up and finalize the
     /// session for upload, based on the offline grace window.
     fn step_waiting_reconnect(&mut self) -> AppResult<()> {
-        if self.offline_since.is_none() {
-            self.offline_since = Some(Instant::now());
-        }
+        let since = self.offline_since.get_or_insert_with(Instant::now);
 
-        if let Some(since) = self.offline_since {
-            if since.elapsed().as_secs() > self.config.offline_grace_s {
-                info!("Offline grace period expired. Transitioning to Uploading.");
-                self.transition(PipelineState::Uploading)?;
-            } else {
-                // Not expired yet, try to resolve again
-                self.transition(PipelineState::ReResolving)?;
-            }
-        } else {
+        if since.elapsed().as_secs() > self.config.offline_grace_s {
+            info!("Offline grace period expired. Transitioning to Uploading.");
             self.transition(PipelineState::Uploading)?;
+        } else {
+            self.transition(PipelineState::ReResolving)?;
         }
         Ok(())
     }
@@ -1014,7 +1013,6 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             }
             PipelineState::Submitted => {
                 self.active_session_id = None;
-                self.offline_since = None;
                 self.transition(PipelineState::Idle)?;
             }
             PipelineState::Failed => {
@@ -1275,6 +1273,78 @@ mod tests {
         assert_eq!(
             store.get_pipeline_state(room_id).unwrap(),
             Some(PipelineState::Resolving)
+        );
+    }
+
+    #[test]
+    fn test_offline_grace_starts_when_entering_waiting_reconnect() {
+        let mut supervisor = mock_supervisor();
+        let session_id = put_recording_session(&supervisor.store, 1);
+        supervisor.session.state = PipelineState::Recording;
+        supervisor.active_session_id = Some(session_id);
+
+        assert!(supervisor.offline_since.is_none());
+
+        supervisor
+            .transition(PipelineState::WaitingReconnect)
+            .unwrap();
+
+        assert!(
+            supervisor.offline_since.is_some(),
+            "offline grace must start at the transition, before the main loop sleeps"
+        );
+    }
+
+    #[test]
+    fn test_waiting_reconnect_uses_existing_offline_grace_anchor() {
+        let mut supervisor = mock_supervisor();
+        let session_id = put_recording_session(&supervisor.store, 1);
+        supervisor.config.offline_grace_s = 1;
+        supervisor.session.state = PipelineState::Recording;
+        supervisor.active_session_id = Some(session_id);
+
+        supervisor
+            .transition(PipelineState::WaitingReconnect)
+            .unwrap();
+        supervisor.offline_since = Some(Instant::now() - std::time::Duration::from_secs(2));
+
+        supervisor.step_waiting_reconnect().unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::Uploading);
+        assert!(
+            supervisor.offline_since.is_none(),
+            "leaving reconnect lifecycle should clear the grace anchor"
+        );
+    }
+
+    #[test]
+    fn test_resume_waiting_reconnect_starts_grace_from_resume() {
+        let store =
+            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
+        let session_id = put_recording_session(&store, 1);
+        store
+            .put_room_pipeline_state(1, PipelineState::WaitingReconnect, Some(session_id))
+            .unwrap();
+
+        let (_, rx) = tokio::sync::watch::channel(false);
+        let supervisor = RoomSupervisor::new(
+            1,
+            PipelineConfig::default(),
+            test_room_config(),
+            RoomSupervisorDeps {
+                store,
+                client: Arc::new(BiliClient::new(None).unwrap()),
+                uploader: Arc::new(FakeUploader::new()),
+            },
+            rx,
+        )
+        .unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::WaitingReconnect);
+        assert_eq!(supervisor.active_session_id, Some(session_id));
+        assert!(
+            supervisor.offline_since.is_some(),
+            "resumed WaitingReconnect cannot know the old monotonic instant, so it starts grace at resume"
         );
     }
 
