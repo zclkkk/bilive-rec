@@ -256,7 +256,7 @@ pub(super) struct MediaGroupBuffer {
 pub(super) enum MediaGroupFlush {
     Empty,
     Unique(Vec<FlvTag>),
-    Duplicate { reconnect: bool, media_tags: usize },
+    Duplicate { threshold_exceeded: bool, media_tags: usize },
 }
 
 impl MediaGroupBuffer {
@@ -297,14 +297,14 @@ impl MediaGroupBuffer {
             MediaGroupDecision::Duplicate => {
                 self.pending.clear();
                 MediaGroupFlush::Duplicate {
-                    reconnect: false,
+                    threshold_exceeded: false,
                     media_tags,
                 }
             }
             MediaGroupDecision::Reconnect => {
                 self.pending.clear();
                 MediaGroupFlush::Duplicate {
-                    reconnect: true,
+                    threshold_exceeded: true,
                     media_tags,
                 }
             }

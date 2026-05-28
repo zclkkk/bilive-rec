@@ -42,10 +42,18 @@ enum RecordPhase {
     Recording(Box<ActiveSegment>),
 }
 
+/// Controls how duplicate media groups are handled during a flush.
+///
+/// During normal streaming, hitting the duplicate-threshold is a hard
+/// error — the stream is stuck and must reconnect. During segment finalization
+/// the same condition is benign: the segment is being closed regardless, so the
+/// duplicate group is simply dropped without triggering a reconnect.
 #[derive(Debug, Clone, Copy)]
 enum PendingMediaFlush {
-    Normal,
-    Final,
+    /// Stream is live; threshold-exceeded duplicates trigger reconnect.
+    DuringStream,
+    /// Segment is finalizing; threshold-exceeded duplicates are silently dropped.
+    FinalizeSegment,
 }
 
 struct InitialSegmentWrite {
@@ -157,7 +165,7 @@ impl<'a> FlvRecorder<'a> {
             self.read_pos += total_needed;
 
             if self.normalizer.is_cache_tag(&tag) {
-                self.flush_pending_media_group(PendingMediaFlush::Normal)
+                self.flush_pending_media_group(PendingMediaFlush::DuringStream)
                     .await?;
             }
 
@@ -206,7 +214,7 @@ impl<'a> FlvRecorder<'a> {
         allow_keyframe_rotation: bool,
     ) -> AppResult<()> {
         if self.media_group.should_start_new_group(&tag, is_keyframe) {
-            self.flush_pending_media_group(PendingMediaFlush::Normal)
+            self.flush_pending_media_group(PendingMediaFlush::DuringStream)
                 .await?;
         }
 
@@ -278,20 +286,20 @@ impl<'a> FlvRecorder<'a> {
                 }
             }
             MediaGroupFlush::Duplicate {
-                reconnect: false,
+                threshold_exceeded: false,
                 media_tags,
             } => {
                 tracing::warn!(media_tags, "dropping duplicated FLV media group");
             }
             MediaGroupFlush::Duplicate {
-                reconnect: true,
+                threshold_exceeded: true,
                 media_tags,
             } => {
                 tracing::warn!(
                     media_tags,
-                    "dropping duplicated FLV media group after reconnect threshold"
+                    "dropping duplicated FLV media group — reconnect threshold exceeded"
                 );
-                if matches!(mode, PendingMediaFlush::Final) {
+                if matches!(mode, PendingMediaFlush::FinalizeSegment) {
                     return Ok(());
                 }
                 return Err(AppError::StreamRepeatedData(
@@ -623,7 +631,7 @@ impl<'a> FlvRecorder<'a> {
             );
             self.buffer.clear();
         }
-        self.flush_pending_media_group(PendingMediaFlush::Final)
+        self.flush_pending_media_group(PendingMediaFlush::FinalizeSegment)
             .await?;
         self.finalize_current_segment(close_reason).await?;
         Ok(())
