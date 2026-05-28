@@ -24,13 +24,19 @@ use crate::state::store::StateStore;
 use crate::submission_template::render_room_template;
 use crate::uploader::types::{SubmissionOutcome, SubmissionRequest, Uploader};
 use crate::uploader::validation::{
-    PersistedUploadFailure, upload_and_persist_segment, validate_finalized_segment_for_upload,
+    PersistedUploadFailure, reconcile_session_uploads, upload_and_persist_segment,
+    validate_finalized_segment_for_upload,
 };
 
+/// A background upload task's outcome that the supervisor cannot safely
+/// reconcile on its own. Recoverable failures (clean remote errors, failed
+/// preconditions) are intentionally absent: the task logs them and continues,
+/// leaving the leftover `Finalized` segments for store-based reconciliation.
 #[derive(Debug)]
 enum BackgroundUploadFailure {
-    Reconcileable { index: u32, error: String },
+    /// Could not even persist the pre-upload intent — the store is unreliable.
     FatalState { index: u32, error: String },
+    /// Remote upload may have succeeded but durable state could not be written.
     Ambiguous { index: u32, error: String },
 }
 
@@ -55,50 +61,23 @@ fn pipeline_state_requires_active_session(state: PipelineState) -> bool {
 
 fn ensure_session_ready_to_submit(store: &StateStore, session_id: Uuid) -> AppResult<()> {
     let segments = store.list_segments(session_id)?;
-    let uploaded_parts = store.list_uploaded_parts(session_id)?;
-    let uploaded_indices: std::collections::HashSet<u32> = uploaded_parts
+    let uploaded_indices: std::collections::HashSet<u32> = store
+        .list_uploaded_parts(session_id)?
         .into_iter()
         .map(|part| part.segment_index)
         .collect();
 
-    for segment in &segments {
-        match segment.status {
-            SegmentStatus::Finalized | SegmentStatus::Uploaded => {
-                if !uploaded_indices.contains(&segment.index) {
-                    return Err(AppError::State(format!(
-                        "Segment {} is {:?} but has no UploadedPart; refusing submission",
-                        segment.index, segment.status
-                    )));
-                }
-            }
-            SegmentStatus::Uploading => {
-                return Err(AppError::State(format!(
-                    "Segment {} is Uploading; upload outcome is ambiguous, refusing submission",
-                    segment.index
-                )));
-            }
-            SegmentStatus::Recording => {
-                return Err(AppError::State(format!(
-                    "Segment {} is still Recording; refusing submission",
-                    segment.index
-                )));
-            }
-            SegmentStatus::Failed => {
-                return Err(AppError::State(format!(
-                    "Segment {} is Failed; refusing submission",
-                    segment.index
-                )));
-            }
-            SegmentStatus::Cleaned => {
-                return Err(AppError::State(format!(
-                    "Segment {} was cleaned before submission; refusing submission",
-                    segment.index
-                )));
-            }
-            SegmentStatus::Filtered => {}
-        }
+    let report = reconcile_session_uploads(&segments, &uploaded_indices);
+    if let Some((index, reason)) = report.blocked.first() {
+        return Err(AppError::State(format!(
+            "Segment {index} blocks submission: {reason}"
+        )));
     }
-
+    if let Some(index) = report.needs_upload.first() {
+        return Err(AppError::State(format!(
+            "Segment {index} is Finalized but has no UploadedPart; refusing submission"
+        )));
+    }
     Ok(())
 }
 
@@ -450,9 +429,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
     /// spawning a background task that uploads finalized segments as they
     /// arrive. Transient failures fall back to `WaitingReconnect`.
     async fn step_recording(&mut self) -> AppResult<()> {
-        let active_session = self.active_session_id.ok_or_else(|| {
-            AppError::State("Recording state requires active_session_id".into())
-        })?;
+        let active_session = self
+            .active_session_id
+            .ok_or_else(|| AppError::State("Recording state requires active_session_id".into()))?;
 
         let policy = RecorderPolicy {
             layout: SegmentLayout {
@@ -468,9 +447,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         };
 
         let play_info =
-            match fetch_play_info(&self.client, self.room_id, self.room_config.record.qn)
-                .await
-            {
+            match fetch_play_info(&self.client, self.room_id, self.room_config.record.qn).await {
                 Ok(info) => info,
                 Err(e) => {
                     warn!("fetch_play_info failed: {}", e);
@@ -562,24 +539,21 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         ) {
                             Ok(Ok(segment)) => segment,
                             Ok(Err(reason)) => {
+                                // Precondition failed but state is clean; defer
+                                // this segment to reconciliation and keep
+                                // uploading the ones that follow.
                                 error!(
-                                    "Upload precondition failed for finalized segment {}: {}",
+                                    "Upload precondition failed for finalized segment {}: {} (deferring to reconciliation)",
                                     index, reason
                                 );
-                                return Err(BackgroundUploadFailure::Reconcileable {
-                                    index,
-                                    error: reason,
-                                });
+                                continue;
                             }
                             Err(error) => {
                                 error!(
-                                    "Failed to validate finalized segment {}: {}",
+                                    "Failed to validate finalized segment {}: {} (deferring to reconciliation)",
                                     index, error
                                 );
-                                return Err(BackgroundUploadFailure::Reconcileable {
-                                    index,
-                                    error: error.to_string(),
-                                });
+                                continue;
                             }
                         };
                         match upload_and_persist_segment(
@@ -594,40 +568,28 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                                 info!("Upload success for idx={}", index);
                             }
                             Err(PersistedUploadFailure::Remote { index, error }) => {
+                                // Remote upload failed but the segment was reset
+                                // to Finalized, so retrying it later is safe;
+                                // don't stall live uploads of later segments.
                                 error!(
-                                    "Upload segment failed for idx={}: {}",
+                                    "Upload segment failed for idx={}: {} (deferring to reconciliation)",
                                     index, error
                                 );
-                                return Err(BackgroundUploadFailure::Reconcileable {
-                                    index,
-                                    error,
-                                });
+                                continue;
                             }
-                            Err(PersistedUploadFailure::StateBeforeRemote {
-                                index,
-                                error,
-                            }) => {
+                            Err(PersistedUploadFailure::StateBeforeRemote { index, error }) => {
                                 error!(
                                     "Failed to mark segment {} as Uploading before remote upload: {}",
                                     index, error
                                 );
-                                return Err(BackgroundUploadFailure::FatalState {
-                                    index,
-                                    error,
-                                });
+                                return Err(BackgroundUploadFailure::FatalState { index, error });
                             }
-                            Err(PersistedUploadFailure::StateAfterRemote {
-                                index,
-                                error,
-                            }) => {
+                            Err(PersistedUploadFailure::StateAfterRemote { index, error }) => {
                                 error!(
                                     "Upload segment persisted remotely but not locally for idx={}: {}",
                                     index, error
                                 );
-                                return Err(BackgroundUploadFailure::Ambiguous {
-                                    index,
-                                    error,
-                                });
+                                return Err(BackgroundUploadFailure::Ambiguous { index, error });
                             }
                         }
                     }
@@ -660,42 +622,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             Err(AppError::GracefulShutdown) => {
                 info!("record_flv interrupted by graceful shutdown");
                 // event_tx was moved into record_flv and dropped on return,
-                // closing the channel. Await the upload task to let it finish
+                // closing the channel. Await the upload tasks to let them finish
                 // any in-flight upload before we exit.
-                let tasks = std::mem::take(&mut self.upload_tasks);
-                for task in tasks {
-                    match task.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(BackgroundUploadFailure::Reconcileable {
-                            index,
-                            error,
-                        })) => {
-                            warn!(
-                                "Upload task failed during shutdown for segment {} (recoverable): {}",
-                                index, error
-                            );
-                        }
-                        Ok(Err(BackgroundUploadFailure::FatalState { index, error })) => {
-                            self.transition(PipelineState::Failed)?;
-                            return Err(AppError::State(format!(
-                                "Failed to persist pre-upload state for segment {index}: {error}"
-                            )));
-                        }
-                        Ok(Err(BackgroundUploadFailure::Ambiguous { index, error })) => {
-                            self.transition(PipelineState::Failed)?;
-                            return Err(AppError::State(format!(
-                                "Remote upload for segment {index} may have succeeded, but state persistence failed during shutdown: {error}"
-                            )));
-                        }
-                        Err(e) => {
-                            self.transition(PipelineState::Failed)?;
-                            return Err(AppError::State(format!(
-                                "Background upload task panicked during shutdown; refusing automatic reconciliation: {e}"
-                            )));
-                        }
-                    }
-                }
-                // Do not transition — leave persisted state as-is
+                self.join_background_uploads().await?;
+                // Do not transition — leave persisted state as-is for resume.
                 return Err(AppError::GracefulShutdown);
             }
             Err(e) => match e {
@@ -740,25 +670,16 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         Ok(())
     }
 
-    /// Join background upload tasks and reconcile every finalized segment so the
-    /// session can only advance to `Submitting` once all parts have a durable
-    /// `UploadedPart`. Any ambiguous or fatal outcome routes to `Failed`.
-    async fn step_uploading(&mut self) -> AppResult<()> {
-        let active_session = self.active_session_id.ok_or_else(|| {
-            AppError::State("Uploading state requires active_session_id".into())
-        })?;
-
+    /// Await every background upload task and interpret its outcome. The task
+    /// already defers recoverable failures to reconciliation, so it only ever
+    /// reports outcomes that cannot be reconciled automatically: a fatal state
+    /// write, an ambiguous remote result, or a panic. Each routes the room to
+    /// `Failed` and surfaces an error.
+    async fn join_background_uploads(&mut self) -> AppResult<()> {
         let tasks = std::mem::take(&mut self.upload_tasks);
-
         for task in tasks {
             match task.await {
                 Ok(Ok(())) => {}
-                Ok(Err(BackgroundUploadFailure::Reconcileable { index, error })) => {
-                    warn!(
-                        "Background upload task failed for segment {} (will reconcile): {}",
-                        index, error
-                    );
-                }
                 Ok(Err(BackgroundUploadFailure::FatalState { index, error })) => {
                     self.transition(PipelineState::Failed)?;
                     return Err(AppError::State(format!(
@@ -779,128 +700,96 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
             }
         }
+        Ok(())
+    }
 
-        let mut reconciliation_failed = false;
+    /// Join background upload tasks, then upload every segment still missing a
+    /// durable `UploadedPart`. The session may only advance to `Submitting`
+    /// once [`reconcile_session_uploads`] reports the whole session ready;
+    /// anything blocked or still missing routes to `Failed`.
+    async fn step_uploading(&mut self) -> AppResult<()> {
+        let active_session = self
+            .active_session_id
+            .ok_or_else(|| AppError::State("Uploading state requires active_session_id".into()))?;
+
+        self.join_background_uploads().await?;
+
         let segments = self.store.list_segments(active_session)?;
-        let uploaded_parts = self.store.list_uploaded_parts(active_session)?;
-
-        let mut uploaded_indices: std::collections::HashSet<u32> = uploaded_parts
+        let uploaded_indices: std::collections::HashSet<u32> = self
+            .store
+            .list_uploaded_parts(active_session)?
             .into_iter()
             .map(|p| p.segment_index)
             .collect();
 
-        for seg in &segments {
-            match seg.status {
-                SegmentStatus::Finalized if !uploaded_indices.contains(&seg.index) => {
-                    info!("Reconciling upload for segment index {}", seg.index);
-                    match validate_finalized_segment_for_upload(
-                        &self.store,
-                        active_session,
-                        seg.index,
-                        Some(&seg.path),
-                    )? {
-                        Ok(segment) => {
-                            match upload_and_persist_segment(
-                                self.uploader.as_ref(),
-                                &self.store,
-                                segment,
-                                format!("Part {}", seg.index),
-                            )
-                            .await
-                            {
-                                Ok(part) => {
-                                    uploaded_indices.insert(part.segment_index);
-                                }
-                                Err(PersistedUploadFailure::Remote { index, error }) => {
-                                    error!(
-                                        "Reconciled upload failed for index {}: {}",
-                                        index, error
-                                    );
-                                    reconciliation_failed = true;
-                                }
-                                Err(PersistedUploadFailure::StateBeforeRemote {
-                                    index,
-                                    error,
-                                }) => {
-                                    self.transition(PipelineState::Failed)?;
-                                    return Err(AppError::State(format!(
-                                        "Failed to mark segment {index} as Uploading before reconciliation: {error}. Refusing remote upload."
-                                    )));
-                                }
-                                Err(PersistedUploadFailure::StateAfterRemote {
-                                    index,
-                                    error,
-                                }) => {
-                                    self.transition(PipelineState::Failed)?;
-                                    return Err(AppError::State(format!(
-                                        "Remote upload for segment {index} may have succeeded during reconciliation, but state persistence failed: {error}. Refusing automatic reconciliation."
-                                    )));
-                                }
-                            }
-                        }
-                        Err(reason) => {
-                            error!(
-                                "Upload precondition failed for segment {}: {}",
-                                seg.index, reason
-                            );
-                            reconciliation_failed = true;
-                        }
-                    }
-                }
-                SegmentStatus::Uploading => {
-                    error!(
-                        "Segment {} is Uploading; upload outcome is ambiguous",
-                        seg.index
-                    );
-                    reconciliation_failed = true;
-                }
-                SegmentStatus::Uploaded | SegmentStatus::Cleaned
-                    if !uploaded_indices.contains(&seg.index) =>
+        let report = reconcile_session_uploads(&segments, &uploaded_indices);
+        let mut reconciliation_failed = false;
+
+        // Segments that cannot be auto-resolved block the whole session.
+        for (index, reason) in &report.blocked {
+            error!("Segment {} blocks upload reconciliation: {}", index, reason);
+            reconciliation_failed = true;
+        }
+
+        // Upload each finalized segment that still lacks a part.
+        for index in report.needs_upload {
+            info!("Reconciling upload for segment index {}", index);
+            let path = segments
+                .iter()
+                .find(|s| s.index == index)
+                .map(|s| s.path.clone());
+            match validate_finalized_segment_for_upload(
+                &self.store,
+                active_session,
+                index,
+                path.as_deref(),
+            )? {
+                Ok(segment) => match upload_and_persist_segment(
+                    self.uploader.as_ref(),
+                    &self.store,
+                    segment,
+                    format!("Part {}", index),
+                )
+                .await
                 {
+                    Ok(_part) => {}
+                    Err(PersistedUploadFailure::Remote { index, error }) => {
+                        error!("Reconciled upload failed for index {}: {}", index, error);
+                        reconciliation_failed = true;
+                    }
+                    Err(PersistedUploadFailure::StateBeforeRemote { index, error }) => {
+                        self.transition(PipelineState::Failed)?;
+                        return Err(AppError::State(format!(
+                            "Failed to mark segment {index} as Uploading before reconciliation: {error}. Refusing remote upload."
+                        )));
+                    }
+                    Err(PersistedUploadFailure::StateAfterRemote { index, error }) => {
+                        self.transition(PipelineState::Failed)?;
+                        return Err(AppError::State(format!(
+                            "Remote upload for segment {index} may have succeeded during reconciliation, but state persistence failed: {error}. Refusing automatic reconciliation."
+                        )));
+                    }
+                },
+                Err(reason) => {
                     error!(
-                        "Segment {} is {:?} but lacks UploadedPart",
-                        seg.index, seg.status
+                        "Upload precondition failed for segment {}: {}",
+                        index, reason
                     );
                     reconciliation_failed = true;
                 }
-                SegmentStatus::Recording | SegmentStatus::Failed => {
-                    error!(
-                        "Segment {} is {:?}; refusing upload reconciliation",
-                        seg.index, seg.status
-                    );
-                    reconciliation_failed = true;
-                }
-                SegmentStatus::Finalized
-                | SegmentStatus::Uploaded
-                | SegmentStatus::Cleaned
-                | SegmentStatus::Filtered => {}
             }
         }
 
-        let final_parts = self.store.list_uploaded_parts(active_session)?;
-        let final_indices: std::collections::HashSet<u32> =
-            final_parts.into_iter().map(|p| p.segment_index).collect();
-
-        for seg in &segments {
-            match seg.status {
-                SegmentStatus::Finalized
-                | SegmentStatus::Uploaded
-                | SegmentStatus::Cleaned => {
-                    if !final_indices.contains(&seg.index) {
-                        error!(
-                            "Segment {} is {:?} but still lacks UploadedPart after reconciliation",
-                            seg.index, seg.status
-                        );
-                        reconciliation_failed = true;
-                    }
-                }
-                SegmentStatus::Uploading
-                | SegmentStatus::Recording
-                | SegmentStatus::Failed => {
-                    reconciliation_failed = true;
-                }
-                SegmentStatus::Filtered => {}
-            }
+        // Re-derive truth from the store: every segment must now be satisfied.
+        let final_segments = self.store.list_segments(active_session)?;
+        let final_indices: std::collections::HashSet<u32> = self
+            .store
+            .list_uploaded_parts(active_session)?
+            .into_iter()
+            .map(|p| p.segment_index)
+            .collect();
+        if !reconcile_session_uploads(&final_segments, &final_indices).is_ready() {
+            reconciliation_failed = true;
         }
 
         if reconciliation_failed {
@@ -915,23 +804,22 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
     /// submission row that is already definitive (Submitted/Failed) or that is
     /// in-flight/ambiguous (Pending/Ambiguous); those need manual resolution.
     async fn step_submitting(&mut self) -> AppResult<()> {
-        let active_session = self.active_session_id.ok_or_else(|| {
-            AppError::State("Submitting state requires active_session_id".into())
-        })?;
-        let session = self.store.get_session(active_session)?.ok_or_else(|| {
-            AppError::State(format!("Session {active_session} not found"))
-        })?;
+        let active_session = self
+            .active_session_id
+            .ok_or_else(|| AppError::State("Submitting state requires active_session_id".into()))?;
+        let session = self
+            .store
+            .get_session(active_session)?
+            .ok_or_else(|| AppError::State(format!("Session {active_session} not found")))?;
 
         // Check if already submitted or failed to avoid duplicate submissions
         if let Some(existing_sub) = self.store.get_submission(active_session)? {
             match existing_sub.status {
                 SubmissionStatus::Submitted => {
                     if self.room_config.record.delete_after_submit {
-                        let cleaned = cleanup_submitted_session_recordings(
-                            &self.store,
-                            active_session,
-                        )
-                        .await?;
+                        let cleaned =
+                            cleanup_submitted_session_recordings(&self.store, active_session)
+                                .await?;
                         if cleaned > 0 {
                             info!(
                                 session_id = %active_session,
@@ -976,9 +864,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             let sub = Submission {
                 session_id: active_session,
                 upload_credential: session.upload_credential.clone().ok_or_else(|| {
-                    AppError::State(format!(
-                        "Session {active_session} has no upload credential"
-                    ))
+                    AppError::State(format!("Session {active_session} has no upload credential"))
                 })?,
                 status: SubmissionStatus::Failed,
                 aid: None,
@@ -1064,8 +950,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 self.store.put_submission(&sub)?;
                 if self.room_config.record.delete_after_submit {
                     let cleaned =
-                        cleanup_submitted_session_recordings(&self.store, active_session)
-                            .await?;
+                        cleanup_submitted_session_recordings(&self.store, active_session).await?;
                     if cleaned > 0 {
                         info!(
                             session_id = %active_session,
@@ -1844,6 +1729,13 @@ mod tests {
         supervisor.session.state = PipelineState::Submitting;
 
         store
+            .put_segment(&uploaded_segment(
+                session_id,
+                0,
+                std::path::PathBuf::from("test.flv"),
+            ))
+            .unwrap();
+        store
             .put_uploaded_part(&UploadedPart {
                 session_id,
                 segment_index: 0,
@@ -2065,6 +1957,13 @@ mod tests {
         supervisor.active_session_id = Some(session_id);
         supervisor.session.state = PipelineState::Submitting;
 
+        store
+            .put_segment(&uploaded_segment(
+                session_id,
+                0,
+                std::path::PathBuf::from("test.flv"),
+            ))
+            .unwrap();
         store
             .put_uploaded_part(&UploadedPart {
                 session_id,
