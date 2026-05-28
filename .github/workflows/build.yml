@@ -83,7 +83,7 @@ jobs:
           mkdir -p staging dist
 
           install -m 755 "target/${{ matrix.target }}/release/${{ matrix.exe }}" "staging/${APP_NAME}"
-          install -m 644 config.example.toml staging/
+          install -m 644 config.example.toml LICENSE staging/
 
           tar -czf "dist/${archive}" -C staging .
           echo "archive=dist/${archive}" >> "$GITHUB_OUTPUT"
@@ -101,7 +101,7 @@ jobs:
           New-Item -ItemType Directory -Path staging, dist | Out-Null
 
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.exe }}" "staging\${{ matrix.exe }}"
-          Copy-Item config.example.toml staging\
+          Copy-Item config.example.toml LICENSE staging\
 
           Compress-Archive -Path staging\* -DestinationPath "dist\$archive" -Force
           "archive=dist/$archive" >> $env:GITHUB_OUTPUT

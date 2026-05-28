@@ -49,3 +49,7 @@ bilive-rec run
 - [CLI Reference](docs/reference/cli.md) — 命令完整用法
 - [配置字段速查](docs/reference/config-fields.md) — 所有字段的类型、默认值
 - [架构设计](docs/architecture.md) — 状态机、模块划分、故障恢复机制
+
+## License
+
+Licensed under the [Parity Public License 7.0.0](LICENSE).
