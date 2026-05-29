@@ -562,7 +562,7 @@ impl<'a> FlvRecorder<'a> {
         let h = self
             .header
             .as_ref()
-            .expect("Invariant violated: FLV header must exist when opening segment");
+            .ok_or_else(|| AppError::State("FLV header missing when opening segment".into()))?;
         h.write(&mut buf)
             .map_err(|e| AppError::StreamProtocol(format!("FLV header write error: {}", e)))?;
         crate::recorder::flv::write_previous_tag_size(&mut buf, 0).map_err(|e| {
@@ -581,7 +581,7 @@ impl<'a> FlvRecorder<'a> {
             .normalizer
             .metadata_tag
             .as_ref()
-            .expect("Invariant violated: Metadata must exist when opening segment");
+            .ok_or_else(|| AppError::State("Metadata missing when opening segment".into()))?;
         let mut meta = meta.clone();
         meta.header.timestamp = 0;
         meta.data = build_metadata_body(&meta.data, 0, &[]);
@@ -591,21 +591,17 @@ impl<'a> FlvRecorder<'a> {
         meta.write(&mut buf)
             .map_err(|e| AppError::StreamProtocol(format!("FLV metadata write error: {}", e)))?;
 
-        let avc = self
-            .normalizer
-            .avc_seq_tag
-            .as_ref()
-            .expect("Invariant violated: AVC sequence header must exist when opening segment");
+        let avc = self.normalizer.avc_seq_tag.as_ref().ok_or_else(|| {
+            AppError::State("AVC sequence header missing when opening segment".into())
+        })?;
         let mut avc = avc.clone();
         avc.header.timestamp = 0;
         avc.write(&mut buf)
             .map_err(|e| AppError::StreamProtocol(format!("FLV AVC seq write error: {}", e)))?;
 
-        let aac = self
-            .normalizer
-            .aac_seq_tag
-            .as_ref()
-            .expect("Invariant violated: AAC sequence header must exist when opening segment");
+        let aac = self.normalizer.aac_seq_tag.as_ref().ok_or_else(|| {
+            AppError::State("AAC sequence header missing when opening segment".into())
+        })?;
         let mut aac = aac.clone();
         aac.header.timestamp = 0;
         aac.write(&mut buf)
