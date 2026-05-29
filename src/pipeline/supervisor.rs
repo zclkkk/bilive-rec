@@ -822,39 +822,64 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             .get_session(active_session)?
             .ok_or_else(|| AppError::State(format!("Session {active_session} not found")))?;
 
-        // Check if already submitted or failed to avoid duplicate submissions
-        if let Some(existing_sub) = self.store.get_submission(active_session)? {
-            match existing_sub.status {
-                SubmissionStatus::Submitted => {
-                    if self.room_config.record.delete_after_submit {
-                        let cleaned =
-                            cleanup_submitted_session_recordings(&self.store, active_session)
-                                .await?;
-                        if cleaned > 0 {
-                            info!(
-                                session_id = %active_session,
-                                cleaned,
-                                "Deleted local recordings after confirmed submission"
-                            );
-                        }
-                    }
-                    self.transition(PipelineState::Submitted)?;
-                    return Ok(());
-                }
-                SubmissionStatus::Failed => {
-                    self.transition(PipelineState::Failed)?;
-                    return Err(AppError::State("Submission previously failed. Requires Phase 6 recovery or manual intervention.".into()));
-                }
-                SubmissionStatus::Pending => {
-                    return Err(AppError::State("Pending submission is unknown/in-flight and requires Phase 6 recovery/manual verification.".into()));
-                }
-                SubmissionStatus::Ambiguous => {
-                    return Err(AppError::State("Ambiguous submission — Bilibili accepted but did not return aid/bvid; resolve via `state resolve-submission <session_id> --as submitted|failed`.".into()));
-                }
-            }
+        if self.handle_existing_submission(active_session).await? {
+            return Ok(());
         }
 
-        // No submission row exists here: every Some(_) branch above returned.
+        let req = self.prepare_submission_request(active_session, &session)?;
+        self.submit_and_record_outcome(active_session, &session, req)
+            .await
+    }
+
+    /// If a submission row already exists, handle it according to its status.
+    /// Returns `true` if the caller should return immediately (the submission
+    /// is already resolved, failed, or ambiguous).
+    async fn handle_existing_submission(&mut self, session_id: Uuid) -> AppResult<bool> {
+        let Some(existing_sub) = self.store.get_submission(session_id)? else {
+            return Ok(false);
+        };
+
+        match existing_sub.status {
+            SubmissionStatus::Submitted => {
+                if self.room_config.record.delete_after_submit {
+                    let cleaned =
+                        cleanup_submitted_session_recordings(&self.store, session_id).await?;
+                    if cleaned > 0 {
+                        info!(
+                            session_id = %session_id,
+                            cleaned,
+                            "Deleted local recordings after confirmed submission"
+                        );
+                    }
+                }
+                self.transition(PipelineState::Submitted)?;
+                Ok(true)
+            }
+            SubmissionStatus::Failed => {
+                self.transition(PipelineState::Failed)?;
+                Err(AppError::State(
+                    "Submission previously failed. Requires Phase 6 recovery or manual intervention."
+                        .into(),
+                ))
+            }
+            SubmissionStatus::Pending => Err(AppError::State(
+                "Pending submission is unknown/in-flight and requires Phase 6 recovery/manual verification."
+                    .into(),
+            )),
+            SubmissionStatus::Ambiguous => Err(AppError::State(
+                "Ambiguous submission — Bilibili accepted but did not return aid/bvid; resolve via `state resolve-submission <session_id> --as submitted|failed`."
+                    .into(),
+            )),
+        }
+    }
+
+    /// Finalize the session, validate readiness, collect parts, and build the
+    /// submission request. Fails the pipeline on validation errors.
+    fn prepare_submission_request(
+        &mut self,
+        session_id: Uuid,
+        session: &LiveSession,
+    ) -> AppResult<SubmissionRequest> {
         // Mark the LiveSession finalized if it is still Recording.
         if session.status == SessionStatus::Recording {
             let mut finalized_session = session.clone();
@@ -862,19 +887,19 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             self.store.put_session(&finalized_session)?;
         }
 
-        if let Err(e) = ensure_session_ready_to_submit(&self.store, active_session) {
+        if let Err(e) = ensure_session_ready_to_submit(&self.store, session_id) {
             self.transition(PipelineState::Failed)?;
             return Err(e);
         }
 
-        let mut parts = self.store.list_uploaded_parts(active_session)?;
+        let mut parts = self.store.list_uploaded_parts(session_id)?;
         parts.sort_by_key(|p| p.segment_index);
 
         if parts.is_empty() {
             let sub = Submission {
-                session_id: active_session,
+                session_id,
                 upload_credential: session.upload_credential.clone().ok_or_else(|| {
-                    AppError::State(format!("Session {active_session} has no upload credential"))
+                    AppError::State(format!("Session {session_id} has no upload credential"))
                 })?,
                 status: SubmissionStatus::Failed,
                 aid: None,
@@ -896,7 +921,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     template,
                     &self.room_config.name,
                     &self.room_config.url,
-                    Some(&session),
+                    Some(session),
                     self.room_id,
                 )
             })
@@ -912,7 +937,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                     template,
                     &self.room_config.name,
                     &self.room_config.url,
-                    Some(&session),
+                    Some(session),
                     self.room_id,
                 )
             })
@@ -920,7 +945,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             .unwrap_or_default();
         let submit = &self.room_config.submit;
 
-        let req = SubmissionRequest {
+        Ok(SubmissionRequest {
             title,
             description,
             category_id: submit.category_id,
@@ -935,15 +960,23 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             close_danmu: submit.close_danmu,
             featured_reply: submit.featured_reply,
             parts,
-        };
+        })
+    }
 
-        // No submission row exists here (handled above), so persist a fresh
-        // Pending row before the remote call — an interrupted submit must be
-        // recoverable, never silently lost.
+    /// Persist a Pending submission row, call the remote submit API, and record
+    /// the outcome. The Pending row guarantees crash-recoverability: if the
+    /// process dies between persisting and the remote call, recovery will see
+    /// Pending and ask the operator to verify.
+    async fn submit_and_record_outcome(
+        &mut self,
+        session_id: Uuid,
+        session: &LiveSession,
+        req: SubmissionRequest,
+    ) -> AppResult<()> {
         let mut sub = Submission {
-            session_id: active_session,
+            session_id,
             upload_credential: session.upload_credential.clone().ok_or_else(|| {
-                AppError::State(format!("Session {active_session} has no upload credential"))
+                AppError::State(format!("Session {session_id} has no upload credential"))
             })?,
             status: SubmissionStatus::Pending,
             aid: None,
@@ -960,10 +993,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 self.store.put_submission(&sub)?;
                 if self.room_config.record.delete_after_submit {
                     let cleaned =
-                        cleanup_submitted_session_recordings(&self.store, active_session).await?;
+                        cleanup_submitted_session_recordings(&self.store, session_id).await?;
                     if cleaned > 0 {
                         info!(
-                            session_id = %active_session,
+                            session_id = %session_id,
                             cleaned,
                             "Deleted local recordings after confirmed submission"
                         );
@@ -972,14 +1005,8 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 self.transition(PipelineState::Submitted)?;
             }
             Ok(SubmissionOutcome::Ambiguous { reason }) => {
-                // The submit call completed without error, so the pipeline
-                // *action* succeeded — transition to Submitted. But the
-                // submission status records that we don't actually know
-                // whether Bilibili created the video. Operators must
-                // verify on Bilibili and use
-                // `state resolve-submission`.
                 warn!(
-                    session_id = %active_session,
+                    session_id = %session_id,
                     "Submission outcome is ambiguous: {}",
                     reason
                 );
