@@ -80,75 +80,107 @@ fn pipeline_marks_session_recording(
     })
 }
 
+/// Shared data and lookups loaded once from the state store, used by both
+/// `detect_anomalies` and `plan_recovery` to avoid duplicate loading logic.
+struct RecoveryContext {
+    sessions: Vec<crate::state::model::LiveSession>,
+    segments: Vec<crate::state::model::Segment>,
+    submissions: Vec<crate::state::model::Submission>,
+    pipeline_by_room: HashMap<u64, RoomPipelineState>,
+    uploaded_by_session: HashMap<uuid::Uuid, HashSet<u32>>,
+    session_room_key: HashMap<uuid::Uuid, String>,
+}
+
+impl RecoveryContext {
+    fn load(store: &StateStore) -> AppResult<Self> {
+        let sessions = store.list_all_sessions()?;
+        let segments = store.list_all_segments()?;
+        let uploaded_parts = store.list_all_uploaded_parts()?;
+        let submissions = store.list_all_submissions()?;
+        let pipeline_states = store.list_all_room_pipeline_states()?;
+
+        let pipeline_by_room: HashMap<u64, RoomPipelineState> =
+            pipeline_states.into_iter().collect();
+
+        let mut uploaded_by_session: HashMap<uuid::Uuid, HashSet<u32>> = HashMap::new();
+        for part in &uploaded_parts {
+            uploaded_by_session
+                .entry(part.session_id)
+                .or_default()
+                .insert(part.segment_index);
+        }
+
+        let session_room_key: HashMap<uuid::Uuid, String> = sessions
+            .iter()
+            .map(|s| (s.id, s.room_key.clone()))
+            .collect();
+
+        Ok(Self {
+            sessions,
+            segments,
+            submissions,
+            pipeline_by_room,
+            uploaded_by_session,
+            session_room_key,
+        })
+    }
+
+    fn is_session_interrupted(&self, session: &crate::state::model::LiveSession) -> bool {
+        session.status == SessionStatus::Recording
+            && !session
+                .room_key
+                .parse::<u64>()
+                .ok()
+                .and_then(|room_id| self.pipeline_by_room.get(&room_id))
+                .is_some_and(|state| pipeline_marks_session_active(Some(state), session.id))
+    }
+
+    fn is_segment_interrupted(&self, segment: &crate::state::model::Segment) -> bool {
+        segment.status == SegmentStatus::Recording
+            && !self
+                .session_room_key
+                .get(&segment.session_id)
+                .and_then(|room_key| room_key.parse::<u64>().ok())
+                .and_then(|room_id| self.pipeline_by_room.get(&room_id))
+                .is_some_and(|state| {
+                    pipeline_marks_session_recording(Some(state), segment.session_id)
+                })
+    }
+
+    fn has_uploaded_part(&self, session_id: uuid::Uuid, index: u32) -> bool {
+        self.uploaded_by_session
+            .get(&session_id)
+            .is_some_and(|indices| indices.contains(&index))
+    }
+}
+
 /// Detect anomalies in the persisted state.
 ///
 /// This function is read-only and does not mutate any state.
 /// It scans redb for inconsistent or stuck states and checks
 /// whether segment file paths referenced in the database exist on disk.
 pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
+    let ctx = RecoveryContext::load(store)?;
     let mut anomalies = Vec::new();
 
-    let sessions = store.list_all_sessions()?;
-    let segments = store.list_all_segments()?;
-    let uploaded_parts = store.list_all_uploaded_parts()?;
-    let submissions = store.list_all_submissions()?;
-    let pipeline_states = store.list_all_room_pipeline_states()?;
-
-    // Build lookup: room_id -> PipelineState
-    let pipeline_by_room: HashMap<u64, RoomPipelineState> = pipeline_states.into_iter().collect();
-
-    // Build lookup: session_id -> set of uploaded segment indices
-    let mut uploaded_by_session: HashMap<uuid::Uuid, HashSet<u32>> = HashMap::new();
-    for part in &uploaded_parts {
-        uploaded_by_session
-            .entry(part.session_id)
-            .or_default()
-            .insert(part.segment_index);
-    }
-
-    // Build lookup: session_id -> room_key for segment -> session mapping
-    let session_room_key: HashMap<uuid::Uuid, &str> = sessions
-        .iter()
-        .map(|s| (s.id, s.room_key.as_str()))
-        .collect();
-
     // Check sessions stuck in Recording
-    for session in &sessions {
-        if session.status == SessionStatus::Recording {
-            // Check if the room's pipeline is actively processing
-            let room_active = session
-                .room_key
-                .parse::<u64>()
-                .ok()
-                .and_then(|room_id| pipeline_by_room.get(&room_id))
-                .is_some_and(|state| pipeline_marks_session_active(Some(state), session.id));
-
-            if !room_active {
-                anomalies.push(Anomaly {
-                    kind: AnomalyKind::InterruptedSession,
-                    description: format!(
-                        "Session {} (room {}) is stuck in Recording status — likely interrupted by crash",
-                        session.id, session.room_key
-                    ),
-                });
-            }
+    for session in &ctx.sessions {
+        if ctx.is_session_interrupted(session) {
+            anomalies.push(Anomaly {
+                kind: AnomalyKind::InterruptedSession,
+                description: format!(
+                    "Session {} (room {}) is stuck in Recording status — likely interrupted by crash",
+                    session.id, session.room_key
+                ),
+            });
         }
     }
 
     // Check segments
-    for segment in &segments {
+    for segment in &ctx.segments {
         match segment.status {
             SegmentStatus::Recording => {
-                // Check if the session's room pipeline is actively recording
-                let room_recording = session_room_key
-                    .get(&segment.session_id)
-                    .and_then(|room_key| room_key.parse::<u64>().ok())
-                    .and_then(|room_id| pipeline_by_room.get(&room_id))
-                    .is_some_and(|state| {
-                        pipeline_marks_session_recording(Some(state), segment.session_id)
-                    });
-
-                if !room_recording {
+                if ctx.is_segment_interrupted(segment) {
                     anomalies.push(Anomaly {
                         kind: AnomalyKind::InterruptedSegment,
                         description: format!(
@@ -159,7 +191,6 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                 }
             }
             SegmentStatus::Finalized => {
-                // Check if file exists on disk
                 if !segment.path.exists() {
                     anomalies.push(Anomaly {
                         kind: AnomalyKind::MissingSegmentFile,
@@ -172,13 +203,7 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                     });
                 }
 
-                // Check if UploadedPart exists
-                let has_upload = uploaded_by_session
-                    .get(&segment.session_id)
-                    .map(|indices| indices.contains(&segment.index))
-                    .unwrap_or(false);
-
-                if !has_upload {
+                if !ctx.has_uploaded_part(segment.session_id, segment.index) {
                     anomalies.push(Anomaly {
                         kind: AnomalyKind::MissingUpload,
                         description: format!(
@@ -188,12 +213,7 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                     });
                 }
             }
-            SegmentStatus::Failed => {
-                // Failed segments are not anomalies — they're expected outcomes
-            }
-            SegmentStatus::Filtered => {
-                // Filtered segments are not anomalies — they were intentionally filtered
-            }
+            SegmentStatus::Failed | SegmentStatus::Filtered => {}
             SegmentStatus::Uploading => {
                 anomalies.push(Anomaly {
                     kind: AnomalyKind::AmbiguousUpload,
@@ -204,12 +224,7 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                 });
             }
             SegmentStatus::Uploaded | SegmentStatus::Cleaned => {
-                let has_upload = uploaded_by_session
-                    .get(&segment.session_id)
-                    .map(|indices| indices.contains(&segment.index))
-                    .unwrap_or(false);
-
-                if !has_upload {
+                if !ctx.has_uploaded_part(segment.session_id, segment.index) {
                     anomalies.push(Anomaly {
                         kind: AnomalyKind::AmbiguousUpload,
                         description: format!(
@@ -223,7 +238,7 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
     }
 
     // Check submissions
-    for submission in &submissions {
+    for submission in &ctx.submissions {
         match submission.status {
             SubmissionStatus::Pending => {
                 anomalies.push(Anomaly {
@@ -254,14 +269,12 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
                     ),
                 });
             }
-            SubmissionStatus::Submitted => {
-                // Not an anomaly
-            }
+            SubmissionStatus::Submitted => {}
         }
     }
 
     // Check pipeline states
-    for (room_id, room_pipeline) in &pipeline_by_room {
+    for (room_id, room_pipeline) in &ctx.pipeline_by_room {
         match room_pipeline.state {
             PipelineState::Failed => {
                 anomalies.push(Anomaly {
@@ -288,9 +301,7 @@ pub fn detect_anomalies(store: &StateStore) -> AppResult<Vec<Anomaly>> {
             PipelineState::Idle
             | PipelineState::Resolving
             | PipelineState::Offline
-            | PipelineState::Submitted => {
-                // Normal or terminal states — not anomalies
-            }
+            | PipelineState::Submitted => {}
         }
     }
 
@@ -408,174 +419,118 @@ pub fn plan_recovery(
     reset_rooms: &HashSet<u64>,
     retry_upload_sessions: &HashSet<uuid::Uuid>,
 ) -> AppResult<RecoveryPlan> {
+    let ctx = RecoveryContext::load(store)?;
     let mut actions = Vec::new();
 
-    let sessions = store.list_all_sessions()?;
-    let segments = store.list_all_segments()?;
-    let uploaded_parts = store.list_all_uploaded_parts()?;
-    let submissions = store.list_all_submissions()?;
-    let pipeline_states = store.list_all_room_pipeline_states()?;
-
-    // Build lookup: room_id -> PipelineState
-    let pipeline_by_room: HashMap<u64, RoomPipelineState> = pipeline_states.into_iter().collect();
-
-    // Build lookup: session_id -> set of uploaded segment indices
-    let mut uploaded_by_session: HashMap<uuid::Uuid, HashSet<u32>> = HashMap::new();
-    for part in &uploaded_parts {
-        uploaded_by_session
-            .entry(part.session_id)
-            .or_default()
-            .insert(part.segment_index);
-    }
-
-    // Build lookup: session_id -> room_key for segment -> session mapping
-    let session_room_key: HashMap<uuid::Uuid, &str> = sessions
-        .iter()
-        .map(|s| (s.id, s.room_key.as_str()))
-        .collect();
-
-    // Build lookup: session_id -> Submission
+    // Build lookup: session_id -> Submission (only needed by plan_recovery)
     let submission_by_session: HashMap<uuid::Uuid, &crate::state::model::Submission> =
-        submissions.iter().map(|s| (s.session_id, s)).collect();
+        ctx.submissions.iter().map(|s| (s.session_id, s)).collect();
 
     // 0. Interrupted sessions: Recording status with no active pipeline
-    for session in &sessions {
-        if session.status == SessionStatus::Recording {
-            let room_active = session
-                .room_key
-                .parse::<u64>()
-                .ok()
-                .and_then(|room_id| pipeline_by_room.get(&room_id))
-                .is_some_and(|state| pipeline_marks_session_active(Some(state), session.id));
-
-            if !room_active {
-                actions.push(RecoveryAction::MarkInterruptedSession {
-                    session_id: session.id,
-                });
-            }
+    for session in &ctx.sessions {
+        if ctx.is_session_interrupted(session) {
+            actions.push(RecoveryAction::MarkInterruptedSession {
+                session_id: session.id,
+            });
         }
     }
 
     // 1. Interrupted segments: Recording status with no active pipeline
-    for segment in &segments {
-        if segment.status == SegmentStatus::Recording {
-            let room_recording = session_room_key
-                .get(&segment.session_id)
-                .and_then(|room_key| room_key.parse::<u64>().ok())
-                .and_then(|room_id| pipeline_by_room.get(&room_id))
-                .is_some_and(|state| {
-                    pipeline_marks_session_recording(Some(state), segment.session_id)
-                });
-
-            if !room_recording {
-                actions.push(RecoveryAction::MarkInterruptedSegment {
-                    session_id: segment.session_id,
-                    index: segment.index,
-                });
-            }
+    for segment in &ctx.segments {
+        if ctx.is_segment_interrupted(segment) {
+            actions.push(RecoveryAction::MarkInterruptedSegment {
+                session_id: segment.session_id,
+                index: segment.index,
+            });
         }
     }
 
     // 2. Finalized segments missing upload
-    for segment in &segments {
-        if segment.status == SegmentStatus::Finalized {
-            let has_upload = uploaded_by_session
-                .get(&segment.session_id)
-                .map(|indices| indices.contains(&segment.index))
-                .unwrap_or(false);
+    for segment in &ctx.segments {
+        if segment.status == SegmentStatus::Finalized
+            && !ctx.has_uploaded_part(segment.session_id, segment.index)
+        {
+            let session_requested = retry_upload_sessions.contains(&segment.session_id);
 
-            if !has_upload {
-                let session_requested = retry_upload_sessions.contains(&segment.session_id);
+            if session_requested {
+                // Check submission boundary: refuse if session has a submission
+                if let Some(sub) = submission_by_session.get(&segment.session_id) {
+                    let status_word = match sub.status {
+                        SubmissionStatus::Submitted => "Submitted",
+                        SubmissionStatus::Pending => "Pending",
+                        SubmissionStatus::Ambiguous => "Ambiguous",
+                        SubmissionStatus::Failed => "Failed",
+                    };
+                    actions.push(RecoveryAction::LeaveAsIs {
+                        reason: format!(
+                            "Finalized segment {}/{} missing upload, but session has a {} submission — cannot retry upload",
+                            segment.session_id, segment.index, status_word
+                        ),
+                    });
+                    continue;
+                }
 
-                if session_requested {
-                    // Check submission boundary: refuse if session has a submission
-                    if let Some(sub) = submission_by_session.get(&segment.session_id) {
-                        let status_word = match sub.status {
-                            SubmissionStatus::Submitted => "Submitted",
-                            SubmissionStatus::Pending => "Pending",
-                            SubmissionStatus::Ambiguous => "Ambiguous",
-                            SubmissionStatus::Failed => "Failed",
-                        };
-                        actions.push(RecoveryAction::LeaveAsIs {
-                            reason: format!(
-                                "Finalized segment {}/{} missing upload, but session has a {} submission — cannot retry upload",
-                                segment.session_id, segment.index, status_word
-                            ),
-                        });
-                        continue;
-                    }
-
-                    // Only schedule upload if the file exists on disk and is .flv
-                    if segment.path.exists()
-                        && segment
-                            .path
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
-                    {
-                        actions.push(RecoveryAction::ScheduleUploadReconciliation {
-                            session_id: segment.session_id,
-                            segment_index: segment.index,
-                            path: segment.path.clone(),
-                        });
-                    } else if !segment.path.exists() {
-                        actions.push(RecoveryAction::LeaveAsIs {
-                            reason: format!(
-                                "Finalized segment {}/{} missing upload, but file does not exist: {}",
-                                segment.session_id,
-                                segment.index,
-                                segment.path.display()
-                            ),
-                        });
-                    } else {
-                        actions.push(RecoveryAction::LeaveAsIs {
-                            reason: format!(
-                                "Finalized segment {}/{} missing upload, but file is not a .flv: {}",
-                                segment.session_id,
-                                segment.index,
-                                segment.path.display()
-                            ),
-                        });
-                    }
+                // Only schedule upload if the file exists on disk and is .flv
+                if segment.path.exists()
+                    && segment
+                        .path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
+                {
+                    actions.push(RecoveryAction::ScheduleUploadReconciliation {
+                        session_id: segment.session_id,
+                        segment_index: segment.index,
+                        path: segment.path.clone(),
+                    });
+                } else if !segment.path.exists() {
+                    actions.push(RecoveryAction::LeaveAsIs {
+                        reason: format!(
+                            "Finalized segment {}/{} missing upload, but file does not exist: {}",
+                            segment.session_id,
+                            segment.index,
+                            segment.path.display()
+                        ),
+                    });
                 } else {
                     actions.push(RecoveryAction::LeaveAsIs {
                         reason: format!(
-                            "Finalized segment {}/{} missing upload — use --retry-upload {} --apply to upload",
-                            segment.session_id, segment.index, segment.session_id
+                            "Finalized segment {}/{} missing upload, but file is not a .flv: {}",
+                            segment.session_id,
+                            segment.index,
+                            segment.path.display()
                         ),
                     });
                 }
-            }
-        }
-    }
-
-    // 3. Pending submissions — ambiguous, must not auto-retry
-    for segment in &segments {
-        if matches!(
-            segment.status,
-            SegmentStatus::Uploading | SegmentStatus::Uploaded | SegmentStatus::Cleaned
-        ) {
-            let has_upload = uploaded_by_session
-                .get(&segment.session_id)
-                .map(|indices| indices.contains(&segment.index))
-                .unwrap_or(false);
-            if segment.status == SegmentStatus::Uploading
-                || (matches!(
-                    segment.status,
-                    SegmentStatus::Uploaded | SegmentStatus::Cleaned
-                ) && !has_upload)
-            {
+            } else {
                 actions.push(RecoveryAction::LeaveAsIs {
                     reason: format!(
-                        "Segment {}/{} is {:?} with ambiguous upload state — requires manual verification",
-                        segment.session_id, segment.index, segment.status
+                        "Finalized segment {}/{} missing upload — use --retry-upload {} --apply to upload",
+                        segment.session_id, segment.index, segment.session_id
                     ),
                 });
             }
         }
     }
 
+    // 3. Ambiguous upload states — must not auto-retry
+    for segment in &ctx.segments {
+        if matches!(
+            segment.status,
+            SegmentStatus::Uploading | SegmentStatus::Uploaded | SegmentStatus::Cleaned
+        ) && (segment.status == SegmentStatus::Uploading
+            || !ctx.has_uploaded_part(segment.session_id, segment.index))
+        {
+            actions.push(RecoveryAction::LeaveAsIs {
+                reason: format!(
+                    "Segment {}/{} is {:?} with ambiguous upload state — requires manual verification",
+                    segment.session_id, segment.index, segment.status
+                ),
+            });
+        }
+    }
+
     // 4. Pending submissions — outcome unknown, must not auto-retry
-    for submission in &submissions {
+    for submission in &ctx.submissions {
         if submission.status == SubmissionStatus::Pending {
             actions.push(RecoveryAction::LeaveAsIs {
                 reason: format!(
@@ -588,7 +543,7 @@ pub fn plan_recovery(
 
     // 4b. Ambiguous submissions — Bilibili accepted but did not return aid/bvid;
     // we cannot prove whether the video was created. Manual verification required.
-    for submission in &submissions {
+    for submission in &ctx.submissions {
         if submission.status == SubmissionStatus::Ambiguous {
             actions.push(RecoveryAction::LeaveAsIs {
                 reason: format!(
@@ -600,7 +555,7 @@ pub fn plan_recovery(
     }
 
     // 5. Failed submissions — must not auto-retry
-    for submission in &submissions {
+    for submission in &ctx.submissions {
         if submission.status == SubmissionStatus::Failed {
             actions.push(RecoveryAction::LeaveAsIs {
                 reason: format!(
@@ -612,7 +567,7 @@ pub fn plan_recovery(
     }
 
     // 6. Failed pipeline states — require explicit --reset-room
-    for (room_id, room_pipeline) in &pipeline_by_room {
+    for (room_id, room_pipeline) in &ctx.pipeline_by_room {
         if room_pipeline.state == PipelineState::Failed {
             if reset_rooms.contains(room_id) {
                 actions.push(RecoveryAction::ResetRoomPipeline { room_id: *room_id });
@@ -628,7 +583,7 @@ pub fn plan_recovery(
     }
 
     // 7. Active pipeline states — informational, may be resumed by run
-    for (room_id, room_pipeline) in &pipeline_by_room {
+    for (room_id, room_pipeline) in &ctx.pipeline_by_room {
         if is_active_pipeline_state(&room_pipeline.state) {
             actions.push(RecoveryAction::LeaveAsIs {
                 reason: format!(
