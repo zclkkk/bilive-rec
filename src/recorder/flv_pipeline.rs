@@ -78,7 +78,7 @@ impl FlvNormalizer {
             }
             FlvTagType::Video => {
                 if !is_avc_video_tag(&tag.data) {
-                    return Err(AppError::Bilibili(
+                    return Err(AppError::StreamProtocol(
                         "Unsupported FLV video codec; only AVC is supported".into(),
                     ));
                 }
@@ -86,7 +86,7 @@ impl FlvNormalizer {
                 if is_avc_sequence_header(&tag.data) {
                     let length_size = avc_nalu_length_size_from_sequence_header(&tag.data)
                         .map_err(|err| {
-                            AppError::Bilibili(format!("Invalid AVC sequence header: {err}"))
+                            AppError::StreamProtocol(format!("Invalid AVC sequence header: {err}"))
                         })?;
                     let header_changed = recording
                         && self
@@ -115,7 +115,7 @@ impl FlvNormalizer {
                 {
                     let removal =
                         remove_avc_filler_nalus(&tag.data, length_size).map_err(|err| {
-                            AppError::Bilibili(format!("Invalid AVC NALU packet: {err}"))
+                            AppError::StreamProtocol(format!("Invalid AVC NALU packet: {err}"))
                         })?;
                     if removal.changed() {
                         tracing::debug!(

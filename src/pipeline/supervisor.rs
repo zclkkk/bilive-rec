@@ -59,6 +59,24 @@ fn pipeline_state_requires_active_session(state: PipelineState) -> bool {
     )
 }
 
+fn recording_retry_reason(error: AppError) -> Result<String, AppError> {
+    match error {
+        AppError::Http(_)
+        | AppError::Bilibili(_)
+        | AppError::StreamProtocol(_)
+        | AppError::StreamRepeatedData(_) => Ok(error.to_string()),
+        AppError::Io { .. }
+        | AppError::Config(_)
+        | AppError::Database(_)
+        | AppError::Table(_)
+        | AppError::Transaction(_)
+        | AppError::Storage(_)
+        | AppError::Commit(_)
+        | AppError::State(_)
+        | AppError::GracefulShutdown => Err(error),
+    }
+}
+
 fn ensure_session_ready_to_submit(store: &StateStore, session_id: Uuid) -> AppResult<()> {
     let segments = store.list_segments(session_id)?;
     let uploaded_indices: std::collections::HashSet<u32> = store
@@ -634,21 +652,14 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 // Do not transition — leave persisted state as-is for resume.
                 return Err(AppError::GracefulShutdown);
             }
-            Err(e) => match e {
-                AppError::Io { .. }
-                | AppError::State(_)
-                | AppError::Config(_)
-                | AppError::Database(_)
-                | AppError::Table(_)
-                | AppError::Transaction(_)
-                | AppError::Storage(_)
-                | AppError::Commit(_) => {
+            Err(e) => match recording_retry_reason(e) {
+                Ok(reason) => {
+                    warn!("record_flv retryable error: {}", reason);
+                    self.transition(PipelineState::WaitingReconnect)?;
+                }
+                Err(e) => {
                     error!("record_flv fatal error: {}", e);
                     return Err(e);
-                }
-                _ => {
-                    warn!("record_flv transient error: {}", e);
-                    self.transition(PipelineState::WaitingReconnect)?;
                 }
             },
         }

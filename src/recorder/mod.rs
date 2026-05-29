@@ -128,11 +128,12 @@ impl<'a> FlvRecorder<'a> {
             if self.buffer.len() - self.read_pos >= 13 {
                 let mut cursor = std::io::Cursor::new(&self.buffer[self.read_pos..]);
                 let h = FlvHeader::read(&mut cursor)
-                    .map_err(|e| AppError::Bilibili(format!("FLV header error: {}", e)))?;
-                let prev_size = read_previous_tag_size(&mut cursor)
-                    .map_err(|e| AppError::Bilibili(format!("FLV prev tag size error: {}", e)))?;
+                    .map_err(|e| AppError::StreamProtocol(format!("FLV header error: {}", e)))?;
+                let prev_size = read_previous_tag_size(&mut cursor).map_err(|e| {
+                    AppError::StreamProtocol(format!("FLV prev tag size error: {}", e))
+                })?;
                 if prev_size != 0 {
-                    return Err(AppError::Bilibili(format!(
+                    return Err(AppError::StreamProtocol(format!(
                         "Invalid initial previous tag size: {}",
                         prev_size
                     )));
@@ -148,7 +149,12 @@ impl<'a> FlvRecorder<'a> {
             let mut cursor = std::io::Cursor::new(&self.buffer[self.read_pos..]);
             let tag_header = match FlvTagHeader::read(&mut cursor) {
                 Ok(th) => th,
-                Err(e) => return Err(AppError::Bilibili(format!("FLV tag header error: {}", e))),
+                Err(e) => {
+                    return Err(AppError::StreamProtocol(format!(
+                        "FLV tag header error: {}",
+                        e
+                    )));
+                }
             };
 
             let total_needed = 11 + (tag_header.data_size as usize) + 4;
@@ -158,7 +164,7 @@ impl<'a> FlvRecorder<'a> {
 
             cursor.set_position(0);
             let tag = FlvTag::read(&mut cursor)
-                .map_err(|e| AppError::Bilibili(format!("FLV tag read error: {}", e)))?;
+                .map_err(|e| AppError::StreamProtocol(format!("FLV tag read error: {}", e)))?;
             // The tag is fully parsed; advance past it before any fallible work
             // so all paths (including `continue` and `?`) leave the cursor
             // consistent. The consumed prefix is compacted once below.
@@ -320,7 +326,7 @@ impl<'a> FlvRecorder<'a> {
             let timestamp = tag.header.timestamp;
             let is_keyframe = crate::recorder::flv::is_avc_keyframe(&tag.data);
             tag.write(&mut buf)
-                .map_err(|e| AppError::Bilibili(format!("FLV tag write error: {}", e)))?;
+                .map_err(|e| AppError::StreamProtocol(format!("FLV tag write error: {}", e)))?;
             seg.file.write_all(&buf).await.map_err(|e| AppError::Io {
                 path: seg.part_path.clone(),
                 source: e,
@@ -558,9 +564,10 @@ impl<'a> FlvRecorder<'a> {
             .as_ref()
             .expect("Invariant violated: FLV header must exist when opening segment");
         h.write(&mut buf)
-            .map_err(|e| AppError::Bilibili(format!("FLV header write error: {}", e)))?;
-        crate::recorder::flv::write_previous_tag_size(&mut buf, 0)
-            .map_err(|e| AppError::Bilibili(format!("FLV prev tag size write error: {}", e)))?;
+            .map_err(|e| AppError::StreamProtocol(format!("FLV header write error: {}", e)))?;
+        crate::recorder::flv::write_previous_tag_size(&mut buf, 0).map_err(|e| {
+            AppError::StreamProtocol(format!("FLV prev tag size write error: {}", e))
+        })?;
         file.write_all(&buf).await.map_err(|e| AppError::Io {
             path: path.to_path_buf(),
             source: e,
@@ -582,7 +589,7 @@ impl<'a> FlvRecorder<'a> {
         let metadata_source = meta.data.clone();
         let metadata_len = meta.data.len();
         meta.write(&mut buf)
-            .map_err(|e| AppError::Bilibili(format!("FLV metadata write error: {}", e)))?;
+            .map_err(|e| AppError::StreamProtocol(format!("FLV metadata write error: {}", e)))?;
 
         let avc = self
             .normalizer
@@ -592,7 +599,7 @@ impl<'a> FlvRecorder<'a> {
         let mut avc = avc.clone();
         avc.header.timestamp = 0;
         avc.write(&mut buf)
-            .map_err(|e| AppError::Bilibili(format!("FLV AVC seq write error: {}", e)))?;
+            .map_err(|e| AppError::StreamProtocol(format!("FLV AVC seq write error: {}", e)))?;
 
         let aac = self
             .normalizer
@@ -602,7 +609,7 @@ impl<'a> FlvRecorder<'a> {
         let mut aac = aac.clone();
         aac.header.timestamp = 0;
         aac.write(&mut buf)
-            .map_err(|e| AppError::Bilibili(format!("FLV AAC seq write error: {}", e)))?;
+            .map_err(|e| AppError::StreamProtocol(format!("FLV AAC seq write error: {}", e)))?;
 
         if !buf.is_empty() {
             file.write_all(&buf).await.map_err(|e| AppError::Io {
@@ -658,7 +665,7 @@ impl<'a> FlvRecorder<'a> {
 async fn rewrite_segment_metadata(seg: &mut ActiveSegment) -> AppResult<()> {
     let body = build_metadata_body(&seg.metadata_source, seg.duration_ms, &seg.keyframes);
     if body.len() != seg.metadata_len {
-        return Err(AppError::Bilibili(format!(
+        return Err(AppError::StreamProtocol(format!(
             "FLV metadata rewrite size changed: expected {}, got {}",
             seg.metadata_len,
             body.len()
@@ -698,7 +705,7 @@ pub async fn record_flv(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> AppResult<()> {
     if !resp.status().is_success() {
-        return Err(AppError::Bilibili(format!(
+        return Err(AppError::StreamProtocol(format!(
             "Non-success HTTP status: {}",
             resp.status()
         )));
@@ -2093,7 +2100,7 @@ mod tests {
             .open_new_segment()
             .await
             .expect_err("AVC sequence size mismatch should fail initial header writes");
-        assert!(matches!(err, AppError::Bilibili(_)));
+        assert!(matches!(err, AppError::StreamProtocol(_)));
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
