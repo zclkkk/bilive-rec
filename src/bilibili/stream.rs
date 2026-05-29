@@ -42,7 +42,10 @@ pub async fn fetch_play_info(
         .send()
         .await?
         .json()
-        .await?;
+        .await
+        .map_err(|e| {
+            AppError::Bilibili(format!("Failed to parse getRoomPlayInfo response: {e}"))
+        })?;
 
     Ok(resp)
 }

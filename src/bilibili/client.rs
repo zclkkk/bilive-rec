@@ -112,7 +112,8 @@ impl BiliClient {
             .send()
             .await?
             .json()
-            .await?;
+            .await
+            .map_err(|e| AppError::Bilibili(format!("Failed to parse nav response: {e}")))?;
 
         let keys = parse_wbi_keys(&resp)?;
         self.wbi_cache.store(keys.clone()).await;

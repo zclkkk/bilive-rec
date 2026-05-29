@@ -61,7 +61,7 @@ fn pipeline_state_requires_active_session(state: PipelineState) -> bool {
 
 fn recording_retry_reason(error: AppError) -> Result<String, AppError> {
     match error {
-        AppError::Http(_)
+        AppError::Network(_)
         | AppError::Bilibili(_)
         | AppError::StreamProtocol(_)
         | AppError::StreamRepeatedData(_) => Ok(error.to_string()),

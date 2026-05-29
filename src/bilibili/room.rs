@@ -121,7 +121,8 @@ pub async fn fetch_room_info(client: &BiliClient, room_id: u64) -> AppResult<Bil
         .send()
         .await?
         .json()
-        .await?;
+        .await
+        .map_err(|e| AppError::Bilibili(format!("Failed to parse getInfoByRoom response: {e}")))?;
 
     parse_room_info(&resp)
 }

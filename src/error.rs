@@ -31,8 +31,8 @@ pub enum AppError {
     #[error("state store error: {0}")]
     State(String),
 
-    #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("network error: {0}")]
+    Network(#[from] reqwest::Error),
 
     #[error("bilibili error: {0}")]
     Bilibili(String),
