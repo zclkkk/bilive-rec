@@ -864,11 +864,14 @@ pub async fn apply_recovery<U: Uploader>(
 mod tests {
     use super::*;
     use crate::state::model::{
-        LiveSession, SegmentStatus, SessionStatus, Submission, SubmissionStatus, UploadedPart,
-        fixtures::{failed_segment, finalized_segment, recording_segment, uploading_segment},
+        SegmentStatus, SessionStatus, SubmissionStatus, UploadedPart,
+        fixtures::{
+            failed_segment, finalized_segment, pending_submission, recording_segment,
+            recording_session, session_with_status, submission_with_status, submitted_submission,
+            uploading_segment,
+        },
     };
     use crate::uploader::types::UploadRequest;
-    use jiff::Timestamp;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -890,18 +893,8 @@ mod tests {
     #[test]
     fn detect_interrupted_session_no_pipeline() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "123".to_string(),
-                title: "Test".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        let session = recording_session(123);
+        store.put_session(&session).unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
         assert_eq!(anomalies.len(), 1);
@@ -911,19 +904,10 @@ mod tests {
     #[test]
     fn recording_session_with_active_pipeline_is_not_anomaly() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(456);
+        let session_id = session.id;
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "456".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_room_pipeline_state(456, PipelineState::Recording, Some(session_id))
@@ -940,19 +924,10 @@ mod tests {
     #[test]
     fn recording_session_with_re_resolving_pipeline_is_not_anomaly() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(789);
+        let session_id = session.id;
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "789".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_room_pipeline_state(789, PipelineState::ReResolving, Some(session_id))
@@ -969,19 +944,9 @@ mod tests {
     #[test]
     fn recording_session_with_failed_pipeline_is_anomaly() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(111);
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "111".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_pipeline_state(111, PipelineState::Failed)
@@ -998,19 +963,9 @@ mod tests {
     #[test]
     fn recording_session_with_idle_pipeline_is_anomaly() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(222);
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "222".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store.put_pipeline_state(222, PipelineState::Idle).unwrap();
 
@@ -1025,20 +980,11 @@ mod tests {
     #[test]
     fn detect_interrupted_segment_no_pipeline() {
         let (store, dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(999);
+        let session_id = session.id;
         let part_path = dir.path().join("test.part");
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "999".to_string(),
-                title: "Test".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_segment(&recording_segment(session_id, 0, part_path))
@@ -1055,20 +1001,11 @@ mod tests {
     #[test]
     fn recording_segment_with_active_pipeline_is_not_anomaly() {
         let (store, dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(333);
+        let session_id = session.id;
         let part_path = dir.path().join("test.part");
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "333".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_segment(&recording_segment(session_id, 0, part_path))
@@ -1089,20 +1026,11 @@ mod tests {
     #[test]
     fn recording_segment_with_failed_pipeline_is_anomaly() {
         let (store, dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(444);
+        let session_id = session.id;
         let part_path = dir.path().join("test.part");
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "444".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_segment(&recording_segment(session_id, 0, part_path))
@@ -1123,20 +1051,11 @@ mod tests {
     #[test]
     fn recording_segment_with_idle_pipeline_is_anomaly() {
         let (store, dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(555);
+        let session_id = session.id;
         let part_path = dir.path().join("test.part");
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "555".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_segment(&recording_segment(session_id, 0, part_path))
@@ -1235,17 +1154,7 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
+            .put_submission(&pending_submission(session_id))
             .unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
@@ -1261,19 +1170,9 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
 
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Ambiguous,
-                aid: None,
-                bvid: None,
-                error: Some("Bilibili returned code=0 but no aid/bvid".to_string()),
-            })
-            .unwrap();
+        let mut sub = submission_with_status(session_id, SubmissionStatus::Ambiguous);
+        sub.error = Some("Bilibili returned code=0 but no aid/bvid".to_string());
+        store.put_submission(&sub).unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
         let ambig = anomalies
@@ -1289,19 +1188,9 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
 
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Ambiguous,
-                aid: None,
-                bvid: None,
-                error: Some("ambiguous".into()),
-            })
-            .unwrap();
+        let mut sub = submission_with_status(session_id, SubmissionStatus::Ambiguous);
+        sub.error = Some("ambiguous".into());
+        store.put_submission(&sub).unwrap();
 
         let plan = plan_recovery(&store, &HashSet::new(), &HashSet::new()).unwrap();
 
@@ -1326,19 +1215,9 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
 
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Failed,
-                aid: None,
-                bvid: None,
-                error: Some("network error".to_string()),
-            })
-            .unwrap();
+        let mut sub = submission_with_status(session_id, SubmissionStatus::Failed);
+        sub.error = Some("network error".to_string());
+        store.put_submission(&sub).unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
         assert!(
@@ -1370,17 +1249,7 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Submitted,
-                aid: Some(123),
-                bvid: Some("BV123".to_string()),
-                error: None,
-            })
+            .put_submission(&submitted_submission(session_id, 123, "BV123"))
             .unwrap();
 
         let anomalies = detect_anomalies(&store).unwrap();
@@ -1427,20 +1296,11 @@ mod tests {
     #[test]
     fn plan_interrupted_segment() {
         let (store, dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(999);
+        let session_id = session.id;
         let part_path = dir.path().join("test.part");
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "999".to_string(),
-                title: "Test".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_segment(&recording_segment(session_id, 3, part_path))
@@ -1461,20 +1321,11 @@ mod tests {
     #[test]
     fn plan_active_recording_segment_skipped() {
         let (store, dir) = test_store();
-        let session_id = Uuid::new_v4();
+        let session = recording_session(333);
+        let session_id = session.id;
         let part_path = dir.path().join("test.part");
 
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "333".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        store.put_session(&session).unwrap();
 
         store
             .put_segment(&recording_segment(session_id, 0, part_path))
@@ -1646,17 +1497,7 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
+            .put_submission(&pending_submission(session_id))
             .unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
@@ -1672,19 +1513,9 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
 
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Failed,
-                aid: None,
-                bvid: None,
-                error: Some("timeout".to_string()),
-            })
-            .unwrap();
+        let mut sub = submission_with_status(session_id, SubmissionStatus::Failed);
+        sub.error = Some("timeout".to_string());
+        store.put_submission(&sub).unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert_eq!(plan.actions.len(), 1);
@@ -2072,18 +1903,9 @@ mod tests {
     #[test]
     fn plan_interrupted_session_produces_action() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "123".to_string(),
-                title: "Test".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        let session = recording_session(123);
+        let session_id = session.id;
+        store.put_session(&session).unwrap();
 
         let plan = plan_recovery(&store, &empty_reset_rooms(), &empty_retry_uploads()).unwrap();
         assert!(plan.actions.iter().any(|a| matches!(
@@ -2095,18 +1917,9 @@ mod tests {
     #[test]
     fn plan_active_session_no_action() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "456".to_string(),
-                title: "Live".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        let session = recording_session(456);
+        let session_id = session.id;
+        store.put_session(&session).unwrap();
         store
             .put_room_pipeline_state(456, PipelineState::Recording, Some(session_id))
             .unwrap();
@@ -2123,18 +1936,9 @@ mod tests {
     #[tokio::test]
     async fn apply_mark_interrupted_session() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "123".to_string(),
-                title: "Test".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        let session = recording_session(123);
+        let session_id = session.id;
+        store.put_session(&session).unwrap();
 
         let plan = RecoveryPlan {
             actions: vec![RecoveryAction::MarkInterruptedSession { session_id }],
@@ -2153,18 +1957,9 @@ mod tests {
     #[tokio::test]
     async fn apply_mark_interrupted_session_idempotent() {
         let (store, _dir) = test_store();
-        let session_id = Uuid::new_v4();
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: "123".to_string(),
-                title: "Test".to_string(),
-                started_at: Timestamp::now(),
-                status: SessionStatus::Failed,
-                record_credential: None,
-                upload_credential: None,
-            })
-            .unwrap();
+        let session = session_with_status(123, SessionStatus::Failed);
+        let session_id = session.id;
+        store.put_session(&session).unwrap();
 
         let plan = RecoveryPlan {
             actions: vec![RecoveryAction::MarkInterruptedSession { session_id }],
@@ -2281,17 +2076,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Submitted,
-                aid: Some(1),
-                bvid: Some("BV1".into()),
-                error: None,
-            })
+            .put_submission(&submitted_submission(session_id, 1, "BV1"))
             .unwrap();
 
         let mut retry_uploads = HashSet::new();
@@ -2321,17 +2106,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
+            .put_submission(&pending_submission(session_id))
             .unwrap();
 
         let mut retry_uploads = HashSet::new();
@@ -2360,19 +2135,9 @@ mod tests {
             .put_segment(&finalized_segment(session_id, 1, flv_path))
             .unwrap();
 
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Failed,
-                aid: None,
-                bvid: None,
-                error: Some("timeout".into()),
-            })
-            .unwrap();
+        let mut sub = submission_with_status(session_id, SubmissionStatus::Failed);
+        sub.error = Some("timeout".into());
+        store.put_submission(&sub).unwrap();
 
         let mut retry_uploads = HashSet::new();
         retry_uploads.insert(session_id);
@@ -2481,17 +2246,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Submitted,
-                aid: Some(1),
-                bvid: Some("BV1".into()),
-                error: None,
-            })
+            .put_submission(&submitted_submission(session_id, 1, "BV1"))
             .unwrap();
 
         let plan = RecoveryPlan {
@@ -2524,17 +2279,7 @@ mod tests {
             .unwrap();
 
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
+            .put_submission(&pending_submission(session_id))
             .unwrap();
 
         let plan = RecoveryPlan {
@@ -2566,19 +2311,9 @@ mod tests {
             .put_segment(&finalized_segment(session_id, 1, flv_path.clone()))
             .unwrap();
 
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Failed,
-                aid: None,
-                bvid: None,
-                error: Some("timeout".into()),
-            })
-            .unwrap();
+        let mut sub = submission_with_status(session_id, SubmissionStatus::Failed);
+        sub.error = Some("timeout".into());
+        store.put_submission(&sub).unwrap();
 
         let plan = RecoveryPlan {
             actions: vec![RecoveryAction::ScheduleUploadReconciliation {
@@ -2644,17 +2379,7 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
+            .put_submission(&pending_submission(session_id))
             .unwrap();
 
         let resolved = resolve_submission(
@@ -2679,19 +2404,9 @@ mod tests {
     fn resolve_ambiguous_to_submitted_with_bvid() {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Ambiguous,
-                aid: None,
-                bvid: None,
-                error: Some("no aid/bvid in response".into()),
-            })
-            .unwrap();
+        let mut sub = submission_with_status(session_id, SubmissionStatus::Ambiguous);
+        sub.error = Some("no aid/bvid in response".into());
+        store.put_submission(&sub).unwrap();
 
         let resolved = resolve_submission(
             &store,
@@ -2716,17 +2431,7 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
+            .put_submission(&pending_submission(session_id))
             .unwrap();
 
         resolve_submission(&store, session_id, SubmissionStatus::Failed, None, None).unwrap();
@@ -2742,17 +2447,7 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
+            .put_submission(&pending_submission(session_id))
             .unwrap();
 
         let err = resolve_submission(&store, session_id, SubmissionStatus::Submitted, None, None)
@@ -2769,17 +2464,7 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Submitted,
-                aid: Some(1),
-                bvid: Some("BV1".into()),
-                error: None,
-            })
+            .put_submission(&submitted_submission(session_id, 1, "BV1"))
             .unwrap();
 
         let err = resolve_submission(
@@ -2801,19 +2486,9 @@ mod tests {
     fn resolve_refuses_already_failed() {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Failed,
-                aid: None,
-                bvid: None,
-                error: Some("real failure".into()),
-            })
-            .unwrap();
+        let mut sub = submission_with_status(session_id, SubmissionStatus::Failed);
+        sub.error = Some("real failure".into());
+        store.put_submission(&sub).unwrap();
 
         let err = resolve_submission(&store, session_id, SubmissionStatus::Failed, None, None)
             .unwrap_err();
@@ -2836,17 +2511,7 @@ mod tests {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
         store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
+            .put_submission(&pending_submission(session_id))
             .unwrap();
 
         // Resolving to Pending or Ambiguous makes no sense — those are the

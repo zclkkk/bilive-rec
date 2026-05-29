@@ -167,9 +167,56 @@ pub enum SubmissionStatus {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use super::{Segment, SegmentStatus};
+    use super::*;
     use std::path::PathBuf;
-    use uuid::Uuid;
+
+    // -- LiveSession --
+
+    pub(crate) fn recording_session(room_id: u64) -> LiveSession {
+        session_with_status(room_id, SessionStatus::Recording)
+    }
+
+    pub(crate) fn session_with_status(room_id: u64, status: SessionStatus) -> LiveSession {
+        LiveSession {
+            id: Uuid::new_v4(),
+            room_key: room_id.to_string(),
+            title: format!("Test Room {room_id}"),
+            started_at: jiff::Timestamp::now(),
+            status,
+            record_credential: None,
+            upload_credential: None,
+        }
+    }
+
+    // -- Submission --
+
+    pub(crate) fn submission_with_status(session_id: Uuid, status: SubmissionStatus) -> Submission {
+        Submission {
+            session_id,
+            upload_credential: crate::credential::CredentialIdentity::new("test", "cookies.json"),
+            status,
+            aid: None,
+            bvid: None,
+            error: None,
+        }
+    }
+
+    pub(crate) fn pending_submission(session_id: Uuid) -> Submission {
+        submission_with_status(session_id, SubmissionStatus::Pending)
+    }
+
+    pub(crate) fn submitted_submission(session_id: Uuid, aid: u64, bvid: &str) -> Submission {
+        Submission {
+            session_id,
+            upload_credential: crate::credential::CredentialIdentity::new("test", "cookies.json"),
+            status: SubmissionStatus::Submitted,
+            aid: Some(aid),
+            bvid: Some(bvid.to_string()),
+            error: None,
+        }
+    }
+
+    // -- Segment --
 
     fn segment(
         session_id: Uuid,

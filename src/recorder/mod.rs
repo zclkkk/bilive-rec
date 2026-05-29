@@ -1806,7 +1806,6 @@ mod tests {
 
         // Recorder should still be in WaitSync and no segment created
         assert!(matches!(recorder.phase, RecordPhase::WaitSync));
-        assert!(matches!(recorder.phase, RecordPhase::WaitSync));
 
         // Now push headers
         recorder
@@ -1839,13 +1838,11 @@ mod tests {
             .unwrap();
 
         assert!(matches!(recorder.phase, RecordPhase::WaitSync));
-        assert!(matches!(recorder.phase, RecordPhase::WaitSync));
 
         // Push a keyframe, it should transition to Recording and open a segment
         let keyframe = video_tag(0, avc_keyframe_data(0));
         recorder.push_chunk(&write_tag(keyframe)).await.unwrap();
 
-        assert!(matches!(recorder.phase, RecordPhase::Recording(_)));
         assert!(matches!(recorder.phase, RecordPhase::Recording(_)));
     }
 

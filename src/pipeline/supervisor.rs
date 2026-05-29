@@ -1520,30 +1520,6 @@ mod tests {
         assert_eq!(supervisor.session.state, PipelineState::Idle);
     }
 
-    #[test]
-    fn test_parse_duration_variations() {
-        use crate::config::parse_hms_duration;
-        assert_eq!(
-            parse_hms_duration("01:30:00").unwrap(),
-            std::time::Duration::from_secs(90 * 60)
-        );
-        assert_eq!(
-            parse_hms_duration("00:15:30").unwrap(),
-            std::time::Duration::from_secs(15 * 60 + 30)
-        );
-        assert!(parse_hms_duration("invalid").is_err());
-        assert!(parse_hms_duration("01:aa:bb").is_err());
-    }
-    #[test]
-    fn test_parse_size_variations() {
-        use crate::config::parse_size_bytes;
-        assert_eq!(parse_size_bytes("20MiB"), Some(20 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("2GiB"), Some(2 * 1024 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("10MB"), Some(10 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("15KB"), Some(15 * 1024));
-        assert_eq!(parse_size_bytes("invalid"), None);
-    }
-
     #[tokio::test]
     async fn test_submitting_with_empty_parts() {
         use crate::state::store::StateStore;
