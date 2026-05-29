@@ -899,7 +899,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         session_id: Uuid,
         session: &LiveSession,
     ) -> AppResult<SubmissionRequest> {
-        // Mark the LiveSession finalized if it is still Recording.
+        // Finalize the session early so error paths (validation failure, empty
+        // parts) leave the session in a consistent Finalized state rather than
+        // stuck in Recording with a Failed submission.
         if session.status == SessionStatus::Recording {
             let mut finalized_session = session.clone();
             finalized_session.status = SessionStatus::Finalized;
