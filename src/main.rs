@@ -319,11 +319,18 @@ fn state_inspect_cmd(config_path: &std::path::Path) -> AppResult<()> {
     println!();
 
     // Pipeline states
-    let pipeline_states = store.list_all_pipeline_states()?;
+    let pipeline_states = store.list_all_room_pipeline_states()?;
     if !pipeline_states.is_empty() {
         println!("Pipeline states:");
-        for (room_id, state) in &pipeline_states {
-            println!("  room {}: {:?}", room_id, state);
+        for (room_id, room_state) in &pipeline_states {
+            print!("  room {}: {:?}", room_id, room_state.state);
+            if let Some(session_id) = room_state.active_session_id {
+                print!("  session={session_id}");
+            }
+            if let (Some(err), Some(ts)) = (&room_state.last_error, &room_state.last_error_at) {
+                print!("  last_error=[{ts}] {err}");
+            }
+            println!();
         }
         println!();
     }
@@ -685,11 +692,7 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
             &client,
         )
         .await?;
-        if let Some(ref sel) = selected {
-            println!("selected = {}", sel.url);
-        } else {
-            println!("selected = none");
-        }
+        println!("selected = {}", selected.url);
     } else {
         println!("offline");
         println!("room_id = {}", room_info.room_id);
@@ -750,8 +753,7 @@ async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> Ap
         &check_config.record,
         &client,
     )
-    .await?
-    .ok_or_else(|| bilive_rec::error::AppError::Bilibili("no healthy stream candidates".into()))?;
+    .await?;
 
     tracing::info!(
         room_id = room_info.room_id,

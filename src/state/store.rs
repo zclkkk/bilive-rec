@@ -111,12 +111,12 @@ impl StateStore {
     ) -> AppResult<()> {
         self.write(|txn| {
             txn.put_session(session)?;
-            txn.put_room_pipeline_state(room_id, state, Some(session.id))
+            txn.put_room_pipeline_state(room_id, state, Some(session.id), None)
         })
     }
 
     pub fn put_pipeline_state(&self, room_id: u64, state: PipelineState) -> AppResult<()> {
-        self.write(|txn| txn.put_room_pipeline_state(room_id, state, None))
+        self.write(|txn| txn.put_room_pipeline_state(room_id, state, None, None))
     }
 
     pub fn put_room_pipeline_state(
@@ -125,7 +125,19 @@ impl StateStore {
         state: PipelineState,
         active_session_id: Option<Uuid>,
     ) -> AppResult<()> {
-        self.write(|txn| txn.put_room_pipeline_state(room_id, state, active_session_id))
+        self.write(|txn| txn.put_room_pipeline_state(room_id, state, active_session_id, None))
+    }
+
+    pub fn put_room_pipeline_state_with_error(
+        &self,
+        room_id: u64,
+        state: PipelineState,
+        active_session_id: Option<Uuid>,
+        last_error: String,
+    ) -> AppResult<()> {
+        self.write(|txn| {
+            txn.put_room_pipeline_state(room_id, state, active_session_id, Some(last_error))
+        })
     }
 
     pub fn get_pipeline_state(&self, room_id: u64) -> AppResult<Option<PipelineState>> {
@@ -388,10 +400,13 @@ impl StoreTxn<'_> {
         room_id: u64,
         state: PipelineState,
         active_session_id: Option<Uuid>,
+        last_error: Option<String>,
     ) -> AppResult<()> {
         let room_state = RoomPipelineState {
             state,
             active_session_id,
+            last_error_at: last_error.as_ref().map(|_| jiff::Timestamp::now()),
+            last_error,
         };
         let value = serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
         let mut table = self.txn.open_table(PIPELINE_STATES)?;
@@ -423,6 +438,8 @@ fn decode_room_pipeline_state(bytes: &[u8]) -> AppResult<RoomPipelineState> {
     Ok(RoomPipelineState {
         state: legacy_state,
         active_session_id: None,
+        last_error: None,
+        last_error_at: None,
     })
 }
 
@@ -642,7 +659,7 @@ mod tests {
             .write(|txn| {
                 txn.put_session(&session)?;
                 txn.put_segment(&seg)?;
-                txn.put_room_pipeline_state(7, PipelineState::Recording, Some(session.id))
+                txn.put_room_pipeline_state(7, PipelineState::Recording, Some(session.id), None)
             })
             .unwrap();
 

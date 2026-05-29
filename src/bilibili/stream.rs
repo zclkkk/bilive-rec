@@ -161,9 +161,9 @@ pub async fn select_healthy_stream_candidate(
     candidates: &[StreamCandidate],
     config: &ResolvedRecordConfig,
     client: &BiliClient,
-) -> AppResult<Option<StreamCandidate>> {
+) -> AppResult<StreamCandidate> {
     if candidates.is_empty() {
-        return Ok(None);
+        return Err(AppError::Bilibili("no stream candidates returned".into()));
     }
     let mut sorted: Vec<_> = candidates
         .iter()
@@ -171,14 +171,23 @@ pub async fn select_healthy_stream_candidate(
         .cloned()
         .collect();
     if sorted.is_empty() {
-        return Ok(None);
+        return Err(AppError::Bilibili(
+            "no supported AVC FLV stream candidates returned".into(),
+        ));
     }
     sorted.sort_by(|a, b| compare_candidates(a, b, config));
 
+    let mut checked = 0usize;
+    let mut unhealthy_statuses = 0usize;
+    let mut request_errors = 0usize;
+    let mut last_request_error = None;
+
     for candidate in sorted {
+        checked += 1;
         match check_stream_health(client.client(), &candidate.url).await {
-            Ok(true) => return Ok(Some(candidate)),
+            Ok(true) => return Ok(candidate),
             Ok(false) => {
+                unhealthy_statuses += 1;
                 tracing::debug!(
                     qn = candidate.qn,
                     cdn = candidate.cdn_name.as_str(),
@@ -187,6 +196,8 @@ pub async fn select_healthy_stream_candidate(
                 );
             }
             Err(e) => {
+                request_errors += 1;
+                last_request_error = Some(e.to_string());
                 tracing::debug!(
                     qn = candidate.qn,
                     cdn = candidate.cdn_name.as_str(),
@@ -197,7 +208,14 @@ pub async fn select_healthy_stream_candidate(
             }
         }
     }
-    Ok(None)
+
+    let mut reason = format!(
+        "no healthy stream candidates among {checked} supported candidates ({unhealthy_statuses} unhealthy statuses, {request_errors} request errors)"
+    );
+    if let Some(error) = last_request_error {
+        reason.push_str(&format!("; last request error: {error}"));
+    }
+    Err(AppError::Bilibili(reason))
 }
 
 /// Compares two candidates. Returns `Ordering::Less` if `a` is better than `b` (sorting priority).
@@ -338,6 +356,29 @@ mod tests {
         let selected = select_stream_candidate(&[unsupported.clone(), avc], &config).unwrap();
         assert_eq!(selected.url, "avc_url");
         assert!(select_stream_candidate(&[unsupported], &config).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_healthy_selection_rejects_empty_candidates_without_network() {
+        let client = BiliClient::new(None).unwrap();
+        let err = select_healthy_stream_candidate(&[], &default_config(), &client)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("no stream candidates"));
+    }
+
+    #[tokio::test]
+    async fn test_healthy_selection_rejects_unsupported_candidates_without_network() {
+        let client = BiliClient::new(None).unwrap();
+        let unsupported =
+            make_test_candidate("unsupported_url", Codec::Unknown, 10000, "ws", "host");
+
+        let err = select_healthy_stream_candidate(&[unsupported], &default_config(), &client)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("no supported AVC FLV"));
     }
 
     #[test]

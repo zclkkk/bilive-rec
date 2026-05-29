@@ -370,6 +370,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 
     /// Validate, persist, and apply a state transition. The common path
     /// where the pipeline state is the only thing changing on disk.
+    /// Clears any previously persisted `last_error`.
     pub fn transition(&mut self, next: PipelineState) -> AppResult<()> {
         self.check_transition(next)?;
         let active_session_id = if pipeline_state_requires_active_session(next) {
@@ -380,6 +381,28 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         self.store
             .put_room_pipeline_state(self.room_id, next, active_session_id)?;
         self.apply_transition(next)
+    }
+
+    /// Like [`transition`], but also persists an error message so operators
+    /// can see what went wrong via `state inspect` without digging through logs.
+    fn transition_with_error(&mut self, next: PipelineState, error: String) -> AppResult<()> {
+        self.check_transition(next)?;
+        let active_session_id = if pipeline_state_requires_active_session(next) {
+            self.active_session_id
+        } else {
+            None
+        };
+        self.store.put_room_pipeline_state_with_error(
+            self.room_id,
+            next,
+            active_session_id,
+            error,
+        )?;
+        self.apply_transition(next)
+    }
+
+    fn wait_reconnect_with_error(&mut self, reason: impl Into<String>) -> AppResult<()> {
+        self.transition_with_error(PipelineState::WaitingReconnect, reason.into())
     }
 
     pub fn reconnect_delay(&self) -> std::time::Duration {
@@ -438,11 +461,12 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
             }
             Err(e) => {
+                let reason = format!("fetch_room_info failed: {e}");
                 warn!("Failed to fetch room info for {}: {}", self.room_id, e);
                 if self.session.state == PipelineState::Resolving {
-                    self.transition(PipelineState::Failed)?;
+                    self.transition_with_error(PipelineState::Failed, reason)?;
                 } else {
-                    self.transition(PipelineState::WaitingReconnect)?;
+                    self.wait_reconnect_with_error(reason)?;
                 }
             }
         }
@@ -474,8 +498,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             match fetch_play_info(&self.client, self.room_id, self.room_config.record.qn).await {
                 Ok(info) => info,
                 Err(e) => {
-                    warn!("fetch_play_info failed: {}", e);
-                    self.transition(PipelineState::WaitingReconnect)?;
+                    let reason = format!("fetch_play_info failed: {e}");
+                    warn!("{}", reason);
+                    self.wait_reconnect_with_error(reason)?;
                     return Ok(());
                 }
             };
@@ -483,13 +508,14 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         let candidates = match parse_stream_candidates(&play_info) {
             Ok(c) => c,
             Err(e) => {
-                warn!("Failed to parse stream candidates: {}", e);
-                self.transition(PipelineState::WaitingReconnect)?;
+                let reason = format!("parse_stream_candidates failed: {e}");
+                warn!("{}", reason);
+                self.wait_reconnect_with_error(reason)?;
                 return Ok(());
             }
         };
 
-        let cand_opt = match select_healthy_stream_candidate(
+        let cand = match select_healthy_stream_candidate(
             &candidates,
             &self.room_config.record,
             &self.client,
@@ -498,17 +524,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         {
             Ok(c) => c,
             Err(e) => {
-                warn!("No healthy stream candidates: {}", e);
-                self.transition(PipelineState::WaitingReconnect)?;
-                return Ok(());
-            }
-        };
-
-        let cand = match cand_opt {
-            Some(c) => c,
-            None => {
-                warn!("No healthy stream candidates available");
-                self.transition(PipelineState::WaitingReconnect)?;
+                let reason = format!("select_healthy_stream_candidate failed: {e}");
+                warn!("{}", reason);
+                self.wait_reconnect_with_error(reason)?;
                 return Ok(());
             }
         };
@@ -522,8 +540,9 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!("Failed to connect to stream: {}", e);
-                self.transition(PipelineState::WaitingReconnect)?;
+                let reason = format!("stream connect failed: {e}");
+                warn!("{}", reason);
+                self.wait_reconnect_with_error(reason)?;
                 return Ok(());
             }
         };
@@ -655,7 +674,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             Err(e) => match recording_retry_reason(e) {
                 Ok(reason) => {
                     warn!("record_flv retryable error: {}", reason);
-                    self.transition(PipelineState::WaitingReconnect)?;
+                    self.wait_reconnect_with_error(reason)?;
                 }
                 Err(e) => {
                     error!("record_flv fatal error: {}", e);
@@ -1315,6 +1334,41 @@ mod tests {
     }
 
     #[test]
+    fn test_wait_reconnect_with_error_persists_and_normal_transition_clears() {
+        let mut supervisor = mock_supervisor();
+        let session_id = put_recording_session(&supervisor.store, 1);
+        supervisor.session.state = PipelineState::Recording;
+        supervisor.active_session_id = Some(session_id);
+
+        supervisor
+            .wait_reconnect_with_error("stream connect failed: timeout")
+            .unwrap();
+
+        let persisted = supervisor
+            .store
+            .get_room_pipeline_state(supervisor.room_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, PipelineState::WaitingReconnect);
+        assert_eq!(persisted.active_session_id, Some(session_id));
+        assert_eq!(
+            persisted.last_error.as_deref(),
+            Some("stream connect failed: timeout")
+        );
+        assert!(persisted.last_error_at.is_some());
+
+        supervisor.transition(PipelineState::ReResolving).unwrap();
+        let cleared = supervisor
+            .store
+            .get_room_pipeline_state(supervisor.room_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleared.state, PipelineState::ReResolving);
+        assert!(cleared.last_error.is_none());
+        assert!(cleared.last_error_at.is_none());
+    }
+
+    #[test]
     fn test_offline_grace_starts_when_entering_waiting_reconnect() {
         let mut supervisor = mock_supervisor();
         let session_id = put_recording_session(&supervisor.store, 1);
@@ -1384,6 +1438,18 @@ mod tests {
             supervisor.offline_since.is_some(),
             "resumed WaitingReconnect cannot know the old monotonic instant, so it starts grace at resume"
         );
+    }
+
+    #[test]
+    fn test_recording_retry_reason_is_context_local() {
+        assert!(recording_retry_reason(AppError::Bilibili("risk control".into())).is_ok());
+        assert!(recording_retry_reason(AppError::StreamProtocol("bad tag".into())).is_ok());
+        assert!(
+            recording_retry_reason(AppError::StreamRepeatedData("duplicated media".into())).is_ok()
+        );
+
+        assert!(recording_retry_reason(AppError::State("bad invariant".into())).is_err());
+        assert!(recording_retry_reason(AppError::Config("bad config".into())).is_err());
     }
 
     #[test]
