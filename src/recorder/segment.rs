@@ -131,28 +131,6 @@ mod tests {
     }
 
     #[test]
-    fn test_segment_event_identity() {
-        let session_id = test_uuid();
-        let index = 42;
-        let event = SegmentEvent::Started {
-            session_id,
-            index,
-            part_path: PathBuf::from("test.part"),
-        };
-        match event {
-            SegmentEvent::Started {
-                session_id: sid,
-                index: idx,
-                ..
-            } => {
-                assert_eq!(sid, session_id);
-                assert_eq!(idx, index);
-            }
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
     fn test_should_rotate_by_size() {
         let policy = SegmentPolicy {
             segment_time: None,

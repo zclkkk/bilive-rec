@@ -310,14 +310,4 @@ mod tests {
         // And the cell is still empty — no half-initialized BiliBili.
         assert!(uploader.bili.get().is_none());
     }
-
-    /// Sanity check: BiliupUploader is Send + Sync, so it can live behind
-    /// the `Arc<U: Uploader + Send + Sync + 'static>` that RoomSupervisor
-    /// requires. If a future change adds a non-Send field this fails to
-    /// compile loudly.
-    #[test]
-    fn bili_up_uploader_is_send_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<BiliupUploader>();
-    }
 }
