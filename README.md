@@ -45,10 +45,11 @@ bilive-rec run
 ## Documentation
 
 - [入门指南](docs/guide/getting-started.md) — 安装、配置、首次运行
+- [工作原理](docs/guide/how-it-works.md) — 状态机、录制生命周期、崩溃恢复
 - [配置详解](docs/guide/configuration.md) — 各配置区块、模板系统、覆盖机制
 - [CLI Reference](docs/reference/cli.md) — 命令完整用法
 - [配置字段速查](docs/reference/config-fields.md) — 所有字段的类型、默认值
-- [架构设计](docs/architecture.md) — 状态机、模块划分、故障恢复机制
+- [架构设计](docs/dev/architecture.md) — 模块结构、错误分类、持久化设计（面向开发者）
 
 ## License
 
