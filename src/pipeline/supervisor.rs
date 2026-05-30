@@ -405,6 +405,16 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         self.transition_with_error(PipelineState::WaitingReconnect, reason.into())
     }
 
+    fn handle_room_info_error(&mut self, error: AppError) -> AppResult<()> {
+        let reason = format!("fetch_room_info failed: {error}");
+        warn!("Failed to fetch room info for {}: {}", self.room_id, error);
+        if self.session.state == PipelineState::Resolving {
+            self.transition_with_error(PipelineState::Offline, reason)
+        } else {
+            self.wait_reconnect_with_error(reason)
+        }
+    }
+
     pub fn reconnect_delay(&self) -> std::time::Duration {
         let base = std::time::Duration::from_secs(self.config.backoff_s);
         let max = std::time::Duration::from_secs(self.config.max_backoff_s);
@@ -461,13 +471,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
             }
             Err(e) => {
-                let reason = format!("fetch_room_info failed: {e}");
-                warn!("Failed to fetch room info for {}: {}", self.room_id, e);
-                if self.session.state == PipelineState::Resolving {
-                    self.transition_with_error(PipelineState::Failed, reason)?;
-                } else {
-                    self.wait_reconnect_with_error(reason)?;
-                }
+                self.handle_room_info_error(e)?;
             }
         }
         Ok(())
@@ -1368,6 +1372,32 @@ mod tests {
         assert_eq!(cleared.state, PipelineState::ReResolving);
         assert!(cleared.last_error.is_none());
         assert!(cleared.last_error_at.is_none());
+    }
+
+    #[test]
+    fn test_resolving_fetch_error_is_retryable_offline() {
+        let mut supervisor = mock_supervisor();
+        supervisor.transition(PipelineState::Resolving).unwrap();
+
+        supervisor
+            .handle_room_info_error(AppError::Bilibili("-352".into()))
+            .unwrap();
+
+        assert_eq!(supervisor.session.state, PipelineState::Offline);
+        let persisted = supervisor
+            .store
+            .get_room_pipeline_state(supervisor.room_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.state, PipelineState::Offline);
+        assert!(persisted.active_session_id.is_none());
+        assert!(
+            persisted
+                .last_error
+                .as_deref()
+                .is_some_and(|err| err.contains("fetch_room_info failed"))
+        );
+        assert!(persisted.last_error_at.is_some());
     }
 
     #[test]
