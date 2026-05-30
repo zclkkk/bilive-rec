@@ -682,7 +682,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
                 Err(e) => {
                     error!("record_flv fatal error: {}", e);
-                    return Err(e);
+                    return self.finish_recording_after_fatal_error(e).await;
                 }
             },
         }
@@ -734,6 +734,12 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             }
         }
         Ok(())
+    }
+
+    async fn finish_recording_after_fatal_error(&mut self, error: AppError) -> AppResult<()> {
+        self.join_background_uploads().await?;
+        self.transition(PipelineState::Failed)?;
+        Err(error)
     }
 
     /// Join background upload tasks, then upload every segment still missing a
@@ -1531,6 +1537,61 @@ mod tests {
         assert_eq!(
             supervisor.reconnect_delay(),
             std::time::Duration::from_secs(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fatal_recording_error_joins_background_uploads() {
+        let mut supervisor = mock_supervisor();
+        let session_id = put_recording_session(&supervisor.store, 1);
+        supervisor.session.state = PipelineState::Recording;
+        supervisor.active_session_id = Some(session_id);
+
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_clone = completed.clone();
+        supervisor.upload_tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
+
+        let err = supervisor
+            .finish_recording_after_fatal_error(AppError::State("fatal record error".into()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "fatal recording exit must wait for owned background uploads"
+        );
+        assert!(supervisor.upload_tasks.is_empty());
+        assert_eq!(supervisor.session.state, PipelineState::Failed);
+        assert!(matches!(err, AppError::State(ref msg) if msg == "fatal record error"));
+    }
+
+    #[tokio::test]
+    async fn test_fatal_recording_error_prioritizes_ambiguous_background_upload() {
+        let mut supervisor = mock_supervisor();
+        let session_id = put_recording_session(&supervisor.store, 1);
+        supervisor.session.state = PipelineState::Recording;
+        supervisor.active_session_id = Some(session_id);
+
+        supervisor.upload_tasks.push(tokio::spawn(async {
+            Err(BackgroundUploadFailure::Ambiguous {
+                index: 7,
+                error: "redb commit failed".into(),
+            })
+        }));
+
+        let err = supervisor
+            .finish_recording_after_fatal_error(AppError::State("fatal record error".into()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(supervisor.session.state, PipelineState::Failed);
+        assert!(
+            err.to_string().contains("segment 7")
+                && err.to_string().contains("UploadedPart persistence failed")
         );
     }
 
