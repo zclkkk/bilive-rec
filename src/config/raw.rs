@@ -240,6 +240,8 @@ pub enum SubmitApi {
     #[default]
     App,
     Web,
+    #[serde(rename = "bcut_android")]
+    BCutAndroid,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -884,17 +886,15 @@ url = "https://live.bilibili.com/1"
     }
 
     #[test]
-    fn upload_validation_accepts_both_submit_apis() {
-        for api in [SubmitApi::App, SubmitApi::Web] {
+    fn upload_validation_accepts_all_submit_apis() {
+        for api in [SubmitApi::App, SubmitApi::Web, SubmitApi::BCutAndroid] {
             let upload = UploadConfig {
                 credential: Some("main".into()),
                 line: "auto".into(),
                 threads: 3,
                 submit_api: api,
             };
-            upload
-                .validate()
-                .expect("both App and Web submit APIs must validate");
+            upload.validate().expect("all submit APIs must validate");
         }
     }
 
@@ -917,6 +917,13 @@ url = "https://live.bilibili.com/1"
         assert_eq!(json, "\"app\"");
         let s: SubmitApi = serde_json::from_str("\"web\"").unwrap();
         assert!(matches!(s, SubmitApi::Web));
+        let json = serde_json::to_string(&SubmitApi::BCutAndroid).unwrap();
+        assert_eq!(json, "\"bcut_android\"");
+        let s: SubmitApi = serde_json::from_str("\"bcut_android\"").unwrap();
+        assert!(matches!(s, SubmitApi::BCutAndroid));
+
+        assert!(serde_json::from_str::<SubmitApi>("\"bcutandroid\"").is_err());
+        assert!(serde_json::from_str::<SubmitApi>("\"b-cut-android\"").is_err());
     }
 
     #[test]

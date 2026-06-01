@@ -36,7 +36,7 @@
 | `credential` | string | 无 | 视命令 | 上传账号名 |
 | `line` | string | `auto` | 否 | 上传线路：`auto` 或 `bda2` |
 | `threads` | usize | `3` | 否 | 单文件上传并发数 |
-| `submit_api` | string | `app` | 否 | 投稿 API：`app` 或 `web` |
+| `submit_api` | string | `app` | 否 | 投稿 API：`app`、`web` 或 `bcut_android` |
 
 ## [submit]
 

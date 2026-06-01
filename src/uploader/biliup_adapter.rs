@@ -116,6 +116,10 @@ impl Uploader for BiliupUploader {
                 Ok(res) => res,
                 Err(error) => return submit_error_to_outcome("web", error),
             },
+            SubmitApi::BCutAndroid => match bili.submit_by_bcut_android(&studio, None).await {
+                Ok(res) => res,
+                Err(error) => return submit_error_to_outcome("bcut_android", error),
+            },
         };
 
         if res.code != 0 {

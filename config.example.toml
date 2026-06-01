@@ -32,6 +32,7 @@ delete_after_submit = false
 credential = "main"
 line = "auto"
 threads = 3
+# app, web, or bcut_android
 submit_api = "app"
 
 [submit]

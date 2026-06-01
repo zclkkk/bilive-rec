@@ -82,7 +82,7 @@ delete_after_submit = false  # 投稿确认后删除本地文件
 credential = "main"   # 上传账号
 line = "auto"         # 上传线路：auto 或 bda2
 threads = 3           # 单文件上传并发数
-submit_api = "app"    # 投稿 API：app 或 web
+submit_api = "app"    # 投稿 API：app、web 或 bcut_android
 ```
 
 ---
