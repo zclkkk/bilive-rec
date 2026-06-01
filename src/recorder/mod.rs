@@ -19,13 +19,13 @@ use crate::state::store::StateStore;
 use reqwest::Response;
 use std::path::PathBuf;
 use std::time::Instant;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[derive(Debug)]
 struct ActiveSegment {
-    file: tokio::fs::File,
+    writer: BufWriter<tokio::fs::File>,
     index: u32,
     part_path: std::path::PathBuf,
     size: u64,
@@ -65,6 +65,8 @@ struct InitialSegmentWrite {
 const METADATA_BODY_OFFSET: u64 = 13 + 11;
 const KEYFRAME_INDEX_MIN_INTERVAL_MS: u32 = 1_900;
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 30;
+const SEGMENT_WRITE_BUFFER_CAPACITY: usize = 128 * 1024;
+const TAG_WRITE_BUFFER_INITIAL_CAPACITY: usize = 16 * 1024;
 
 fn duration_millis_u64(duration: std::time::Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
@@ -85,6 +87,7 @@ pub struct FlvRecorder<'a> {
     header: Option<FlvHeader>,
     normalizer: FlvNormalizer,
     media_group: MediaGroupBuffer,
+    tag_write_buffer: Vec<u8>,
 
     next_index: u32,
     phase: RecordPhase,
@@ -116,6 +119,7 @@ impl<'a> FlvRecorder<'a> {
             header: None,
             normalizer: FlvNormalizer::new(),
             media_group: MediaGroupBuffer::new(),
+            tag_write_buffer: Vec::with_capacity(TAG_WRITE_BUFFER_INITIAL_CAPACITY),
             next_index: start_index,
             phase: RecordPhase::WaitSync,
         })
@@ -321,17 +325,20 @@ impl<'a> FlvRecorder<'a> {
         // Write current tag
         if let RecordPhase::Recording(seg) = &mut self.phase {
             self.normalizer.normalize_media_timestamp(&mut tag);
-            let mut buf = Vec::new();
+            self.tag_write_buffer.clear();
             let file_position = seg.size;
             let timestamp = tag.header.timestamp;
             let is_keyframe = crate::recorder::flv::is_avc_keyframe(&tag.data);
-            tag.write(&mut buf)
+            tag.write(&mut self.tag_write_buffer)
                 .map_err(|e| AppError::StreamProtocol(format!("FLV tag write error: {}", e)))?;
-            seg.file.write_all(&buf).await.map_err(|e| AppError::Io {
-                path: seg.part_path.clone(),
-                source: e,
-            })?;
-            seg.size += buf.len() as u64;
+            seg.writer
+                .write_all(&self.tag_write_buffer)
+                .await
+                .map_err(|e| AppError::Io {
+                    path: seg.part_path.clone(),
+                    source: e,
+                })?;
+            seg.size += self.tag_write_buffer.len() as u64;
             seg.duration_ms = seg.duration_ms.max(timestamp);
             if is_keyframe
                 && seg.keyframes.last().is_none_or(|last| {
@@ -360,13 +367,13 @@ impl<'a> FlvRecorder<'a> {
         let final_p = final_path(&self.policy.layout, &self.session_id, seg.index);
 
         if should_filter_by_size(seg.size, &self.policy.filter) {
-            if let Err(e) = seg.file.flush().await.map_err(|e| AppError::Io {
+            if let Err(e) = seg.writer.flush().await.map_err(|e| AppError::Io {
                 path: seg.part_path.clone(),
                 source: e,
             }) {
                 return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
             }
-            drop(seg.file);
+            drop(seg.writer);
 
             let db_seg = Segment {
                 session_id: self.session_id,
@@ -404,13 +411,13 @@ impl<'a> FlvRecorder<'a> {
             return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
         }
 
-        if let Err(e) = seg.file.flush().await.map_err(|e| AppError::Io {
+        if let Err(e) = seg.writer.flush().await.map_err(|e| AppError::Io {
             path: seg.part_path.clone(),
             source: e,
         }) {
             return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
         }
-        drop(seg.file);
+        drop(seg.writer);
 
         if let Err(e) = tokio::fs::rename(&seg.part_path, &final_p)
             .await
@@ -536,8 +543,10 @@ impl<'a> FlvRecorder<'a> {
 
         self.normalizer.start_new_file();
 
+        let writer = BufWriter::with_capacity(SEGMENT_WRITE_BUFFER_CAPACITY, file);
+
         self.phase = RecordPhase::Recording(Box::new(ActiveSegment {
-            file,
+            writer,
             index: idx,
             part_path: p_path,
             size: initial.size,
@@ -640,17 +649,26 @@ impl<'a> FlvRecorder<'a> {
         Ok(())
     }
 
-    pub fn mark_failed(&mut self, err_msg: &str) -> AppResult<()> {
+    pub async fn mark_failed(&mut self, err_msg: &str) -> AppResult<()> {
         if let RecordPhase::Recording(seg) =
             std::mem::replace(&mut self.phase, RecordPhase::WaitSync)
         {
+            let mut seg = seg;
+            let error = match seg.writer.flush().await {
+                Ok(()) => err_msg.to_string(),
+                Err(flush_err) => format!(
+                    "{err_msg}; additionally failed to flush buffered segment data: {flush_err}"
+                ),
+            };
+            drop(seg.writer);
+
             let db_seg = Segment {
                 session_id: self.session_id,
                 index: seg.index,
                 path: seg.part_path.clone(),
                 status: SegmentStatus::Failed,
                 close_reason: None,
-                error: Some(err_msg.to_string()),
+                error: Some(error),
             };
             self.store.put_segment(&db_seg)?;
         }
@@ -659,6 +677,11 @@ impl<'a> FlvRecorder<'a> {
 }
 
 async fn rewrite_segment_metadata(seg: &mut ActiveSegment) -> AppResult<()> {
+    seg.writer.flush().await.map_err(|e| AppError::Io {
+        path: seg.part_path.clone(),
+        source: e,
+    })?;
+
     let body = build_metadata_body(&seg.metadata_source, seg.duration_ms, &seg.keyframes);
     if body.len() != seg.metadata_len {
         return Err(AppError::StreamProtocol(format!(
@@ -668,18 +691,25 @@ async fn rewrite_segment_metadata(seg: &mut ActiveSegment) -> AppResult<()> {
         )));
     }
 
-    seg.file
+    seg.writer
         .seek(std::io::SeekFrom::Start(METADATA_BODY_OFFSET))
         .await
         .map_err(|e| AppError::Io {
             path: seg.part_path.clone(),
             source: e,
         })?;
-    seg.file.write_all(&body).await.map_err(|e| AppError::Io {
+    seg.writer
+        .write_all(&body)
+        .await
+        .map_err(|e| AppError::Io {
+            path: seg.part_path.clone(),
+            source: e,
+        })?;
+    seg.writer.flush().await.map_err(|e| AppError::Io {
         path: seg.part_path.clone(),
         source: e,
     })?;
-    seg.file
+    seg.writer
         .seek(std::io::SeekFrom::End(0))
         .await
         .map_err(|e| AppError::Io {
@@ -762,11 +792,14 @@ pub async fn record_flv(
             return Err(e);
         }
         let err_msg = e.to_string();
-        recorder.mark_failed(&err_msg).map_err(|persist_err| {
-            AppError::State(format!(
-                "{err_msg}; additionally failed to persist failed segment state: {persist_err}"
-            ))
-        })?;
+        recorder
+            .mark_failed(&err_msg)
+            .await
+            .map_err(|persist_err| {
+                AppError::State(format!(
+                    "{err_msg}; additionally failed to persist failed segment state: {persist_err}"
+                ))
+            })?;
         return Err(e);
     }
 
