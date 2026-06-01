@@ -128,7 +128,7 @@ bilive-rec state resolve-submission <session-id> --as failed
 
 ### 可审计恢复
 
-`bilive-rec` 使用 redb 作为本地嵌入式状态库，记录 session、segment、uploaded part、submission 和房间 pipeline 状态。
+`bilive-rec` 使用 redb 作为本地嵌入式状态库，记录 session、segment、uploaded part、submission plan、submission 和房间状态。
 
 崩溃后可以先看状态：
 
@@ -256,7 +256,7 @@ cargo run -- run
 
 - 只关心 B 站直播录制和 B 站投稿
 - 希望进程崩溃后有明确状态可查
-- 希望自动流水线尽量少猜、少隐式行为
+- 希望自动录制上传链路尽量少猜、少隐式行为
 - 接受用配置文件管理房间、账号和投稿元数据
 
 不适合：

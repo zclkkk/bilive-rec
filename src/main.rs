@@ -61,14 +61,28 @@ fn init_tracing() {
         .ok();
 }
 
+enum RunTaskResult {
+    Room(AppResult<()>),
+    UploadWorker(AppResult<()>),
+}
+
+#[derive(Debug, Default)]
+struct RunTaskOutcome {
+    failed: bool,
+    global_failure: bool,
+    room_finished: bool,
+    upload_worker_finished: bool,
+}
+
 async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
     let run_config = config.resolve_for_run()?;
     tracing::info!("config loaded from {}", config_path.display());
 
-    use bilive_rec::pipeline::state_machine::PipelineState;
+    use bilive_rec::pipeline::state_machine::RoomState;
     use bilive_rec::pipeline::supervisor::{RoomSupervisor, RoomSupervisorDeps};
     use bilive_rec::uploader::biliup_adapter::BiliupUploader;
+    use bilive_rec::uploader::worker::{UploadTarget, UploadWorker};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::time::Duration;
@@ -87,26 +101,48 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
 
     let mut uploaders = HashMap::new();
     for room_config in &prepared_rooms {
-        let room_credentials = room_config.credentials();
-        if uploaders.contains_key(&room_credentials.upload) {
+        let target = UploadTarget::new(
+            room_config.upload.credential.clone(),
+            room_config.upload.submit_api.clone(),
+        );
+        if uploaders.contains_key(&target) {
             continue;
         }
         tracing::info!(
             "Checking upload credential '{}'...",
-            room_credentials.upload.name
+            room_config.upload.credential.name
         );
         let uploader = Arc::new(BiliupUploader::new(
-            room_credentials.upload.cookie_file.clone(),
-            run_config.upload.line.clone(),
-            run_config.upload.threads,
-            run_config.upload.submit_api.clone(),
+            room_config.upload.credential.cookie_file.clone(),
+            room_config.upload.line.clone(),
+            room_config.upload.threads,
+            room_config.upload.submit_api.clone(),
         ));
         uploader.check_login().await?;
-        uploaders.insert(room_credentials.upload.clone(), uploader);
+        uploaders.insert(target, uploader);
     }
 
     let mut clients: HashMap<Option<bilive_rec::credential::CredentialIdentity>, Arc<BiliClient>> =
         HashMap::new();
+
+    let mut active_room_tasks = prepared_rooms.len();
+    let mut upload_worker_running = false;
+    if active_room_tasks > 0 {
+        upload_worker_running = true;
+        handles.push(tokio::spawn({
+            let store = store_clone.clone();
+            let uploaders = uploaders.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            let poll_interval = Duration::from_secs(pipeline_config.poll_interval_s);
+            async move {
+                RunTaskResult::UploadWorker(
+                    UploadWorker::new(store, uploaders, poll_interval, shutdown_rx)
+                        .run()
+                        .await,
+                )
+            }
+        }));
+    }
 
     for room_config in prepared_rooms {
         let room_url = room_config.url.clone();
@@ -131,89 +167,78 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
             client
         };
 
-        let uploader = uploaders
-            .get(&room_credentials.upload)
-            .ok_or_else(|| {
-                bilive_rec::error::AppError::State(format!(
-                    "upload credential '{}' was not initialized",
-                    room_credentials.upload.name
-                ))
-            })?
-            .clone();
-
         let shutdown_rx = shutdown_rx.clone();
         let pipeline_config = pipeline_config.clone();
 
         let handle = tokio::spawn(async move {
-            let room_id =
-                match bilive_rec::bilibili::room::resolve_room_id(&client, &room_url).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        return Err(bilive_rec::error::AppError::Bilibili(format!(
-                            "Failed to resolve room URL {}: {}",
-                            room_url, e
-                        )));
+            let result = async move {
+                let room_id =
+                    match bilive_rec::bilibili::room::resolve_room_id(&client, &room_url).await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            return Err(bilive_rec::error::AppError::Bilibili(format!(
+                                "Failed to resolve room URL {}: {}",
+                                room_url, e
+                            )));
+                        }
+                    };
+
+                let mut loop_shutdown_rx = shutdown_rx.clone();
+                let mut supervisor = RoomSupervisor::new(
+                    room_id,
+                    pipeline_config.clone(),
+                    room_config,
+                    RoomSupervisorDeps { store, client },
+                    shutdown_rx,
+                )?;
+
+                tracing::info!("Started supervisor for room {}", room_id);
+
+                loop {
+                    // Check shutdown before each step
+                    if *loop_shutdown_rx.borrow() {
+                        tracing::info!("Room {} shutting down (signal received)", room_id);
+                        return Ok::<(), bilive_rec::error::AppError>(());
                     }
-                };
 
-            let mut loop_shutdown_rx = shutdown_rx.clone();
-            let mut supervisor = RoomSupervisor::new(
-                room_id,
-                pipeline_config.clone(),
-                room_config,
-                RoomSupervisorDeps {
-                    store,
-                    client,
-                    uploader,
-                },
-                shutdown_rx,
-            )?;
-
-            tracing::info!("Started supervisor for room {}", room_id);
-
-            loop {
-                // Check shutdown before each step
-                if *loop_shutdown_rx.borrow() {
-                    tracing::info!("Room {} shutting down (signal received)", room_id);
-                    return Ok::<(), bilive_rec::error::AppError>(());
-                }
-
-                match supervisor.run_step().await {
-                    Ok(()) => {}
-                    Err(bilive_rec::error::AppError::GracefulShutdown) => {
-                        tracing::info!("Room {} interrupted by graceful shutdown", room_id);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        tracing::error!("Fatal supervisor error for room {}: {}", room_id, e);
-                        return Err(e);
-                    }
-                }
-
-                let state = supervisor.session.state;
-                let sleep_duration = match state {
-                    PipelineState::Idle => {
-                        Some(Duration::from_secs(pipeline_config.poll_interval_s))
-                    }
-                    PipelineState::Failed | PipelineState::Offline => {
-                        Some(Duration::from_secs(pipeline_config.poll_interval_s))
-                    }
-                    PipelineState::WaitingReconnect => Some(supervisor.reconnect_delay()),
-                    _ => None, // Recording, Uploading blocks/pumps immediately
-                };
-
-                if let Some(d) = sleep_duration {
-                    tokio::select! {
-                        _ = tokio::time::sleep(d) => {}
-                        _ = loop_shutdown_rx.changed() => {
-                            tracing::info!("Room {} shutting down (signal during sleep)", room_id);
+                    match supervisor.run_step().await {
+                        Ok(()) => {}
+                        Err(bilive_rec::error::AppError::GracefulShutdown) => {
+                            tracing::info!("Room {} interrupted by graceful shutdown", room_id);
                             return Ok(());
+                        }
+                        Err(e) => {
+                            tracing::error!("Fatal supervisor error for room {}: {}", room_id, e);
+                            return Err(e);
+                        }
+                    }
+
+                    let state = supervisor.session.state;
+                    let sleep_duration = match state {
+                        RoomState::Idle => {
+                            Some(Duration::from_secs(pipeline_config.poll_interval_s))
+                        }
+                        RoomState::Failed | RoomState::Offline => {
+                            Some(Duration::from_secs(pipeline_config.poll_interval_s))
+                        }
+                        RoomState::WaitingReconnect => Some(supervisor.reconnect_delay()),
+                        _ => None, // Recording blocks/pumps immediately
+                    };
+
+                    if let Some(d) = sleep_duration {
+                        tokio::select! {
+                            _ = tokio::time::sleep(d) => {}
+                            _ = loop_shutdown_rx.changed() => {
+                                tracing::info!("Room {} shutting down (signal during sleep)", room_id);
+                                return Ok(());
+                            }
                         }
                     }
                 }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), bilive_rec::error::AppError>(())
+            .await;
+
+            RunTaskResult::Room(result)
         });
 
         handles.push(handle);
@@ -240,8 +265,24 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                     shutdown_initiated = true;
                 }
                 Some(res) = handles.next() => {
-                    if process_room_result(res) {
+                    let outcome = process_run_task_result(res);
+                    if outcome.failed {
                         any_failed = true;
+                    }
+                    if outcome.room_finished {
+                        active_room_tasks = active_room_tasks.saturating_sub(1);
+                    }
+                    if outcome.upload_worker_finished {
+                        upload_worker_running = false;
+                    }
+                    if outcome.global_failure && !shutdown_initiated {
+                        let _ = shutdown_tx.send(true);
+                        shutdown_initiated = true;
+                    }
+                    if active_room_tasks == 0 && upload_worker_running && !shutdown_initiated {
+                        tracing::info!("All room tasks finished; signaling upload worker shutdown...");
+                        let _ = shutdown_tx.send(true);
+                        shutdown_initiated = true;
                     }
                 }
             }
@@ -254,46 +295,90 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                     ));
                 }
                 Some(res) = handles.next() => {
-                    if process_room_result(res) {
+                    let outcome = process_run_task_result(res);
+                    if outcome.failed {
                         any_failed = true;
+                    }
+                    if outcome.room_finished {
+                        active_room_tasks = active_room_tasks.saturating_sub(1);
+                    }
+                    if outcome.upload_worker_finished {
+                        upload_worker_running = false;
+                    }
+                    if outcome.global_failure {
+                        let _ = shutdown_tx.send(true);
+                    }
+                    if active_room_tasks == 0 && upload_worker_running {
+                        tracing::info!("All room tasks finished; signaling upload worker shutdown...");
+                        let _ = shutdown_tx.send(true);
                     }
                 }
             }
         }
     }
 
-    tracing::info!("All room tasks finished.");
+    tracing::info!("All run tasks finished.");
 
     if any_failed {
         Err(bilive_rec::error::AppError::State(
-            "One or more room tasks failed; run `state inspect` for details".into(),
+            "One or more run tasks failed; run `state inspect` for details".into(),
         ))
     } else {
         Ok(())
     }
 }
 
-/// Classify a single room task result. Returns true if the task failed
-/// (non-graceful error or panic), false otherwise.
-fn process_room_result(
-    res: Result<bilive_rec::error::AppResult<()>, tokio::task::JoinError>,
-) -> bool {
-    match res {
-        Ok(Ok(())) => {
+fn process_room_outcome(result: bilive_rec::error::AppResult<()>) -> bool {
+    match result {
+        Ok(()) => {
             tracing::info!("Room task shut down cleanly");
             false
         }
-        Ok(Err(bilive_rec::error::AppError::GracefulShutdown)) => {
+        Err(bilive_rec::error::AppError::GracefulShutdown) => {
             tracing::info!("Room task interrupted by shutdown");
             false
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             tracing::error!("Room task error: {}", e);
             true
         }
+    }
+}
+
+fn process_run_task_result(res: Result<RunTaskResult, tokio::task::JoinError>) -> RunTaskOutcome {
+    match res {
+        Ok(RunTaskResult::Room(result)) => RunTaskOutcome {
+            failed: process_room_outcome(result),
+            global_failure: false,
+            room_finished: true,
+            upload_worker_finished: false,
+        },
+        Ok(RunTaskResult::UploadWorker(Ok(()))) => {
+            tracing::info!("Upload worker shut down cleanly");
+            RunTaskOutcome {
+                failed: false,
+                global_failure: false,
+                room_finished: false,
+                upload_worker_finished: true,
+            }
+        }
+        Ok(RunTaskResult::UploadWorker(Err(e))) => {
+            tracing::error!("Upload worker error: {}", e);
+            RunTaskOutcome {
+                failed: true,
+                global_failure: true,
+                room_finished: false,
+                upload_worker_finished: true,
+            }
+        }
         Err(join_err) => {
-            tracing::warn!("Room task panicked: {}", join_err);
-            true
+            tracing::warn!("Run task panicked: {}", join_err);
+            RunTaskOutcome {
+                failed: true,
+                global_failure: true,
+                room_finished: false,
+                upload_worker_finished: false,
+            }
         }
     }
 }
@@ -316,13 +401,14 @@ fn state_inspect_cmd(config_path: &std::path::Path) -> AppResult<()> {
     println!("  segments: {}", summary.segment_count);
     println!("  uploaded_parts: {}", summary.uploaded_parts_count);
     println!("  submissions: {}", summary.submission_count);
+    println!("  submission_plans: {}", summary.submission_plan_count);
     println!();
 
-    // Pipeline states
-    let pipeline_states = store.list_all_room_pipeline_states()?;
-    if !pipeline_states.is_empty() {
-        println!("Pipeline states:");
-        for (room_id, room_state) in &pipeline_states {
+    // Room states
+    let room_states = store.list_all_room_states()?;
+    if !room_states.is_empty() {
+        println!("Room states:");
+        for (room_id, room_state) in &room_states {
             print!("  room {}: {:?}", room_id, room_state.state);
             if let Some(session_id) = room_state.active_session_id {
                 print!("  session={session_id}");
@@ -704,7 +790,7 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
 
 /// One-shot recording. Resolves the room, captures the stream into the
 /// configured output dir, and persists a LiveSession + segment rows. No
-/// upload, no pipeline state machine. Stops on Ctrl-C or when the stream
+/// upload, no persisted room state. Stops on Ctrl-C or when the stream
 /// ends. For long-running multi-room operation with auto-upload, use `run`.
 async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> AppResult<()> {
     use bilive_rec::recorder::record_flv;
@@ -854,7 +940,7 @@ async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> Ap
         session_id,
         policy,
         store.as_ref(),
-        event_tx,
+        Some(event_tx),
         1,
         shutdown_rx,
     )
@@ -1116,61 +1202,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_room_result_clean_exit() {
-        let handle = tokio::spawn(async { Ok(()) });
-        let res = handle.await;
-        assert!(!process_room_result(res));
+    async fn test_process_room_outcome_clean_exit() {
+        assert!(!process_room_outcome(Ok(())));
     }
 
     #[tokio::test]
-    async fn test_process_room_result_graceful_shutdown() {
-        let handle = tokio::spawn(async { Err(bilive_rec::error::AppError::GracefulShutdown) });
-        let res = handle.await;
-        assert!(!process_room_result(res));
+    async fn test_process_room_outcome_graceful_shutdown() {
+        assert!(!process_room_outcome(Err(
+            bilive_rec::error::AppError::GracefulShutdown
+        )));
     }
 
     #[tokio::test]
-    async fn test_process_room_result_fatal_error() {
-        let handle = tokio::spawn(async {
-            Err(bilive_rec::error::AppError::State(
-                "room is in Failed".into(),
-            ))
-        });
-        let res = handle.await;
-        assert!(process_room_result(res));
+    async fn test_process_room_outcome_fatal_error() {
+        assert!(process_room_outcome(Err(
+            bilive_rec::error::AppError::State("room is in Failed".into(),)
+        )));
     }
 
     #[tokio::test]
-    async fn test_process_room_result_panic() {
-        let handle: tokio::task::JoinHandle<bilive_rec::error::AppResult<()>> =
+    async fn test_process_run_task_result_panic_is_global_failure() {
+        let handle: tokio::task::JoinHandle<RunTaskResult> =
             tokio::spawn(async { panic!("simulated panic") });
-        let res = handle.await;
-        assert!(process_room_result(res));
+
+        let outcome = process_run_task_result(handle.await);
+
+        assert!(outcome.failed);
+        assert!(outcome.global_failure);
+        assert!(!outcome.room_finished);
+        assert!(!outcome.upload_worker_finished);
     }
 
-    /// Smoke test: drain loop terminates when all handles complete, regardless
-    /// of whether they succeed, fail, or panic, and reports any_failed correctly.
+    #[tokio::test]
+    async fn test_process_run_task_result_room_error_is_not_global_failure() {
+        let handle = tokio::spawn(async {
+            RunTaskResult::Room(Err(bilive_rec::error::AppError::State(
+                "room failed".into(),
+            )))
+        });
+
+        let outcome = process_run_task_result(handle.await);
+
+        assert!(outcome.failed);
+        assert!(!outcome.global_failure);
+        assert!(outcome.room_finished);
+        assert!(!outcome.upload_worker_finished);
+    }
+
+    #[tokio::test]
+    async fn test_process_run_task_result_worker_error_is_global_failure() {
+        let handle = tokio::spawn(async {
+            RunTaskResult::UploadWorker(Err(bilive_rec::error::AppError::State(
+                "worker failed".into(),
+            )))
+        });
+
+        let outcome = process_run_task_result(handle.await);
+
+        assert!(outcome.failed);
+        assert!(outcome.global_failure);
+        assert!(!outcome.room_finished);
+        assert!(outcome.upload_worker_finished);
+    }
+
+    /// Smoke test: drain loop sees room task outcomes through the same enum the
+    /// run loop uses, instead of preserving the pre-worker task shape.
     #[tokio::test]
     async fn test_run_cmd_drains_mixed_room_outcomes() {
         use futures::stream::FuturesUnordered;
 
-        let handles: FuturesUnordered<tokio::task::JoinHandle<bilive_rec::error::AppResult<()>>> =
+        let handles: FuturesUnordered<tokio::task::JoinHandle<RunTaskResult>> =
             FuturesUnordered::new();
-        handles.push(tokio::spawn(async { Ok(()) }));
+        handles.push(tokio::spawn(async { RunTaskResult::Room(Ok(())) }));
         handles.push(tokio::spawn(async {
-            Err(bilive_rec::error::AppError::State(
+            RunTaskResult::Room(Err(bilive_rec::error::AppError::State(
                 "simulated room failure".into(),
-            ))
+            )))
         }));
         handles.push(tokio::spawn(async {
-            Err(bilive_rec::error::AppError::GracefulShutdown)
+            RunTaskResult::Room(Err(bilive_rec::error::AppError::GracefulShutdown))
         }));
 
         // Drain all handles using the same classifier the main loop uses.
         let mut any_failed = false;
         let mut handles = handles;
         while let Some(res) = futures::StreamExt::next(&mut handles).await {
-            if process_room_result(res) {
+            let outcome = process_run_task_result(res);
+            assert!(!outcome.global_failure);
+            assert!(outcome.room_finished);
+            if outcome.failed {
                 any_failed = true;
             }
         }

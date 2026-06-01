@@ -25,9 +25,9 @@ src/
 │   ├── cdn.rs           # CDN 健康探测
 │   ├── wbi.rs           # WBI 签名
 │   └── types.rs         # API 响应类型
-├── pipeline/            # 状态机与房间协调器
-│   ├── state_machine.rs # PipelineState 枚举，can_transition_to()
-│   ├── session.rs       # PipelineSession（状态机包装）
+├── pipeline/            # 房间状态机与录制协调器
+│   ├── state_machine.rs # RoomState 枚举，can_transition_to()
+│   ├── session.rs       # RoomStateMachine（状态机包装）
 │   └── supervisor.rs    # RoomSupervisor（房间生命周期管理）
 ├── recorder/            # FLV 录制引擎
 │   ├── mod.rs           # FlvRecorder，record_flv() 核心循环
@@ -42,7 +42,8 @@ src/
 └── uploader/            # 上传与投稿
     ├── types.rs         # Uploader trait，UploadRequest，SubmissionRequest
     ├── biliup_adapter.rs # BiliupUploader（biliup crate 适配）
-    └── validation.rs    # 上传对账，分段校验
+    ├── validation.rs    # 上传对账，分段校验
+    └── worker.rs        # UploadWorker（从 redb 推导上传/投稿任务）
 ```
 
 ---
@@ -70,7 +71,7 @@ src/
 错误的重试/致命分类不是全局的，而是由调用上下文决定。`recording_retry_reason()` 函数（`supervisor.rs`）为录制上下文定义分类：
 
 - **可重试**：`Network`、`Bilibili`、`StreamProtocol`、`StreamRepeatedData` → 持久化错误信息，进入 `WaitingReconnect`
-- **致命**：`Io`、`Config`、`Database`、`Table`、`Transaction`、`Storage`、`Commit`、`State`、`GracefulShutdown` → 终止 pipeline
+- **致命**：`Io`、`Config`、`Database`、`Table`、`Transaction`、`Storage`、`Commit`、`State`、`GracefulShutdown` → 终止当前房间
 
 其他上下文（上传、投稿）有自己的错误处理逻辑，不复用此函数。
 
@@ -87,20 +88,22 @@ src/
 | `segments` | `{uuid}:{index:010}` | JSON `Segment` | 录制分段 |
 | `uploaded_parts` | `{uuid}:{index:010}` | JSON `UploadedPart` | 已上传分段 |
 | `submissions` | UUID 字符串 | JSON `Submission` | 投稿记录 |
-| `pipeline_states` | `u64` (room_id) | JSON `RoomPipelineState` | 房间 pipeline 状态 |
+| `submission_plans` | UUID 字符串 | JSON `SubmissionPlan` | session 创建时冻结的投稿计划 |
+| `room_states` | `u64` (room_id) | JSON `PersistedRoomState` | 房间录制状态 |
 
 ### 事务性写入
 
 `StateStore::write()` 在单个 redb 事务中执行闭包内的所有写入。原子写入的关键场景：
 
-- `put_session_and_pipeline_state()`：Session 和 PipelineState 同时写入
+- `create_recording_session()`：`LiveSession`、`SubmissionPlan` 和 `RoomState::Recording` 同时写入
+- `finalize_session_and_release_room()`：`LiveSession::Finalized` 和 `RoomState::Idle` 同时写入
 - 分段 finalize：rename `.part` → `.flv` 后立即更新 DB 状态；rename 失败时回滚
 
-### RoomPipelineState
+### PersistedRoomState
 
 ```rust
-struct RoomPipelineState {
-    state: PipelineState,
+struct PersistedRoomState {
+    state: RoomState,
     active_session_id: Option<Uuid>,
     last_error: Option<String>,        // 最近一次暂时性错误
     last_error_at: Option<Timestamp>,  // 错误发生时间
@@ -108,6 +111,10 @@ struct RoomPipelineState {
 ```
 
 `last_error` 在暂时性错误时持久化（如网络断开、流异常），在成功状态转换时清除。`state inspect` 命令会显示该字段。
+
+### SubmissionPlan
+
+`SubmissionPlan` 在 session 创建时写入，用来冻结本次投稿的标题、简介、分区、tag、投稿身份、提交接口和清理策略。上传 worker 后续只读取这个计划，不从当前配置重新推导历史 session 的投稿事实。
 
 ---
 
@@ -139,6 +146,8 @@ struct RoomPipelineState {
 ---
 
 ## Uploader 设计
+
+上传和投稿不属于房间状态机。`RoomSupervisor` 只负责录制并把 session 标记为 `Finalized`；`UploadWorker` 扫描 redb，从 `Segment`、`UploadedPart`、`SubmissionPlan` 和 `Submission` 推导下一步动作。
 
 ### Uploader trait
 

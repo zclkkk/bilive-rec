@@ -2,7 +2,7 @@
 //!
 //! Raw TOML structs live only at the edge. Runtime code should use resolved
 //! config types so inheritance, credentials, defaults, and validation are paid
-//! once before the pipeline starts.
+//! once before the run loop starts.
 
 mod defaults;
 mod raw;

@@ -22,7 +22,7 @@ pub enum Command {
         config: Option<PathBuf>,
     },
 
-    /// Record a live stream once (no upload, no pipeline state machine).
+    /// Record a live stream once (no upload, no persisted room state).
     ///
     /// Use this for ad-hoc recording. Stops on Ctrl-C or when the stream
     /// ends. For long-running multi-room operation with auto-upload, use
@@ -51,7 +51,7 @@ pub enum Command {
         config: Option<PathBuf>,
     },
 
-    /// Run the full pipeline
+    /// Run the recorder daemon
     Run {
         /// Path to config file
         #[arg(short, long, default_value = "config.toml")]
@@ -80,7 +80,7 @@ pub enum StateAction {
         #[arg(long)]
         apply: bool,
 
-        /// Reset a specific room's pipeline from Failed to Idle
+        /// Reset a specific room from Failed to Idle
         #[arg(long)]
         reset_room: Option<u64>,
 

@@ -2,22 +2,26 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub enum PipelineState {
+pub enum RoomState {
     Idle,
     Resolving,
     Offline,
     Recording,
     ReResolving,
     WaitingReconnect,
-    Uploading,
-    Submitting,
-    Submitted,
     Failed,
 }
 
-impl PipelineState {
-    /// Validates if a state transition is allowed in the pipeline.
-    pub fn can_transition_to(&self, next: PipelineState) -> bool {
+impl RoomState {
+    pub fn requires_active_session(self) -> bool {
+        matches!(
+            self,
+            Self::Recording | Self::ReResolving | Self::WaitingReconnect
+        )
+    }
+
+    /// Validates if a room lifecycle transition is allowed.
+    pub fn can_transition_to(&self, next: RoomState) -> bool {
         if *self == next {
             return true;
         }
@@ -31,20 +35,14 @@ impl PipelineState {
                 | (Self::Offline, Self::Idle)
                 | (Self::Recording, Self::ReResolving)
                 | (Self::Recording, Self::WaitingReconnect)
-                | (Self::Recording, Self::Uploading)
                 | (Self::Recording, Self::Failed)
                 | (Self::ReResolving, Self::Recording)
                 | (Self::ReResolving, Self::WaitingReconnect)
                 | (Self::ReResolving, Self::Failed)
                 | (Self::WaitingReconnect, Self::ReResolving)
                 | (Self::WaitingReconnect, Self::Recording)
-                | (Self::WaitingReconnect, Self::Uploading)
+                | (Self::WaitingReconnect, Self::Idle)
                 | (Self::WaitingReconnect, Self::Failed)
-                | (Self::Uploading, Self::Submitting)
-                | (Self::Uploading, Self::Failed)
-                | (Self::Submitting, Self::Submitted)
-                | (Self::Submitting, Self::Failed)
-                | (Self::Submitted, Self::Idle)
                 | (Self::Failed, Self::Idle)
         )
     }

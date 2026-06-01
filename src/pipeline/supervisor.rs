@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -13,50 +12,17 @@ use crate::bilibili::stream::{
 use crate::bilibili::types::LiveStatus;
 use crate::config::{PipelineConfig, ResolvedRoomConfig, RoomCredentials};
 use crate::error::{AppError, AppResult};
-use crate::pipeline::session::PipelineSession;
-use crate::pipeline::state_machine::PipelineState;
+use crate::pipeline::session::RoomStateMachine;
+use crate::pipeline::state_machine::RoomState;
+use crate::recorder::record_flv;
 use crate::recorder::segment::{RecorderPolicy, SegmentFilter, SegmentLayout, SegmentPolicy};
-use crate::recorder::{record_flv, segment::SegmentEvent};
-use crate::state::model::{
-    LiveSession, SegmentStatus, SessionStatus, Submission, SubmissionStatus,
-};
+use crate::state::model::{LiveSession, SessionStatus, SubmissionPlan};
 use crate::state::store::StateStore;
 use crate::submission_template::render_room_template;
-use crate::uploader::types::{SubmissionOutcome, SubmissionRequest, Uploader};
-use crate::uploader::validation::{
-    PersistedUploadFailure, reconcile_session_uploads, upload_and_persist_segment,
-    validate_finalized_segment_for_upload,
-};
 
-/// A background upload task's outcome that the supervisor cannot safely
-/// reconcile on its own. Recoverable failures (clean remote errors, failed
-/// preconditions) are intentionally absent: the task logs them and continues,
-/// leaving the leftover `Finalized` segments for store-based reconciliation.
-#[derive(Debug)]
-enum BackgroundUploadFailure {
-    /// Could not even persist the pre-upload intent — the store is unreliable.
-    FatalState { index: u32, error: String },
-    /// Remote upload may have succeeded but durable state could not be written.
-    Ambiguous { index: u32, error: String },
-}
-
-type BackgroundUploadResult = Result<(), BackgroundUploadFailure>;
-
-pub struct RoomSupervisorDeps<U: Uploader + Send + Sync + 'static> {
+pub struct RoomSupervisorDeps {
     pub store: Arc<StateStore>,
     pub client: Arc<BiliClient>,
-    pub uploader: Arc<U>,
-}
-
-fn pipeline_state_requires_active_session(state: PipelineState) -> bool {
-    matches!(
-        state,
-        PipelineState::Recording
-            | PipelineState::ReResolving
-            | PipelineState::WaitingReconnect
-            | PipelineState::Uploading
-            | PipelineState::Submitting
-    )
 }
 
 fn recording_retry_reason(error: AppError) -> Result<String, AppError> {
@@ -75,122 +41,6 @@ fn recording_retry_reason(error: AppError) -> Result<String, AppError> {
         | AppError::State(_)
         | AppError::GracefulShutdown => Err(error),
     }
-}
-
-fn ensure_session_ready_to_submit(store: &StateStore, session_id: Uuid) -> AppResult<()> {
-    let segments = store.list_segments(session_id)?;
-    let uploaded_indices: std::collections::HashSet<u32> = store
-        .list_uploaded_parts(session_id)?
-        .into_iter()
-        .map(|part| part.segment_index)
-        .collect();
-
-    let report = reconcile_session_uploads(&segments, &uploaded_indices);
-    if let Some((index, reason)) = report.blocked.first() {
-        return Err(AppError::State(format!(
-            "Segment {index} blocks submission: {reason}"
-        )));
-    }
-    if let Some(index) = report.needs_upload.first() {
-        return Err(AppError::State(format!(
-            "Segment {index} is Finalized but has no UploadedPart; refusing submission"
-        )));
-    }
-    Ok(())
-}
-
-async fn cleanup_submitted_session_recordings(
-    store: &StateStore,
-    session_id: Uuid,
-) -> AppResult<usize> {
-    let session = store
-        .get_session(session_id)?
-        .ok_or_else(|| AppError::State(format!("Session {session_id} not found")))?;
-    if session.status != SessionStatus::Finalized {
-        return Err(AppError::State(format!(
-            "Session {session_id} is {:?}, not Finalized; refusing recording cleanup",
-            session.status
-        )));
-    }
-
-    let submission = store
-        .get_submission(session_id)?
-        .ok_or_else(|| AppError::State(format!("Session {session_id} has no submission")))?;
-    if submission.status != SubmissionStatus::Submitted {
-        return Err(AppError::State(format!(
-            "Session {session_id} submission is {:?}, not Submitted; refusing recording cleanup",
-            submission.status
-        )));
-    }
-
-    let uploaded_indices: std::collections::HashSet<u32> = store
-        .list_uploaded_parts(session_id)?
-        .into_iter()
-        .map(|part| part.segment_index)
-        .collect();
-    let segments = store.list_segments(session_id)?;
-    let mut cleaned = 0;
-
-    for segment in segments {
-        match segment.status {
-            SegmentStatus::Cleaned | SegmentStatus::Filtered => {}
-            SegmentStatus::Uploaded | SegmentStatus::Finalized => {
-                if !uploaded_indices.contains(&segment.index) {
-                    return Err(AppError::State(format!(
-                        "Segment {}/{} is {:?} but has no UploadedPart; refusing recording cleanup",
-                        segment.session_id, segment.index, segment.status
-                    )));
-                }
-
-                match tokio::fs::metadata(&segment.path).await {
-                    Ok(metadata) => {
-                        if !metadata.is_file() {
-                            return Err(AppError::State(format!(
-                                "Segment {}/{} path is not a regular file: {}",
-                                segment.session_id,
-                                segment.index,
-                                segment.path.display()
-                            )));
-                        }
-                        match tokio::fs::remove_file(&segment.path).await {
-                            Ok(()) => {}
-                            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                                // Crash or concurrent cleanup after metadata but before remove:
-                                // deletion is already true, so the state can still be advanced.
-                            }
-                            Err(source) => {
-                                return Err(AppError::Io {
-                                    path: segment.path.clone(),
-                                    source,
-                                });
-                            }
-                        }
-                    }
-                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(source) => {
-                        return Err(AppError::Io {
-                            path: segment.path.clone(),
-                            source,
-                        });
-                    }
-                }
-
-                let mut cleaned_segment = segment;
-                cleaned_segment.status = SegmentStatus::Cleaned;
-                cleaned_segment.error = None;
-                store.put_segment(&cleaned_segment)?;
-                cleaned += 1;
-            }
-            SegmentStatus::Recording | SegmentStatus::Uploading | SegmentStatus::Failed => {
-                return Err(AppError::State(format!(
-                    "Segment {}/{} is {:?}; refusing recording cleanup",
-                    segment.session_id, segment.index, segment.status
-                )));
-            }
-        }
-    }
-
-    Ok(cleaned)
 }
 
 fn validate_session_credentials(
@@ -226,52 +76,48 @@ fn validate_session_credentials(
     Ok(())
 }
 
-pub struct RoomSupervisor<U: Uploader + Send + Sync + 'static> {
+pub struct RoomSupervisor {
     pub room_id: u64,
-    pub session: PipelineSession,
+    pub session: RoomStateMachine,
     pub config: PipelineConfig,
     pub room_config: ResolvedRoomConfig,
     pub store: Arc<StateStore>,
     pub client: Arc<BiliClient>,
-    pub uploader: Arc<U>,
     pub active_session_id: Option<Uuid>,
-    upload_tasks: Vec<JoinHandle<BackgroundUploadResult>>,
     pub offline_since: Option<Instant>,
     reconnect_attempt: u32,
     pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
-impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
+impl RoomSupervisor {
     pub fn new(
         room_id: u64,
         config: PipelineConfig,
         room_config: ResolvedRoomConfig,
-        deps: RoomSupervisorDeps<U>,
+        deps: RoomSupervisorDeps,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> AppResult<Self> {
         let expected_credentials = room_config.credentials();
         let mut supervisor = Self {
             room_id,
-            session: PipelineSession::new(room_id),
+            session: RoomStateMachine::new(room_id),
             config,
             room_config,
             store: deps.store.clone(),
             client: deps.client,
-            uploader: deps.uploader,
             active_session_id: None,
-            upload_tasks: Vec::new(),
             offline_since: None,
             reconnect_attempt: 0,
             shutdown_rx,
         };
 
-        if let Some(room_state) = deps.store.get_room_pipeline_state(room_id)? {
+        if let Some(room_state) = deps.store.get_room_state(room_id)? {
             supervisor.session.state = room_state.state;
 
-            if pipeline_state_requires_active_session(room_state.state) {
+            if room_state.state.requires_active_session() {
                 let session_id = room_state.active_session_id.ok_or_else(|| {
                     AppError::State(format!(
-                        "Persisted pipeline state {:?} requires active_session_id",
+                        "Persisted room state {:?} requires active_session_id",
                         room_state.state
                     ))
                 })?;
@@ -287,16 +133,16 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                         session_id, session.room_key, room_id
                     )));
                 }
-                if session.status == SessionStatus::Failed {
+                if session.status != SessionStatus::Recording {
                     return Err(AppError::State(format!(
-                        "Persisted active session {} is Failed",
-                        session_id
+                        "Persisted active session {} is {:?}, not Recording",
+                        session_id, session.status
                     )));
                 }
                 validate_session_credentials(&session, &expected_credentials)?;
                 supervisor.active_session_id = Some(session_id);
             }
-            if room_state.state == PipelineState::WaitingReconnect {
+            if room_state.state == RoomState::WaitingReconnect {
                 supervisor.offline_since = Some(Instant::now());
             }
         }
@@ -304,112 +150,89 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         Ok(supervisor)
     }
 
-    /// Validate the transition `prev -> next` against the state machine
-    /// table and the active-session invariant. Used as a precondition by
-    /// both `transition` (which persists first) and the atomic-write paths
-    /// that bundle the pipeline state with other rows (which must validate
-    /// *before* persisting so an invalid transition cannot poison disk
-    /// state).
-    fn check_transition(&self, next: PipelineState) -> AppResult<()> {
+    fn check_transition(&self, next: RoomState) -> AppResult<()> {
         self.check_transition_with_active_session(next, self.active_session_id)
     }
 
     fn check_transition_with_active_session(
         &self,
-        next: PipelineState,
+        next: RoomState,
         active_session_id: Option<Uuid>,
     ) -> AppResult<()> {
         if !self.session.state.can_transition_to(next) {
             return Err(AppError::State(format!(
-                "Invalid pipeline state transition from {:?} to {:?}",
+                "Invalid room state transition from {:?} to {:?}",
                 self.session.state, next
             )));
         }
-        if pipeline_state_requires_active_session(next) && active_session_id.is_none() {
+        if next.requires_active_session() && active_session_id.is_none() {
             return Err(AppError::State(format!(
-                "Pipeline state {:?} requires an active session",
+                "Room state {:?} requires an active session",
                 next
             )));
         }
         Ok(())
     }
 
-    /// Apply an in-memory state transition that has already been persisted.
-    /// Callers must have validated with `check_transition` and persisted
-    /// the new pipeline state to redb before invoking this. The re-check
-    /// here is a safety net — if it ever fires it means a caller skipped
-    /// the contract and we should refuse to silently corrupt in-memory
-    /// state to match a bad on-disk write.
-    fn apply_transition(&mut self, next: PipelineState) -> AppResult<()> {
+    fn apply_transition(&mut self, next: RoomState) -> AppResult<()> {
         self.check_transition(next)?;
         let prev = self.session.state;
-        if !pipeline_state_requires_active_session(next) {
+        if !next.requires_active_session() {
             self.active_session_id = None;
         }
-        if next == PipelineState::WaitingReconnect && prev != PipelineState::WaitingReconnect {
+        if next == RoomState::WaitingReconnect && prev != RoomState::WaitingReconnect {
             self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
             self.offline_since.get_or_insert_with(Instant::now);
         }
         if matches!(
             next,
-            PipelineState::Recording
-                | PipelineState::Uploading
-                | PipelineState::Resolving
-                | PipelineState::Offline
-                | PipelineState::Submitted
-                | PipelineState::Failed
-                | PipelineState::Idle
+            RoomState::Recording
+                | RoomState::Resolving
+                | RoomState::Offline
+                | RoomState::Failed
+                | RoomState::Idle
         ) {
             self.reconnect_attempt = 0;
             self.offline_since = None;
         }
         self.session.state = next;
-        info!(room_id = self.room_id, from = ?prev, to = ?next, "Pipeline state transition");
+        info!(room_id = self.room_id, from = ?prev, to = ?next, "Room state transition");
         Ok(())
     }
 
-    /// Validate, persist, and apply a state transition. The common path
-    /// where the pipeline state is the only thing changing on disk.
-    /// Clears any previously persisted `last_error`.
-    pub fn transition(&mut self, next: PipelineState) -> AppResult<()> {
+    pub fn transition(&mut self, next: RoomState) -> AppResult<()> {
         self.check_transition(next)?;
-        let active_session_id = if pipeline_state_requires_active_session(next) {
+        let active_session_id = if next.requires_active_session() {
             self.active_session_id
         } else {
             None
         };
         self.store
-            .put_room_pipeline_state(self.room_id, next, active_session_id)?;
+            .put_room_state(self.room_id, next, active_session_id)?;
         self.apply_transition(next)
     }
 
-    /// Like [`transition`], but also persists an error message so operators
-    /// can see what went wrong via `state inspect` without digging through logs.
-    fn transition_with_error(&mut self, next: PipelineState, error: String) -> AppResult<()> {
+    fn transition_with_error(&mut self, next: RoomState, error: String) -> AppResult<()> {
         self.check_transition(next)?;
-        let active_session_id = if pipeline_state_requires_active_session(next) {
+        let active_session_id = if next.requires_active_session() {
             self.active_session_id
         } else {
             None
         };
-        self.store.put_room_pipeline_state_with_error(
-            self.room_id,
-            next,
-            active_session_id,
-            error,
-        )?;
+        self.store
+            .put_room_state_with_error(self.room_id, next, active_session_id, error)?;
         self.apply_transition(next)
     }
 
     fn wait_reconnect_with_error(&mut self, reason: impl Into<String>) -> AppResult<()> {
-        self.transition_with_error(PipelineState::WaitingReconnect, reason.into())
+        self.transition_with_error(RoomState::WaitingReconnect, reason.into())
     }
 
     fn handle_room_info_error(&mut self, error: AppError) -> AppResult<()> {
         let reason = format!("fetch_room_info failed: {error}");
         warn!("Failed to fetch room info for {}: {}", self.room_id, error);
-        if self.session.state == PipelineState::Resolving {
-            self.transition_with_error(PipelineState::Offline, reason)
+        if self.session.state == RoomState::Resolving {
+            self.transition_with_error(RoomState::Offline, reason)
         } else {
             self.wait_reconnect_with_error(reason)
         }
@@ -423,14 +246,67 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         base.saturating_mul(factor).min(max)
     }
 
-    /// Resolve room status. From `Resolving` this opens a brand-new session on
-    /// first live detection; from `ReResolving` it resumes the active session
-    /// or falls back to waiting/uploading.
+    fn submission_plan_for_session(&self, session: &LiveSession) -> AppResult<SubmissionPlan> {
+        let title = self
+            .room_config
+            .submit
+            .title
+            .as_deref()
+            .map(|template| {
+                render_room_template(
+                    template,
+                    &self.room_config.name,
+                    &self.room_config.url,
+                    Some(session),
+                    self.room_id,
+                )
+            })
+            .transpose()?
+            .unwrap_or_else(|| session.title.clone());
+        let description = self
+            .room_config
+            .submit
+            .description
+            .as_deref()
+            .map(|template| {
+                render_room_template(
+                    template,
+                    &self.room_config.name,
+                    &self.room_config.url,
+                    Some(session),
+                    self.room_id,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let submit = &self.room_config.submit;
+
+        Ok(SubmissionPlan {
+            session_id: session.id,
+            upload_credential: self.room_config.upload.credential.clone(),
+            submit_api: self.room_config.upload.submit_api.clone(),
+            title,
+            description,
+            category_id: submit.category_id,
+            copyright: submit.copyright,
+            tags: submit.tags.clone(),
+            source: submit.source.clone(),
+            private: submit.private,
+            dynamic: submit.dynamic.clone(),
+            forbid_reprint: submit.forbid_reprint,
+            charging_panel: submit.charging_panel,
+            close_reply: submit.close_reply,
+            close_danmu: submit.close_danmu,
+            featured_reply: submit.featured_reply,
+            delete_after_submit: self.room_config.record.delete_after_submit,
+        })
+    }
+
     async fn step_resolving(&mut self) -> AppResult<()> {
         match fetch_room_info(&self.client, self.room_id).await {
             Ok(info) => {
                 if info.live_status == LiveStatus::Live {
-                    if self.session.state == PipelineState::Resolving {
+                    if self.session.state == RoomState::Resolving {
                         let session_id = Uuid::new_v4();
                         let room_credentials = self.room_config.credentials();
 
@@ -443,31 +319,26 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                             record_credential: room_credentials.record,
                             upload_credential: Some(room_credentials.upload),
                         };
+                        let submission_plan = self.submission_plan_for_session(&live_session)?;
 
-                        // Validate before the atomic write: an invalid
-                        // transition must not be persisted, even via
-                        // bundled writes. (Resolving -> Recording is in
-                        // the table, but we're not going to trust that
-                        // by hand — every caller of the state machine
-                        // goes through check_transition.)
                         self.check_transition_with_active_session(
-                            PipelineState::Recording,
+                            RoomState::Recording,
                             Some(session_id),
                         )?;
-                        self.store.put_session_and_pipeline_state(
+                        self.store.create_recording_session(
                             &live_session,
+                            &submission_plan,
                             self.room_id,
-                            PipelineState::Recording,
                         )?;
                         self.active_session_id = Some(session_id);
-                        self.apply_transition(PipelineState::Recording)?;
+                        self.apply_transition(RoomState::Recording)?;
                     } else {
-                        self.transition(PipelineState::Recording)?;
+                        self.transition(RoomState::Recording)?;
                     }
-                } else if self.session.state == PipelineState::Resolving {
-                    self.transition(PipelineState::Offline)?;
+                } else if self.session.state == RoomState::Resolving {
+                    self.transition(RoomState::Offline)?;
                 } else {
-                    self.transition(PipelineState::WaitingReconnect)?;
+                    self.transition(RoomState::WaitingReconnect)?;
                 }
             }
             Err(e) => {
@@ -477,9 +348,6 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         Ok(())
     }
 
-    /// Connect to the live stream and drive `record_flv` to completion,
-    /// spawning a background task that uploads finalized segments as they
-    /// arrive. Transient failures fall back to `WaitingReconnect`.
     async fn step_recording(&mut self) -> AppResult<()> {
         let active_session = self
             .active_session_id
@@ -551,104 +419,13 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             }
         };
 
-        // Compute start_index across all segments
-        let mut start_index = 1;
-        let segments = self.store.list_segments(active_session)?;
-        if let Some(max_idx) = segments.iter().map(|s| s.index).max() {
-            start_index = max_idx + 1;
-        }
-
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SegmentEvent>();
-        let uploader_clone = self.uploader.clone();
-        let store_clone = self.store.clone();
-
-        let handle = tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                match event {
-                    SegmentEvent::Finalized {
-                        session_id,
-                        index,
-                        path,
-                        size: _,
-                        close_reason,
-                    } => {
-                        info!(
-                            segment_index = index,
-                            segment_path = %path.display(),
-                            close_reason = %close_reason,
-                            "segment finalized"
-                        );
-                        let segment = match validate_finalized_segment_for_upload(
-                            &store_clone,
-                            session_id,
-                            index,
-                            Some(&path),
-                        ) {
-                            Ok(Ok(segment)) => segment,
-                            Ok(Err(reason)) => {
-                                // Precondition failed but state is clean; defer
-                                // this segment to reconciliation and keep
-                                // uploading the ones that follow.
-                                error!(
-                                    "Upload precondition failed for finalized segment {}: {} (deferring to reconciliation)",
-                                    index, reason
-                                );
-                                continue;
-                            }
-                            Err(error) => {
-                                error!(
-                                    "Failed to validate finalized segment {}: {} (deferring to reconciliation)",
-                                    index, error
-                                );
-                                continue;
-                            }
-                        };
-                        match upload_and_persist_segment(
-                            uploader_clone.as_ref(),
-                            &store_clone,
-                            segment,
-                            format!("Part {}", index),
-                        )
-                        .await
-                        {
-                            Ok(_uploaded_part) => {
-                                info!("Upload success for idx={}", index);
-                            }
-                            Err(PersistedUploadFailure::Remote { index, error }) => {
-                                // Remote upload failed but the segment was reset
-                                // to Finalized, so retrying it later is safe;
-                                // don't stall live uploads of later segments.
-                                error!(
-                                    "Upload segment failed for idx={}: {} (deferring to reconciliation)",
-                                    index, error
-                                );
-                                continue;
-                            }
-                            Err(PersistedUploadFailure::StateBeforeRemote { index, error }) => {
-                                error!(
-                                    "Failed to mark segment {} as Uploading before remote upload: {}",
-                                    index, error
-                                );
-                                return Err(BackgroundUploadFailure::FatalState { index, error });
-                            }
-                            Err(PersistedUploadFailure::StateAfterRemote { index, error }) => {
-                                error!(
-                                    "Upload segment persisted remotely but not locally for idx={}: {}",
-                                    index, error
-                                );
-                                return Err(BackgroundUploadFailure::Ambiguous { index, error });
-                            }
-                        }
-                    }
-                    _ => {
-                        // ignore Started, Filtered
-                    }
-                }
-            }
-            Ok(())
-        });
-
-        self.upload_tasks.push(handle);
+        let start_index = self
+            .store
+            .list_segments(active_session)?
+            .iter()
+            .map(|s| s.index)
+            .max()
+            .map_or(1, |idx| idx + 1);
 
         info!("Starting record_flv from index {}", start_index);
         match record_flv(
@@ -656,7 +433,7 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
             active_session,
             policy,
             &self.store,
-            event_tx,
+            None,
             start_index,
             self.shutdown_rx.clone(),
         )
@@ -664,15 +441,10 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
         {
             Ok(_) => {
                 info!("record_flv completed gracefully");
-                self.transition(PipelineState::WaitingReconnect)?;
+                self.transition(RoomState::WaitingReconnect)?;
             }
             Err(AppError::GracefulShutdown) => {
                 info!("record_flv interrupted by graceful shutdown");
-                // event_tx was moved into record_flv and dropped on return,
-                // closing the channel. Await the upload tasks to let them finish
-                // any in-flight upload before we exit.
-                self.join_background_uploads().await?;
-                // Do not transition — leave persisted state as-is for resume.
                 return Err(AppError::GracefulShutdown);
             }
             Err(e) => match recording_retry_reason(e) {
@@ -682,412 +454,52 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
                 }
                 Err(e) => {
                     error!("record_flv fatal error: {}", e);
-                    return self.finish_recording_after_fatal_error(e).await;
+                    self.transition(RoomState::Failed)?;
+                    return Err(e);
                 }
             },
         }
         Ok(())
     }
 
-    /// Decide whether to keep retrying the stream or give up and finalize the
-    /// session for upload, based on the offline grace window.
     fn step_waiting_reconnect(&mut self) -> AppResult<()> {
         let since = self.offline_since.get_or_insert_with(Instant::now);
 
         if since.elapsed().as_secs() > self.config.offline_grace_s {
-            info!("Offline grace period expired. Transitioning to Uploading.");
-            self.transition(PipelineState::Uploading)?;
+            let active_session = self.active_session_id.ok_or_else(|| {
+                AppError::State("WaitingReconnect state requires active_session_id".into())
+            })?;
+            info!("Offline grace period expired. Finalizing session and releasing room.");
+            self.check_transition(RoomState::Idle)?;
+            self.store
+                .finalize_session_and_release_room(self.room_id, active_session)?;
+            self.apply_transition(RoomState::Idle)?;
         } else {
-            self.transition(PipelineState::ReResolving)?;
+            self.transition(RoomState::ReResolving)?;
         }
         Ok(())
     }
 
-    /// Await every background upload task and interpret its outcome. The task
-    /// already defers recoverable failures to reconciliation, so it only ever
-    /// reports outcomes that cannot be reconciled automatically: a fatal state
-    /// write, an ambiguous remote result, or a panic. Each routes the room to
-    /// `Failed` and surfaces an error.
-    async fn join_background_uploads(&mut self) -> AppResult<()> {
-        let tasks = std::mem::take(&mut self.upload_tasks);
-        for task in tasks {
-            match task.await {
-                Ok(Ok(())) => {}
-                Ok(Err(BackgroundUploadFailure::FatalState { index, error })) => {
-                    self.transition(PipelineState::Failed)?;
-                    return Err(AppError::State(format!(
-                        "Failed to persist pre-upload state for segment {index}: {error}"
-                    )));
-                }
-                Ok(Err(BackgroundUploadFailure::Ambiguous { index, error })) => {
-                    self.transition(PipelineState::Failed)?;
-                    return Err(AppError::State(format!(
-                        "Remote upload for segment {index} may have succeeded, but UploadedPart persistence failed: {error}. Refusing automatic reconciliation."
-                    )));
-                }
-                Err(e) => {
-                    self.transition(PipelineState::Failed)?;
-                    return Err(AppError::State(format!(
-                        "Background upload task panicked; refusing automatic reconciliation: {e}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn finish_recording_after_fatal_error(&mut self, error: AppError) -> AppResult<()> {
-        self.join_background_uploads().await?;
-        self.transition(PipelineState::Failed)?;
-        Err(error)
-    }
-
-    /// Join background upload tasks, then upload every segment still missing a
-    /// durable `UploadedPart`. The session may only advance to `Submitting`
-    /// once [`reconcile_session_uploads`] reports the whole session ready;
-    /// anything blocked or still missing routes to `Failed`.
-    async fn step_uploading(&mut self) -> AppResult<()> {
-        let active_session = self
-            .active_session_id
-            .ok_or_else(|| AppError::State("Uploading state requires active_session_id".into()))?;
-
-        self.join_background_uploads().await?;
-
-        let segments = self.store.list_segments(active_session)?;
-        let uploaded_indices: std::collections::HashSet<u32> = self
-            .store
-            .list_uploaded_parts(active_session)?
-            .into_iter()
-            .map(|p| p.segment_index)
-            .collect();
-
-        let report = reconcile_session_uploads(&segments, &uploaded_indices);
-        let mut reconciliation_failed = false;
-
-        // Segments that cannot be auto-resolved block the whole session.
-        for (index, reason) in &report.blocked {
-            error!("Segment {} blocks upload reconciliation: {}", index, reason);
-            reconciliation_failed = true;
-        }
-
-        // Upload each finalized segment that still lacks a part.
-        for index in report.needs_upload {
-            info!("Reconciling upload for segment index {}", index);
-            let path = segments
-                .iter()
-                .find(|s| s.index == index)
-                .map(|s| s.path.clone());
-            match validate_finalized_segment_for_upload(
-                &self.store,
-                active_session,
-                index,
-                path.as_deref(),
-            )? {
-                Ok(segment) => match upload_and_persist_segment(
-                    self.uploader.as_ref(),
-                    &self.store,
-                    segment,
-                    format!("Part {}", index),
-                )
-                .await
-                {
-                    Ok(_part) => {}
-                    Err(PersistedUploadFailure::Remote { index, error }) => {
-                        error!("Reconciled upload failed for index {}: {}", index, error);
-                        reconciliation_failed = true;
-                    }
-                    Err(PersistedUploadFailure::StateBeforeRemote { index, error }) => {
-                        self.transition(PipelineState::Failed)?;
-                        return Err(AppError::State(format!(
-                            "Failed to mark segment {index} as Uploading before reconciliation: {error}. Refusing remote upload."
-                        )));
-                    }
-                    Err(PersistedUploadFailure::StateAfterRemote { index, error }) => {
-                        self.transition(PipelineState::Failed)?;
-                        return Err(AppError::State(format!(
-                            "Remote upload for segment {index} may have succeeded during reconciliation, but state persistence failed: {error}. Refusing automatic reconciliation."
-                        )));
-                    }
-                },
-                Err(reason) => {
-                    error!(
-                        "Upload precondition failed for segment {}: {}",
-                        index, reason
-                    );
-                    reconciliation_failed = true;
-                }
-            }
-        }
-
-        // Re-derive truth from the store: every segment must now be satisfied.
-        let final_segments = self.store.list_segments(active_session)?;
-        let final_indices: std::collections::HashSet<u32> = self
-            .store
-            .list_uploaded_parts(active_session)?
-            .into_iter()
-            .map(|p| p.segment_index)
-            .collect();
-        if !reconcile_session_uploads(&final_segments, &final_indices).is_ready() {
-            reconciliation_failed = true;
-        }
-
-        if reconciliation_failed {
-            self.transition(PipelineState::Failed)?;
-        } else {
-            self.transition(PipelineState::Submitting)?;
-        }
-        Ok(())
-    }
-
-    /// Finalize the session and submit all uploaded parts. Refuses to act on a
-    /// submission row that is already definitive (Submitted/Failed) or that is
-    /// in-flight/ambiguous (Pending/Ambiguous); those need manual resolution.
-    async fn step_submitting(&mut self) -> AppResult<()> {
-        let active_session = self
-            .active_session_id
-            .ok_or_else(|| AppError::State("Submitting state requires active_session_id".into()))?;
-        let session = self
-            .store
-            .get_session(active_session)?
-            .ok_or_else(|| AppError::State(format!("Session {active_session} not found")))?;
-
-        if self.handle_existing_submission(active_session).await? {
-            return Ok(());
-        }
-
-        let req = self.prepare_submission_request(active_session, &session)?;
-        self.submit_and_record_outcome(active_session, &session, req)
-            .await
-    }
-
-    /// If a submission row already exists, handle it according to its status.
-    /// Returns `true` if the caller should return immediately (the submission
-    /// is already resolved, failed, or ambiguous).
-    async fn handle_existing_submission(&mut self, session_id: Uuid) -> AppResult<bool> {
-        let Some(existing_sub) = self.store.get_submission(session_id)? else {
-            return Ok(false);
-        };
-
-        match existing_sub.status {
-            SubmissionStatus::Submitted => {
-                if self.room_config.record.delete_after_submit {
-                    let cleaned =
-                        cleanup_submitted_session_recordings(&self.store, session_id).await?;
-                    if cleaned > 0 {
-                        info!(
-                            session_id = %session_id,
-                            cleaned,
-                            "Deleted local recordings after confirmed submission"
-                        );
-                    }
-                }
-                self.transition(PipelineState::Submitted)?;
-                Ok(true)
-            }
-            SubmissionStatus::Failed => {
-                self.transition(PipelineState::Failed)?;
-                Err(AppError::State(
-                    "Submission previously failed. Requires Phase 6 recovery or manual intervention."
-                        .into(),
-                ))
-            }
-            SubmissionStatus::Pending => Err(AppError::State(
-                "Pending submission is unknown/in-flight and requires Phase 6 recovery/manual verification."
-                    .into(),
-            )),
-            SubmissionStatus::Ambiguous => Err(AppError::State(
-                "Ambiguous submission — Bilibili accepted but did not return aid/bvid; resolve via `state resolve-submission <session_id> --as submitted|failed`."
-                    .into(),
-            )),
-        }
-    }
-
-    /// Finalize the session, validate readiness, collect parts, and build the
-    /// submission request. Fails the pipeline on validation errors.
-    fn prepare_submission_request(
-        &mut self,
-        session_id: Uuid,
-        session: &LiveSession,
-    ) -> AppResult<SubmissionRequest> {
-        // Finalize the session early so error paths (validation failure, empty
-        // parts) leave the session in a consistent Finalized state rather than
-        // stuck in Recording with a Failed submission.
-        if session.status == SessionStatus::Recording {
-            let mut finalized_session = session.clone();
-            finalized_session.status = SessionStatus::Finalized;
-            self.store.put_session(&finalized_session)?;
-        }
-
-        if let Err(e) = ensure_session_ready_to_submit(&self.store, session_id) {
-            self.transition(PipelineState::Failed)?;
-            return Err(e);
-        }
-
-        let mut parts = self.store.list_uploaded_parts(session_id)?;
-        parts.sort_by_key(|p| p.segment_index);
-
-        if parts.is_empty() {
-            let sub = Submission {
-                session_id,
-                upload_credential: session.upload_credential.clone().ok_or_else(|| {
-                    AppError::State(format!("Session {session_id} has no upload credential"))
-                })?,
-                status: SubmissionStatus::Failed,
-                aid: None,
-                bvid: None,
-                error: Some("No parts to submit".into()),
-            };
-            self.store.put_submission(&sub)?;
-            self.transition(PipelineState::Failed)?;
-            return Err(AppError::State("No parts to submit".into()));
-        }
-
-        let title = self
-            .room_config
-            .submit
-            .title
-            .as_deref()
-            .map(|template| {
-                render_room_template(
-                    template,
-                    &self.room_config.name,
-                    &self.room_config.url,
-                    Some(session),
-                    self.room_id,
-                )
-            })
-            .transpose()?
-            .unwrap_or_else(|| session.title.clone());
-        let description = self
-            .room_config
-            .submit
-            .description
-            .as_deref()
-            .map(|template| {
-                render_room_template(
-                    template,
-                    &self.room_config.name,
-                    &self.room_config.url,
-                    Some(session),
-                    self.room_id,
-                )
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let submit = &self.room_config.submit;
-
-        Ok(SubmissionRequest {
-            title,
-            description,
-            category_id: submit.category_id,
-            copyright: submit.copyright,
-            tags: submit.tags.clone(),
-            source: submit.source.clone(),
-            private: submit.private,
-            dynamic: submit.dynamic.clone(),
-            forbid_reprint: submit.forbid_reprint,
-            charging_panel: submit.charging_panel,
-            close_reply: submit.close_reply,
-            close_danmu: submit.close_danmu,
-            featured_reply: submit.featured_reply,
-            parts,
-        })
-    }
-
-    /// Persist a Pending submission row, call the remote submit API, and record
-    /// the outcome. The Pending row guarantees crash-recoverability: if the
-    /// process dies between persisting and the remote call, recovery will see
-    /// Pending and ask the operator to verify.
-    async fn submit_and_record_outcome(
-        &mut self,
-        session_id: Uuid,
-        session: &LiveSession,
-        req: SubmissionRequest,
-    ) -> AppResult<()> {
-        let mut sub = Submission {
-            session_id,
-            upload_credential: session.upload_credential.clone().ok_or_else(|| {
-                AppError::State(format!("Session {session_id} has no upload credential"))
-            })?,
-            status: SubmissionStatus::Pending,
-            aid: None,
-            bvid: None,
-            error: None,
-        };
-        self.store.put_submission(&sub)?;
-
-        match self.uploader.submit(req).await {
-            Ok(SubmissionOutcome::Confirmed { aid, bvid }) => {
-                sub.status = SubmissionStatus::Submitted;
-                sub.aid = aid;
-                sub.bvid = bvid;
-                self.store.put_submission(&sub)?;
-                if self.room_config.record.delete_after_submit {
-                    let cleaned =
-                        cleanup_submitted_session_recordings(&self.store, session_id).await?;
-                    if cleaned > 0 {
-                        info!(
-                            session_id = %session_id,
-                            cleaned,
-                            "Deleted local recordings after confirmed submission"
-                        );
-                    }
-                }
-                self.transition(PipelineState::Submitted)?;
-            }
-            Ok(SubmissionOutcome::Ambiguous { reason }) => {
-                warn!(
-                    session_id = %session_id,
-                    "Submission outcome is ambiguous: {}",
-                    reason
-                );
-                sub.status = SubmissionStatus::Ambiguous;
-                sub.error = Some(reason);
-                self.store.put_submission(&sub)?;
-                self.transition(PipelineState::Submitted)?;
-            }
-            Err(e) => {
-                sub.status = SubmissionStatus::Failed;
-                sub.error = Some(e.to_string());
-                self.store.put_submission(&sub)?;
-                self.transition(PipelineState::Failed)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Main state machine pump. Blocks when performing long tasks (e.g. recording, uploading).
     pub async fn run_step(&mut self) -> AppResult<()> {
         match self.session.state {
-            PipelineState::Idle => {
-                self.transition(PipelineState::Resolving)?;
+            RoomState::Idle => {
+                self.transition(RoomState::Resolving)?;
             }
-            PipelineState::Resolving | PipelineState::ReResolving => {
+            RoomState::Resolving | RoomState::ReResolving => {
                 self.step_resolving().await?;
             }
-            PipelineState::Offline => {
-                self.transition(PipelineState::Idle)?;
+            RoomState::Offline => {
+                self.transition(RoomState::Idle)?;
             }
-            PipelineState::Recording => {
+            RoomState::Recording => {
                 self.step_recording().await?;
             }
-            PipelineState::WaitingReconnect => {
+            RoomState::WaitingReconnect => {
                 self.step_waiting_reconnect()?;
             }
-            PipelineState::Uploading => {
-                self.step_uploading().await?;
-            }
-            PipelineState::Submitting => {
-                self.step_submitting().await?;
-            }
-            PipelineState::Submitted => {
-                self.active_session_id = None;
-                self.transition(PipelineState::Idle)?;
-            }
-            PipelineState::Failed => {
+            RoomState::Failed => {
                 return Err(AppError::State(
-                    "Room is in Failed state and requires Phase 6 recovery or manual intervention."
-                        .into(),
+                    "Room is in Failed state and requires recovery or manual intervention.".into(),
                 ));
             }
         }
@@ -1098,192 +510,65 @@ impl<U: Uploader + Send + Sync + 'static> RoomSupervisor<U> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::model::{
-        UploadedPart,
-        fixtures::{finalized_segment, uploaded_segment, uploading_segment},
+    use crate::config::{
+        Copyright, ResolvedRecordConfig, ResolvedRoomUploadConfig, ResolvedSubmitConfig,
     };
-    use crate::uploader::types::UploadRequest;
+    use crate::credential::CredentialIdentity;
+    use tempfile::TempDir;
 
-    /// What the FakeUploader should do on the next `submit` call.
-    #[derive(Debug, Clone)]
-    enum SubmitBehavior {
-        Confirmed {
-            aid: Option<u64>,
-            bvid: Option<String>,
-        },
-        Ambiguous {
-            reason: String,
-        },
-        Err(String),
-    }
-
-    struct FakeUploader {
-        submit_count: std::sync::atomic::AtomicUsize,
-        upload_count: std::sync::atomic::AtomicUsize,
-        last_submission: std::sync::Mutex<Option<SubmissionRequest>>,
-        submit_behavior: std::sync::Mutex<SubmitBehavior>,
-    }
-
-    impl FakeUploader {
-        fn new() -> Self {
-            Self {
-                submit_count: std::sync::atomic::AtomicUsize::new(0),
-                upload_count: std::sync::atomic::AtomicUsize::new(0),
-                last_submission: std::sync::Mutex::new(None),
-                submit_behavior: std::sync::Mutex::new(SubmitBehavior::Confirmed {
-                    aid: Some(1),
-                    bvid: Some("bv1".to_string()),
-                }),
-            }
-        }
-
-        fn get_submit_count(&self) -> usize {
-            self.submit_count.load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        fn get_upload_count(&self) -> usize {
-            self.upload_count.load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        fn last_submission(&self) -> Option<SubmissionRequest> {
-            self.last_submission.lock().unwrap().clone()
-        }
-
-        fn set_submit_behavior(&self, behavior: SubmitBehavior) {
-            *self.submit_behavior.lock().unwrap() = behavior;
-        }
-    }
-
-    impl Uploader for FakeUploader {
-        async fn check_login(&self) -> AppResult<()> {
-            Ok(())
-        }
-        async fn upload_segment(&self, req: UploadRequest) -> AppResult<UploadedPart> {
-            self.upload_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(UploadedPart {
-                session_id: req.session_id,
-                segment_index: req.segment_index,
-                bili_filename: "fake_file".to_string(),
-                part_title: req.part_title,
-            })
-        }
-        async fn submit(&self, _req: SubmissionRequest) -> AppResult<SubmissionOutcome> {
-            self.submit_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            *self.last_submission.lock().unwrap() = Some(_req);
-            match self.submit_behavior.lock().unwrap().clone() {
-                SubmitBehavior::Confirmed { aid, bvid } => {
-                    Ok(SubmissionOutcome::Confirmed { aid, bvid })
-                }
-                SubmitBehavior::Ambiguous { reason } => Ok(SubmissionOutcome::Ambiguous { reason }),
-                SubmitBehavior::Err(msg) => Err(AppError::Bilibili(msg)),
-            }
-        }
-    }
-
-    fn test_upload_credential() -> crate::credential::CredentialIdentity {
-        crate::credential::CredentialIdentity::new("main", "Cargo.toml")
-    }
-
-    fn test_record_config() -> crate::config::ResolvedRecordConfig {
-        crate::config::ResolvedRecordConfig {
-            credential: None,
-            output_dir: "./data/recordings".into(),
-            segment_time: None,
-            segment_size: None,
-            min_segment_size: 20 * 1024 * 1024,
-            qn: 10000,
-            cdn: Vec::new(),
-            delete_after_submit: false,
-        }
-    }
-
-    fn test_submit_config() -> crate::config::ResolvedSubmitConfig {
-        crate::config::ResolvedSubmitConfig {
-            title: None,
-            description: None,
-            category_id: 171,
-            copyright: crate::config::Copyright::Reprint,
-            source: "source".into(),
-            tags: Vec::new(),
-            private: false,
-            dynamic: String::new(),
-            forbid_reprint: false,
-            charging_panel: false,
-            close_reply: false,
-            close_danmu: false,
-            featured_reply: false,
-        }
-    }
-
-    fn test_room_config() -> ResolvedRoomConfig {
+    fn test_room_config(dir: &std::path::Path) -> ResolvedRoomConfig {
+        let upload_credential = CredentialIdentity::new("main", dir.join("cookies.json"));
         ResolvedRoomConfig {
-            name: "test-room".into(),
+            name: "room".into(),
             url: "https://live.bilibili.com/1".into(),
-            record: test_record_config(),
-            upload: crate::config::ResolvedRoomUploadConfig {
-                credential: test_upload_credential(),
+            record: ResolvedRecordConfig {
+                credential: None,
+                output_dir: dir.join("recordings"),
+                segment_time: None,
+                segment_size: None,
+                min_segment_size: 0,
+                qn: 10_000,
+                cdn: Vec::new(),
+                delete_after_submit: false,
             },
-            submit: test_submit_config(),
+            upload: ResolvedRoomUploadConfig {
+                credential: upload_credential,
+                line: "bda2".into(),
+                threads: 3,
+                submit_api: crate::config::SubmitApi::App,
+            },
+            submit: ResolvedSubmitConfig {
+                title: None,
+                description: None,
+                category_id: 171,
+                copyright: Copyright::Reprint,
+                source: "live recording".into(),
+                tags: vec!["直播录像".into()],
+                private: false,
+                dynamic: String::new(),
+                forbid_reprint: false,
+                charging_panel: false,
+                close_reply: false,
+                close_danmu: false,
+                featured_reply: false,
+            },
         }
     }
 
-    fn put_recording_session(store: &StateStore, room_id: u64) -> Uuid {
-        let session_id = Uuid::new_v4();
-        store
-            .put_session(&LiveSession {
-                id: session_id,
-                room_key: room_id.to_string(),
-                title: "Test Stream".into(),
-                started_at: jiff::Timestamp::now(),
-                status: SessionStatus::Recording,
-                record_credential: None,
-                upload_credential: Some(test_upload_credential()),
-            })
-            .unwrap();
-        session_id
-    }
-
-    fn mock_supervisor() -> RoomSupervisor<FakeUploader> {
-        let (_, rx) = tokio::sync::watch::channel(false);
-        let store =
-            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
+    fn test_supervisor(store: Arc<StateStore>, dir: &std::path::Path) -> RoomSupervisor {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         RoomSupervisor::new(
             1,
-            PipelineConfig::default(),
-            test_room_config(),
-            RoomSupervisorDeps {
-                store,
-                client: Arc::new(BiliClient::new(None).unwrap()),
-                uploader: Arc::new(FakeUploader::new()),
+            PipelineConfig {
+                poll_interval_s: 1,
+                offline_grace_s: 0,
+                backoff_s: 1,
+                max_backoff_s: 1,
             },
-            rx,
-        )
-        .unwrap()
-    }
-
-    fn supervisor_with(
-        store: Arc<StateStore>,
-        uploader: Arc<FakeUploader>,
-    ) -> RoomSupervisor<FakeUploader> {
-        supervisor_with_room(store, uploader, test_room_config())
-    }
-
-    fn supervisor_with_room(
-        store: Arc<StateStore>,
-        uploader: Arc<FakeUploader>,
-        room_config: ResolvedRoomConfig,
-    ) -> RoomSupervisor<FakeUploader> {
-        let (_, shutdown_rx) = tokio::sync::watch::channel(false);
-        RoomSupervisor::new(
-            1,
-            PipelineConfig::default(),
-            room_config,
+            test_room_config(dir),
             RoomSupervisorDeps {
                 store,
                 client: Arc::new(BiliClient::new(None).unwrap()),
-                uploader,
             },
             shutdown_rx,
         )
@@ -1291,937 +576,101 @@ mod tests {
     }
 
     #[test]
-    fn test_supervisor_skeleton_offline() {
-        let mut supervisor = mock_supervisor();
-
-        assert_eq!(supervisor.session.state, PipelineState::Idle);
-        supervisor.transition(PipelineState::Resolving).unwrap();
-        assert_eq!(supervisor.session.state, PipelineState::Resolving);
-
-        // Room is offline
-        supervisor.transition(PipelineState::Offline).unwrap();
-
-        // Go back to idle
-        supervisor.transition(PipelineState::Idle).unwrap();
-        assert_eq!(supervisor.session.state, PipelineState::Idle);
-    }
-
-    #[test]
-    fn test_transition_rejects_invalid_jump_and_leaves_disk_clean() {
-        let mut supervisor = mock_supervisor();
-        let room_id = supervisor.room_id;
-        let store = supervisor.store.clone();
-
-        // Idle -> Recording is not in the state-machine table.
-        let err = supervisor
-            .transition(PipelineState::Recording)
-            .expect_err("invalid transition must be rejected");
-        assert!(matches!(err, AppError::State(_)));
-        assert_eq!(supervisor.session.state, PipelineState::Idle);
-        // No pipeline state should have been written to redb.
-        assert!(store.get_pipeline_state(room_id).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_transition_rejects_target_without_active_session() {
-        let mut supervisor = mock_supervisor();
-        let room_id = supervisor.room_id;
-        let store = supervisor.store.clone();
-
-        // Drive to Resolving legitimately so the transition table allows
-        // Resolving -> Recording. But active_session_id is still None, so
-        // Recording (which requires a session) must be refused.
-        supervisor.transition(PipelineState::Resolving).unwrap();
-        let err = supervisor
-            .transition(PipelineState::Recording)
-            .expect_err("Recording without active_session_id must be rejected");
-        assert!(
-            matches!(err, AppError::State(ref msg) if msg.contains("requires an active session"))
-        );
-        // Disk state still Resolving — no half-written Recording row.
-        assert_eq!(
-            store.get_pipeline_state(room_id).unwrap(),
-            Some(PipelineState::Resolving)
-        );
-    }
-
-    #[test]
-    fn test_wait_reconnect_with_error_persists_and_normal_transition_clears() {
-        let mut supervisor = mock_supervisor();
-        let session_id = put_recording_session(&supervisor.store, 1);
-        supervisor.session.state = PipelineState::Recording;
+    fn waiting_reconnect_grace_expiry_finalizes_session_and_releases_room() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(StateStore::open(dir.path().join("state.redb")).unwrap());
+        let mut supervisor = test_supervisor(store.clone(), dir.path());
+        let session_id = Uuid::new_v4();
+        let session = LiveSession {
+            id: session_id,
+            room_key: "1".into(),
+            title: "title".into(),
+            started_at: jiff::Timestamp::now(),
+            status: SessionStatus::Recording,
+            record_credential: None,
+            upload_credential: Some(supervisor.room_config.upload.credential.clone()),
+        };
+        let plan = supervisor.submission_plan_for_session(&session).unwrap();
+        store.create_recording_session(&session, &plan, 1).unwrap();
+        supervisor.session.state = RoomState::WaitingReconnect;
         supervisor.active_session_id = Some(session_id);
-
-        supervisor
-            .wait_reconnect_with_error("stream connect failed: timeout")
-            .unwrap();
-
-        let persisted = supervisor
-            .store
-            .get_room_pipeline_state(supervisor.room_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(persisted.state, PipelineState::WaitingReconnect);
-        assert_eq!(persisted.active_session_id, Some(session_id));
-        assert_eq!(
-            persisted.last_error.as_deref(),
-            Some("stream connect failed: timeout")
-        );
-        assert!(persisted.last_error_at.is_some());
-
-        supervisor.transition(PipelineState::ReResolving).unwrap();
-        let cleared = supervisor
-            .store
-            .get_room_pipeline_state(supervisor.room_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(cleared.state, PipelineState::ReResolving);
-        assert!(cleared.last_error.is_none());
-        assert!(cleared.last_error_at.is_none());
-    }
-
-    #[test]
-    fn test_resolving_fetch_error_is_retryable_offline() {
-        let mut supervisor = mock_supervisor();
-        supervisor.transition(PipelineState::Resolving).unwrap();
-
-        supervisor
-            .handle_room_info_error(AppError::Bilibili("-352".into()))
-            .unwrap();
-
-        assert_eq!(supervisor.session.state, PipelineState::Offline);
-        let persisted = supervisor
-            .store
-            .get_room_pipeline_state(supervisor.room_id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(persisted.state, PipelineState::Offline);
-        assert!(persisted.active_session_id.is_none());
-        assert!(
-            persisted
-                .last_error
-                .as_deref()
-                .is_some_and(|err| err.contains("fetch_room_info failed"))
-        );
-        assert!(persisted.last_error_at.is_some());
-    }
-
-    #[test]
-    fn test_offline_grace_starts_when_entering_waiting_reconnect() {
-        let mut supervisor = mock_supervisor();
-        let session_id = put_recording_session(&supervisor.store, 1);
-        supervisor.session.state = PipelineState::Recording;
-        supervisor.active_session_id = Some(session_id);
-
-        assert!(supervisor.offline_since.is_none());
-
-        supervisor
-            .transition(PipelineState::WaitingReconnect)
-            .unwrap();
-
-        assert!(
-            supervisor.offline_since.is_some(),
-            "offline grace must start at the transition, before the main loop sleeps"
-        );
-    }
-
-    #[test]
-    fn test_waiting_reconnect_uses_existing_offline_grace_anchor() {
-        let mut supervisor = mock_supervisor();
-        let session_id = put_recording_session(&supervisor.store, 1);
-        supervisor.config.offline_grace_s = 1;
-        supervisor.session.state = PipelineState::Recording;
-        supervisor.active_session_id = Some(session_id);
-
-        supervisor
-            .transition(PipelineState::WaitingReconnect)
-            .unwrap();
         supervisor.offline_since = Some(Instant::now() - std::time::Duration::from_secs(2));
 
         supervisor.step_waiting_reconnect().unwrap();
 
-        assert_eq!(supervisor.session.state, PipelineState::Uploading);
-        assert!(
-            supervisor.offline_since.is_none(),
-            "leaving reconnect lifecycle should clear the grace anchor"
+        assert_eq!(supervisor.session.state, RoomState::Idle);
+        assert_eq!(supervisor.active_session_id, None);
+        assert_eq!(
+            store.get_session(session_id).unwrap().unwrap().status,
+            SessionStatus::Finalized
         );
+        let room_state = store.get_room_state(1).unwrap().unwrap();
+        assert_eq!(room_state.state, RoomState::Idle);
+        assert_eq!(room_state.active_session_id, None);
     }
 
     #[test]
-    fn test_resume_waiting_reconnect_starts_grace_from_resume() {
-        let store =
-            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
-        let session_id = put_recording_session(&store, 1);
+    fn active_room_state_requires_persisted_session() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(StateStore::open(dir.path().join("state.redb")).unwrap());
         store
-            .put_room_pipeline_state(1, PipelineState::WaitingReconnect, Some(session_id))
+            .put_room_state(1, RoomState::Recording, Some(Uuid::new_v4()))
             .unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let (_, rx) = tokio::sync::watch::channel(false);
-        let supervisor = RoomSupervisor::new(
+        let err = match RoomSupervisor::new(
             1,
             PipelineConfig::default(),
-            test_room_config(),
+            test_room_config(dir.path()),
             RoomSupervisorDeps {
                 store,
                 client: Arc::new(BiliClient::new(None).unwrap()),
-                uploader: Arc::new(FakeUploader::new()),
             },
-            rx,
-        )
-        .unwrap();
+            shutdown_rx,
+        ) {
+            Ok(_) => panic!("expected missing active session error"),
+            Err(err) => err,
+        };
 
-        assert_eq!(supervisor.session.state, PipelineState::WaitingReconnect);
-        assert_eq!(supervisor.active_session_id, Some(session_id));
-        assert!(
-            supervisor.offline_since.is_some(),
-            "resumed WaitingReconnect cannot know the old monotonic instant, so it starts grace at resume"
-        );
+        assert!(err.to_string().contains("does not exist"));
     }
 
     #[test]
-    fn test_recording_retry_reason_is_context_local() {
-        assert!(recording_retry_reason(AppError::Bilibili("risk control".into())).is_ok());
-        assert!(recording_retry_reason(AppError::StreamProtocol("bad tag".into())).is_ok());
-        assert!(
-            recording_retry_reason(AppError::StreamRepeatedData("duplicated media".into())).is_ok()
-        );
-
-        assert!(recording_retry_reason(AppError::State("bad invariant".into())).is_err());
-        assert!(recording_retry_reason(AppError::Config("bad config".into())).is_err());
-    }
-
-    #[test]
-    fn test_reconnect_delay_exponential_and_clamped() {
-        let mut supervisor = mock_supervisor();
-        supervisor.config.backoff_s = 5;
-        supervisor.config.max_backoff_s = 20;
-        supervisor.session.state = PipelineState::Recording;
-        supervisor.active_session_id = Some(Uuid::new_v4());
-
-        supervisor
-            .transition(PipelineState::WaitingReconnect)
-            .unwrap();
-        assert_eq!(
-            supervisor.reconnect_delay(),
-            std::time::Duration::from_secs(5)
-        );
-
-        supervisor.transition(PipelineState::ReResolving).unwrap();
-        supervisor
-            .transition(PipelineState::WaitingReconnect)
-            .unwrap();
-        assert_eq!(
-            supervisor.reconnect_delay(),
-            std::time::Duration::from_secs(10)
-        );
-
-        supervisor.transition(PipelineState::ReResolving).unwrap();
-        supervisor
-            .transition(PipelineState::WaitingReconnect)
-            .unwrap();
-        assert_eq!(
-            supervisor.reconnect_delay(),
-            std::time::Duration::from_secs(20)
-        );
-
-        supervisor.transition(PipelineState::ReResolving).unwrap();
-        supervisor
-            .transition(PipelineState::WaitingReconnect)
-            .unwrap();
-        assert_eq!(
-            supervisor.reconnect_delay(),
-            std::time::Duration::from_secs(20)
-        );
-
-        supervisor.transition(PipelineState::Recording).unwrap();
-        assert_eq!(
-            supervisor.reconnect_delay(),
-            std::time::Duration::from_secs(5)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fatal_recording_error_joins_background_uploads() {
-        let mut supervisor = mock_supervisor();
-        let session_id = put_recording_session(&supervisor.store, 1);
-        supervisor.session.state = PipelineState::Recording;
-        supervisor.active_session_id = Some(session_id);
-
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let completed_clone = completed.clone();
-        supervisor.upload_tasks.push(tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }));
-
-        let err = supervisor
-            .finish_recording_after_fatal_error(AppError::State("fatal record error".into()))
-            .await
-            .unwrap_err();
-
-        assert!(
-            completed.load(std::sync::atomic::Ordering::SeqCst),
-            "fatal recording exit must wait for owned background uploads"
-        );
-        assert!(supervisor.upload_tasks.is_empty());
-        assert_eq!(supervisor.session.state, PipelineState::Failed);
-        assert!(matches!(err, AppError::State(ref msg) if msg == "fatal record error"));
-    }
-
-    #[tokio::test]
-    async fn test_fatal_recording_error_prioritizes_ambiguous_background_upload() {
-        let mut supervisor = mock_supervisor();
-        let session_id = put_recording_session(&supervisor.store, 1);
-        supervisor.session.state = PipelineState::Recording;
-        supervisor.active_session_id = Some(session_id);
-
-        supervisor.upload_tasks.push(tokio::spawn(async {
-            Err(BackgroundUploadFailure::Ambiguous {
-                index: 7,
-                error: "redb commit failed".into(),
-            })
-        }));
-
-        let err = supervisor
-            .finish_recording_after_fatal_error(AppError::State("fatal record error".into()))
-            .await
-            .unwrap_err();
-
-        assert_eq!(supervisor.session.state, PipelineState::Failed);
-        assert!(
-            err.to_string().contains("segment 7")
-                && err.to_string().contains("UploadedPart persistence failed")
-        );
-    }
-
-    #[test]
-    fn test_apply_transition_is_safety_net_for_atomic_write_callers() {
-        // Simulates a caller that bundled the pipeline state with another
-        // write but skipped check_transition. apply_transition's internal
-        // re-check must catch the invalid transition and refuse to update
-        // the in-memory state — at that point on-disk state is already
-        // corrupt, but at least the in-memory state machine refuses to
-        // pretend it's fine.
-        let mut supervisor = mock_supervisor();
-        let err = supervisor
-            .apply_transition(PipelineState::Recording)
-            .expect_err("apply_transition must re-check");
-        assert!(matches!(err, AppError::State(_)));
-        assert_eq!(supervisor.session.state, PipelineState::Idle);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_with_empty_parts() {
-        use crate::state::store::StateStore;
-
-        let store = std::sync::Arc::new(
-            StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
-        );
-        let mut supervisor = supervisor_with(store.clone(), Arc::new(FakeUploader::new()));
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        let err = supervisor.run_step().await.unwrap_err();
-        assert!(matches!(err, AppError::State(_)));
-        assert_eq!(supervisor.session.state, PipelineState::Failed);
-
-        let sub = store.get_submission(session_id).unwrap().unwrap();
-        assert_eq!(sub.status, crate::state::model::SubmissionStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn test_uploading_reconciles_missing_parts() {
-        use crate::state::store::StateStore;
-
-        let file_dir = tempfile::tempdir().unwrap();
-        let file_path = file_dir.path().join("test.flv");
-        std::fs::write(&file_path, b"FLV").unwrap();
-
-        let store = std::sync::Arc::new(
-            StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap(),
-        );
-        let mut supervisor = supervisor_with(store.clone(), Arc::new(FakeUploader::new()));
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Uploading;
-
-        // Add a finalized segment with no uploaded part
-        store
-            .put_segment(&finalized_segment(session_id, 1, file_path))
-            .unwrap();
-
-        supervisor.run_step().await.unwrap();
-
-        // Should have transitioned to Submitting and added uploaded part
-        assert_eq!(supervisor.session.state, PipelineState::Submitting);
-        let parts = store.list_uploaded_parts(session_id).unwrap();
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].segment_index, 1);
-        let segments = store.list_segments(session_id).unwrap();
-        assert_eq!(segments[0].status, SegmentStatus::Uploaded);
-    }
-
-    #[tokio::test]
-    async fn test_uploading_refuses_missing_finalized_file() {
-        use crate::state::store::StateStore;
-
-        let store =
-            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Uploading;
-
-        store
-            .put_segment(&finalized_segment(
-                session_id,
-                1,
-                std::path::PathBuf::from("missing.flv"),
-            ))
-            .unwrap();
-
-        supervisor.run_step().await.unwrap();
-
-        assert_eq!(supervisor.session.state, PipelineState::Failed);
-        assert_eq!(uploader.get_upload_count(), 0);
-        assert!(store.list_uploaded_parts(session_id).unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_uploading_refuses_ambiguous_uploading_segment() {
-        use crate::state::store::StateStore;
-
-        let store =
-            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Uploading;
-
-        store
-            .put_segment(&uploading_segment(
-                session_id,
-                1,
-                std::path::PathBuf::from("ambiguous.flv"),
-            ))
-            .unwrap();
-
-        supervisor.run_step().await.unwrap();
-
-        assert_eq!(supervisor.session.state, PipelineState::Failed);
-        assert_eq!(uploader.get_upload_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_recording_missing_components() {
-        let mut supervisor = mock_supervisor();
-        supervisor.session.state = PipelineState::Recording;
-
-        let err = supervisor.run_step().await.unwrap_err();
-        assert!(matches!(err, AppError::State(_)));
-        assert_eq!(supervisor.session.state, PipelineState::Recording);
-    }
-
-    #[test]
-    fn test_resume_requires_persisted_active_session_id() {
-        let store =
-            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
-        store
-            .put_pipeline_state(1, PipelineState::Recording)
-            .unwrap();
-        let (_, rx) = tokio::sync::watch::channel(false);
-
-        let res = RoomSupervisor::new(
-            1,
-            PipelineConfig::default(),
-            test_room_config(),
-            RoomSupervisorDeps {
-                store,
-                client: Arc::new(BiliClient::new(None).unwrap()),
-                uploader: Arc::new(FakeUploader::new()),
-            },
-            rx,
-        );
-
-        assert!(matches!(res, Err(AppError::State(_))));
-    }
-
-    #[test]
-    fn test_resume_uses_persisted_active_session_id_not_latest_session() {
-        let store =
-            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
-        let active_session_id = put_recording_session(&store, 1);
-        let newer_session_id = Uuid::new_v4();
-        store
-            .put_session(&LiveSession {
-                id: newer_session_id,
-                room_key: "1".into(),
-                title: "newer terminal session".into(),
-                started_at: jiff::Timestamp::now() + jiff::SignedDuration::from_secs(1),
-                status: SessionStatus::Finalized,
-                record_credential: None,
-                upload_credential: Some(test_upload_credential()),
-            })
-            .unwrap();
-        store
-            .put_room_pipeline_state(1, PipelineState::Recording, Some(active_session_id))
-            .unwrap();
-
-        let (_, rx) = tokio::sync::watch::channel(false);
-        let supervisor = RoomSupervisor::new(
-            1,
-            PipelineConfig::default(),
-            test_room_config(),
-            RoomSupervisorDeps {
-                store,
-                client: Arc::new(BiliClient::new(None).unwrap()),
-                uploader: Arc::new(FakeUploader::new()),
-            },
-            rx,
-        )
-        .unwrap();
-
-        assert_eq!(supervisor.active_session_id, Some(active_session_id));
-    }
-
-    #[test]
-    fn test_resume_refuses_upload_credential_mismatch() {
-        let store =
-            Arc::new(StateStore::open(tempfile::tempdir().unwrap().path().join("db")).unwrap());
+    fn active_room_state_requires_recording_session() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(StateStore::open(dir.path().join("state.redb")).unwrap());
+        let upload_credential = CredentialIdentity::new("main", dir.path().join("cookies.json"));
         let session_id = Uuid::new_v4();
         store
             .put_session(&LiveSession {
                 id: session_id,
                 room_key: "1".into(),
-                title: "mismatched credential".into(),
+                title: "title".into(),
                 started_at: jiff::Timestamp::now(),
-                status: SessionStatus::Recording,
+                status: SessionStatus::Finalized,
                 record_credential: None,
-                upload_credential: Some(crate::credential::CredentialIdentity::new(
-                    "main",
-                    "Cargo.lock",
-                )),
+                upload_credential: Some(upload_credential),
             })
             .unwrap();
         store
-            .put_room_pipeline_state(1, PipelineState::Recording, Some(session_id))
+            .put_room_state(1, RoomState::Recording, Some(session_id))
             .unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let (_, rx) = tokio::sync::watch::channel(false);
-        let res = RoomSupervisor::new(
+        let err = match RoomSupervisor::new(
             1,
             PipelineConfig::default(),
-            test_room_config(),
+            test_room_config(dir.path()),
             RoomSupervisorDeps {
                 store,
                 client: Arc::new(BiliClient::new(None).unwrap()),
-                uploader: Arc::new(FakeUploader::new()),
             },
-            rx,
-        );
+            shutdown_rx,
+        ) {
+            Ok(_) => panic!("expected finalized active session error"),
+            Err(err) => err,
+        };
 
-        assert!(matches!(res, Err(AppError::State(ref msg)) if msg.contains("upload credential")));
-    }
-
-    #[tokio::test]
-    async fn test_submitting_idempotent_submitted() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let store =
-            std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut room_config = test_room_config();
-        room_config.submit.category_id = 123;
-        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Submitted,
-                aid: Some(1),
-                bvid: Some("bv1".into()),
-                error: None,
-            })
-            .unwrap();
-
-        supervisor.run_step().await.unwrap();
-
-        assert_eq!(supervisor.session.state, PipelineState::Submitted);
-        assert_eq!(uploader.get_submit_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_deletes_uploaded_recordings_after_confirmed_submission() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let file_dir = tempfile::tempdir().unwrap();
-        let file_path = file_dir.path().join("segment.flv");
-        std::fs::write(&file_path, b"FLV").unwrap();
-
-        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-        let mut room_config = test_room_config();
-        room_config.record.delete_after_submit = true;
-        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_segment(&uploaded_segment(session_id, 0, file_path.clone()))
-            .unwrap();
-        store
-            .put_uploaded_part(&UploadedPart {
-                session_id,
-                segment_index: 0,
-                bili_filename: "fake_file".into(),
-                part_title: "part 0".into(),
-            })
-            .unwrap();
-
-        supervisor.run_step().await.unwrap();
-
-        assert_eq!(supervisor.session.state, PipelineState::Submitted);
-        assert!(!file_path.exists());
-        let segments = store.list_segments(session_id).unwrap();
-        assert_eq!(segments[0].status, SegmentStatus::Cleaned);
-        let sub = store.get_submission(session_id).unwrap().unwrap();
-        assert_eq!(sub.status, SubmissionStatus::Submitted);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_existing_submitted_retries_recording_cleanup() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let file_dir = tempfile::tempdir().unwrap();
-        let file_path = file_dir.path().join("segment.flv");
-        std::fs::write(&file_path, b"FLV").unwrap();
-
-        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-        let mut room_config = test_room_config();
-        room_config.record.delete_after_submit = true;
-        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
-
-        let session_id = put_recording_session(&store, 1);
-        let mut session = store.get_session(session_id).unwrap().unwrap();
-        session.status = SessionStatus::Finalized;
-        store.put_session(&session).unwrap();
-
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_segment(&uploaded_segment(session_id, 0, file_path.clone()))
-            .unwrap();
-        store
-            .put_uploaded_part(&UploadedPart {
-                session_id,
-                segment_index: 0,
-                bili_filename: "fake_file".into(),
-                part_title: "part 0".into(),
-            })
-            .unwrap();
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: test_upload_credential(),
-                status: SubmissionStatus::Submitted,
-                aid: Some(1),
-                bvid: Some("bv1".into()),
-                error: None,
-            })
-            .unwrap();
-
-        supervisor.run_step().await.unwrap();
-
-        assert_eq!(supervisor.session.state, PipelineState::Submitted);
-        assert_eq!(uploader.get_submit_count(), 0);
-        assert!(!file_path.exists());
-        let segments = store.list_segments(session_id).unwrap();
-        assert_eq!(segments[0].status, SegmentStatus::Cleaned);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_uses_room_title_and_description_templates() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-        let mut room_config = test_room_config();
-        room_config.name = "room-name".into();
-        room_config.submit.title = Some("Archive {title} #{room_id}".into());
-        room_config.submit.description = Some("From {name}: {url}".into());
-        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_segment(&uploaded_segment(
-                session_id,
-                0,
-                std::path::PathBuf::from("test.flv"),
-            ))
-            .unwrap();
-        store
-            .put_uploaded_part(&UploadedPart {
-                session_id,
-                segment_index: 0,
-                bili_filename: "fake_file".into(),
-                part_title: "part 0".into(),
-            })
-            .unwrap();
-
-        supervisor.run_step().await.unwrap();
-
-        let req = uploader.last_submission().unwrap();
-        assert_eq!(req.title, "Archive Test Stream #1");
-        assert_eq!(
-            req.description,
-            "From room-name: https://live.bilibili.com/1"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_submitting_refuses_ambiguous_uploading_segment() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_segment(&uploading_segment(
-                session_id,
-                0,
-                std::path::PathBuf::from("ambiguous.flv"),
-            ))
-            .unwrap();
-
-        let err = supervisor.run_step().await.unwrap_err();
-
-        assert!(matches!(err, AppError::State(_)));
-        assert_eq!(supervisor.session.state, PipelineState::Failed);
-        assert_eq!(uploader.get_submit_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_idempotent_failed() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let store =
-            std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut room_config = test_room_config();
-        room_config.submit.category_id = 123;
-        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Failed,
-                aid: None,
-                bvid: None,
-                error: Some("mock err".into()),
-            })
-            .unwrap();
-
-        let err = supervisor.run_step().await.unwrap_err();
-        assert!(matches!(err, AppError::State(_)));
-
-        assert_eq!(supervisor.session.state, PipelineState::Failed);
-        assert_eq!(uploader.get_submit_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_idempotent_pending() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let store =
-            std::sync::Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = std::sync::Arc::new(FakeUploader::new());
-        let mut room_config = test_room_config();
-        room_config.submit.category_id = 123;
-        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Pending,
-                aid: None,
-                bvid: None,
-                error: None,
-            })
-            .unwrap();
-
-        store
-            .put_uploaded_part(&UploadedPart {
-                session_id,
-                segment_index: 0,
-                bili_filename: "fake_file".into(),
-                part_title: "part 0".into(),
-            })
-            .unwrap();
-
-        let err = supervisor.run_step().await.unwrap_err();
-        assert!(matches!(err, AppError::State(_)));
-
-        assert_eq!(supervisor.session.state, PipelineState::Submitting);
-        assert_eq!(uploader.get_submit_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_records_ambiguous_outcome() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let file_dir = tempfile::tempdir().unwrap();
-        let file_path = file_dir.path().join("segment.flv");
-        std::fs::write(&file_path, b"FLV").unwrap();
-        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-        uploader.set_submit_behavior(SubmitBehavior::Ambiguous {
-            reason: "code=0 but no aid/bvid".into(),
-        });
-
-        let mut room_config = test_room_config();
-        room_config.record.delete_after_submit = true;
-        let mut supervisor = supervisor_with_room(store.clone(), uploader.clone(), room_config);
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_segment(&uploaded_segment(session_id, 0, file_path.clone()))
-            .unwrap();
-        store
-            .put_uploaded_part(&UploadedPart {
-                session_id,
-                segment_index: 0,
-                bili_filename: "fake_file".into(),
-                part_title: "part 0".into(),
-            })
-            .unwrap();
-
-        // submit succeeds (the pipeline action completed), but the submission
-        // status records the outcome as Ambiguous.
-        supervisor.run_step().await.unwrap();
-
-        assert_eq!(supervisor.session.state, PipelineState::Submitted);
-        assert_eq!(uploader.get_submit_count(), 1);
-
-        let sub = store.get_submission(session_id).unwrap().unwrap();
-        assert_eq!(sub.status, SubmissionStatus::Ambiguous);
-        assert!(sub.aid.is_none());
-        assert!(sub.bvid.is_none());
-        assert!(sub.error.as_deref().unwrap().contains("no aid/bvid"));
-        assert!(file_path.exists());
-        let segments = store.list_segments(session_id).unwrap();
-        assert_eq!(segments[0].status, SegmentStatus::Uploaded);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_refuses_existing_ambiguous_submission() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        // Pre-existing Ambiguous submission from a prior run.
-        store
-            .put_submission(&Submission {
-                session_id,
-                upload_credential: crate::credential::CredentialIdentity::new(
-                    "test",
-                    "cookies.json",
-                ),
-                status: SubmissionStatus::Ambiguous,
-                aid: None,
-                bvid: None,
-                error: Some("prior ambiguous outcome".into()),
-            })
-            .unwrap();
-
-        let err = supervisor.run_step().await.unwrap_err();
-        assert!(matches!(err, AppError::State(ref msg) if msg.contains("Ambiguous")));
-        // Refused — no re-submission.
-        assert_eq!(uploader.get_submit_count(), 0);
-        // Status stayed Ambiguous; no automatic flip.
-        let sub = store.get_submission(session_id).unwrap().unwrap();
-        assert_eq!(sub.status, SubmissionStatus::Ambiguous);
-    }
-
-    #[tokio::test]
-    async fn test_submitting_records_failed_on_remote_error() {
-        let db_dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(StateStore::open(db_dir.path().join("state.redb")).unwrap());
-        let uploader = Arc::new(FakeUploader::new());
-        uploader.set_submit_behavior(SubmitBehavior::Err("network reset".into()));
-
-        let mut supervisor = supervisor_with(store.clone(), uploader.clone());
-
-        let session_id = put_recording_session(&store, 1);
-        supervisor.active_session_id = Some(session_id);
-        supervisor.session.state = PipelineState::Submitting;
-
-        store
-            .put_segment(&uploaded_segment(
-                session_id,
-                0,
-                std::path::PathBuf::from("test.flv"),
-            ))
-            .unwrap();
-        store
-            .put_uploaded_part(&UploadedPart {
-                session_id,
-                segment_index: 0,
-                bili_filename: "fake_file".into(),
-                part_title: "part 0".into(),
-            })
-            .unwrap();
-
-        // submit Err → SubmissionStatus::Failed, pipeline → Failed.
-        let _ = supervisor.run_step().await;
-
-        assert_eq!(supervisor.session.state, PipelineState::Failed);
-        let sub = store.get_submission(session_id).unwrap().unwrap();
-        assert_eq!(sub.status, SubmissionStatus::Failed);
-        assert!(sub.error.as_deref().unwrap().contains("network reset"));
+        assert!(err.to_string().contains("not Recording"));
     }
 }

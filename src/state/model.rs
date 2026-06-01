@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+use crate::config::{Copyright, SubmitApi};
 use crate::credential::CredentialIdentity;
-use crate::pipeline::state_machine::PipelineState;
+use crate::pipeline::state_machine::RoomState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveSession {
@@ -51,9 +52,30 @@ pub struct Submission {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionPlan {
+    pub session_id: Uuid,
+    pub upload_credential: CredentialIdentity,
+    pub submit_api: SubmitApi,
+    pub title: String,
+    pub description: String,
+    pub category_id: u16,
+    pub copyright: Copyright,
+    pub source: String,
+    pub tags: Vec<String>,
+    pub private: bool,
+    pub dynamic: String,
+    pub forbid_reprint: bool,
+    pub charging_panel: bool,
+    pub close_reply: bool,
+    pub close_danmu: bool,
+    pub featured_reply: bool,
+    pub delete_after_submit: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoomPipelineState {
-    pub state: PipelineState,
+pub struct PersistedRoomState {
+    pub state: RoomState,
     #[serde(default)]
     pub active_session_id: Option<Uuid>,
     #[serde(default)]
@@ -170,54 +192,6 @@ pub(crate) mod fixtures {
     use super::*;
     use std::path::PathBuf;
 
-    // -- LiveSession --
-
-    pub(crate) fn recording_session(room_id: u64) -> LiveSession {
-        session_with_status(room_id, SessionStatus::Recording)
-    }
-
-    pub(crate) fn session_with_status(room_id: u64, status: SessionStatus) -> LiveSession {
-        LiveSession {
-            id: Uuid::new_v4(),
-            room_key: room_id.to_string(),
-            title: format!("Test Room {room_id}"),
-            started_at: jiff::Timestamp::now(),
-            status,
-            record_credential: None,
-            upload_credential: None,
-        }
-    }
-
-    // -- Submission --
-
-    pub(crate) fn submission_with_status(session_id: Uuid, status: SubmissionStatus) -> Submission {
-        Submission {
-            session_id,
-            upload_credential: crate::credential::CredentialIdentity::new("test", "cookies.json"),
-            status,
-            aid: None,
-            bvid: None,
-            error: None,
-        }
-    }
-
-    pub(crate) fn pending_submission(session_id: Uuid) -> Submission {
-        submission_with_status(session_id, SubmissionStatus::Pending)
-    }
-
-    pub(crate) fn submitted_submission(session_id: Uuid, aid: u64, bvid: &str) -> Submission {
-        Submission {
-            session_id,
-            upload_credential: crate::credential::CredentialIdentity::new("test", "cookies.json"),
-            status: SubmissionStatus::Submitted,
-            aid: Some(aid),
-            bvid: Some(bvid.to_string()),
-            error: None,
-        }
-    }
-
-    // -- Segment --
-
     fn segment(
         session_id: Uuid,
         index: u32,
@@ -248,34 +222,6 @@ pub(crate) mod fixtures {
         path: impl Into<PathBuf>,
     ) -> Segment {
         segment(session_id, index, path, SegmentStatus::Finalized)
-    }
-
-    pub(crate) fn uploading_segment(
-        session_id: Uuid,
-        index: u32,
-        path: impl Into<PathBuf>,
-    ) -> Segment {
-        segment(session_id, index, path, SegmentStatus::Uploading)
-    }
-
-    pub(crate) fn uploaded_segment(
-        session_id: Uuid,
-        index: u32,
-        path: impl Into<PathBuf>,
-    ) -> Segment {
-        segment(session_id, index, path, SegmentStatus::Uploaded)
-    }
-
-    pub(crate) fn failed_segment(
-        session_id: Uuid,
-        index: u32,
-        path: impl Into<PathBuf>,
-        error: impl Into<String>,
-    ) -> Segment {
-        Segment {
-            error: Some(error.into()),
-            ..segment(session_id, index, path, SegmentStatus::Failed)
-        }
     }
 }
 

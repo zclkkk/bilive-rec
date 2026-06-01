@@ -9,7 +9,6 @@ use super::raw::{Copyright, DataConfig, PipelineConfig, SubmitApi};
 pub struct RunConfig {
     pub data: DataConfig,
     pub pipeline: PipelineConfig,
-    pub upload: UploadTransportConfig,
     pub rooms: Vec<ResolvedRoomConfig>,
 }
 
@@ -80,6 +79,9 @@ pub struct ResolvedRecordConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedRoomUploadConfig {
     pub credential: CredentialIdentity,
+    pub line: String,
+    pub threads: usize,
+    pub submit_api: SubmitApi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

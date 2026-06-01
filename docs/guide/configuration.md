@@ -11,7 +11,7 @@ config.toml
 ├── [record]                # 录制参数（全局默认）
 ├── [upload]                # 上传参数
 ├── [submit]                # 投稿元数据（全局默认）
-├── [pipeline]              # 流水线调度参数
+├── [pipeline]              # 房间轮询与重连参数
 └── [rooms.<name>]          # 房间配置（必填至少一个）
     ├── [rooms.<name>.record]   # 覆盖该房间的录制参数
     ├── [rooms.<name>.upload]   # 覆盖该房间的上传参数
@@ -112,12 +112,12 @@ featured_reply = false
 
 ### [pipeline]
 
-流水线调度参数。
+房间轮询与断流重连参数。
 
 ```toml
 [pipeline]
 poll_interval_s = 60    # 闲置/失败状态下的轮询间隔（秒）
-offline_grace_s = 60    # 断流宽限期（秒），超时则打包上传
+offline_grace_s = 60    # 断流宽限期（秒），超时则结束当前 session
 backoff_s = 15          # 重连退避起始间隔（秒）
 max_backoff_s = 300     # 重连退避最大间隔（秒）
 ```

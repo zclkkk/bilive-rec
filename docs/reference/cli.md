@@ -120,7 +120,7 @@ bilive-rec state recover --apply
 选项：
 
 - `--apply`：实际执行恢复操作（不加则只打印计划）
-- `--reset-room <room_id>`：将指定房间的流水线状态从 Failed 重置为 Idle
+- `--reset-room <room_id>`：将指定房间状态从 Failed 重置为 Idle
 - `--retry-upload <session_id>`：为指定会话重新上传缺失 UploadedPart 的 Finalized 分段
 
 ### state resolve-submission

@@ -4,17 +4,21 @@ use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, Tab
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::pipeline::state_machine::PipelineState;
-use crate::state::model::{LiveSession, RoomPipelineState, Segment, Submission, UploadedPart};
+use crate::pipeline::state_machine::RoomState;
+use crate::state::model::{
+    LiveSession, PersistedRoomState, Segment, SessionStatus, Submission, SubmissionPlan,
+    UploadedPart,
+};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("sessions");
 const SEGMENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("segments");
 const UPLOADED_PARTS: TableDefinition<&str, &[u8]> = TableDefinition::new("uploaded_parts");
 const SUBMISSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("submissions");
-const PIPELINE_STATES: TableDefinition<u64, &[u8]> = TableDefinition::new("pipeline_states");
+const SUBMISSION_PLANS: TableDefinition<&str, &[u8]> = TableDefinition::new("submission_plans");
+const ROOM_STATES: TableDefinition<u64, &[u8]> = TableDefinition::new("room_states");
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub struct StateSummary {
@@ -22,6 +26,7 @@ pub struct StateSummary {
     pub segment_count: usize,
     pub uploaded_parts_count: usize,
     pub submission_count: usize,
+    pub submission_plan_count: usize,
 }
 
 pub struct StateStore {
@@ -47,14 +52,30 @@ impl StateStore {
         let write_txn = self.db.begin_write()?;
         {
             let mut meta = write_txn.open_table(META)?;
-            if meta.get("schema_version")?.is_none() {
-                meta.insert("schema_version", SCHEMA_VERSION.to_be_bytes().as_slice())?;
+            let existing_version = {
+                let existing = meta.get("schema_version")?;
+                existing
+                    .map(|v| decode_schema_version(v.value()))
+                    .transpose()?
+            };
+            match existing_version {
+                Some(existing) => {
+                    if existing != SCHEMA_VERSION {
+                        return Err(AppError::State(format!(
+                            "unsupported state schema version {existing}; expected {SCHEMA_VERSION}"
+                        )));
+                    }
+                }
+                None => {
+                    meta.insert("schema_version", SCHEMA_VERSION.to_be_bytes().as_slice())?;
+                }
             }
             write_txn.open_table(SESSIONS)?;
             write_txn.open_table(SEGMENTS)?;
             write_txn.open_table(UPLOADED_PARTS)?;
             write_txn.open_table(SUBMISSIONS)?;
-            write_txn.open_table(PIPELINE_STATES)?;
+            write_txn.open_table(SUBMISSION_PLANS)?;
+            write_txn.open_table(ROOM_STATES)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -64,13 +85,7 @@ impl StateStore {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(META)?;
         match table.get("schema_version")? {
-            Some(v) => {
-                let bytes = v.value();
-                let arr: [u8; 4] = bytes
-                    .try_into()
-                    .map_err(|_| AppError::State("invalid schema version bytes".to_string()))?;
-                Ok(u32::from_be_bytes(arr))
-            }
+            Some(v) => decode_schema_version(v.value()),
             None => Ok(0),
         }
     }
@@ -103,55 +118,107 @@ impl StateStore {
         self.write(|txn| txn.put_session(session))
     }
 
-    pub fn put_session_and_pipeline_state(
+    pub fn create_recording_session(
         &self,
         session: &LiveSession,
+        submission_plan: &SubmissionPlan,
         room_id: u64,
-        state: PipelineState,
     ) -> AppResult<()> {
+        let room_key = room_id.to_string();
+        if session.id != submission_plan.session_id {
+            return Err(AppError::State(format!(
+                "SubmissionPlan session_id {} does not match LiveSession {}",
+                submission_plan.session_id, session.id
+            )));
+        }
+        if session.status != SessionStatus::Recording {
+            return Err(AppError::State(format!(
+                "LiveSession {} is {:?}, not Recording; refusing to create recording session",
+                session.id, session.status
+            )));
+        }
+        if session.room_key != room_key {
+            return Err(AppError::State(format!(
+                "LiveSession {} belongs to room {}, not room {room_id}",
+                session.id, session.room_key
+            )));
+        }
+        if session.upload_credential.as_ref() != Some(&submission_plan.upload_credential) {
+            return Err(AppError::State(format!(
+                "LiveSession {} upload credential {:?} does not match SubmissionPlan credential {:?}",
+                session.id, session.upload_credential, submission_plan.upload_credential
+            )));
+        }
         self.write(|txn| {
             txn.put_session(session)?;
-            txn.put_room_pipeline_state(room_id, state, Some(session.id), None)
+            txn.put_submission_plan(submission_plan)?;
+            txn.put_room_state(room_id, RoomState::Recording, Some(session.id), None)
         })
     }
 
-    pub fn put_pipeline_state(&self, room_id: u64, state: PipelineState) -> AppResult<()> {
-        self.write(|txn| txn.put_room_pipeline_state(room_id, state, None, None))
-    }
-
-    pub fn put_room_pipeline_state(
+    pub fn finalize_session_and_release_room(
         &self,
         room_id: u64,
-        state: PipelineState,
+        session_id: Uuid,
+    ) -> AppResult<()> {
+        let room_key = room_id.to_string();
+        self.write(|txn| {
+            let mut session = txn.get_session(session_id)?.ok_or_else(|| {
+                AppError::State(format!("Session {session_id} not found when finalizing"))
+            })?;
+            if session.status != SessionStatus::Recording {
+                return Err(AppError::State(format!(
+                    "Session {session_id} is {:?}, not Recording; refusing to finalize",
+                    session.status
+                )));
+            }
+            if session.room_key != room_key {
+                return Err(AppError::State(format!(
+                    "Session {session_id} belongs to room {}, not room {room_id}; refusing to release room",
+                    session.room_key
+                )));
+            }
+            session.status = SessionStatus::Finalized;
+            txn.put_session(&session)?;
+            txn.put_room_state(room_id, RoomState::Idle, None, None)
+        })
+    }
+
+    pub fn put_room_state_value(&self, room_id: u64, state: RoomState) -> AppResult<()> {
+        self.write(|txn| txn.put_room_state(room_id, state, None, None))
+    }
+
+    pub fn put_room_state(
+        &self,
+        room_id: u64,
+        state: RoomState,
         active_session_id: Option<Uuid>,
     ) -> AppResult<()> {
-        self.write(|txn| txn.put_room_pipeline_state(room_id, state, active_session_id, None))
+        self.write(|txn| txn.put_room_state(room_id, state, active_session_id, None))
     }
 
-    pub fn put_room_pipeline_state_with_error(
+    pub fn put_room_state_with_error(
         &self,
         room_id: u64,
-        state: PipelineState,
+        state: RoomState,
         active_session_id: Option<Uuid>,
         last_error: String,
     ) -> AppResult<()> {
-        self.write(|txn| {
-            txn.put_room_pipeline_state(room_id, state, active_session_id, Some(last_error))
-        })
+        self.write(|txn| txn.put_room_state(room_id, state, active_session_id, Some(last_error)))
     }
 
-    pub fn get_pipeline_state(&self, room_id: u64) -> AppResult<Option<PipelineState>> {
+    pub fn get_room_state_value(&self, room_id: u64) -> AppResult<Option<RoomState>> {
         Ok(self
-            .get_room_pipeline_state(room_id)?
+            .get_room_state(room_id)?
             .map(|room_state| room_state.state))
     }
 
-    pub fn get_room_pipeline_state(&self, room_id: u64) -> AppResult<Option<RoomPipelineState>> {
+    pub fn get_room_state(&self, room_id: u64) -> AppResult<Option<PersistedRoomState>> {
         let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(PIPELINE_STATES)?;
+        let table = read_txn.open_table(ROOM_STATES)?;
         match table.get(room_id)? {
             Some(v) => {
-                let state = decode_room_pipeline_state(v.value())?;
+                let state = decode_room_state(v.value())?;
                 Ok(Some(state))
             }
             None => Ok(None),
@@ -261,22 +328,35 @@ impl StateStore {
         Ok(submissions)
     }
 
-    pub fn list_all_pipeline_states(&self) -> AppResult<Vec<(u64, PipelineState)>> {
+    pub fn list_all_submission_plans(&self) -> AppResult<Vec<SubmissionPlan>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SUBMISSION_PLANS)?;
+        let mut plans = Vec::new();
+        for entry in table.iter()? {
+            let (_, v) = entry?;
+            let plan: SubmissionPlan = serde_json::from_slice(v.value())
+                .map_err(|e| AppError::State(format!("deserialize submission plan: {e}")))?;
+            plans.push(plan);
+        }
+        Ok(plans)
+    }
+
+    pub fn list_all_room_state_values(&self) -> AppResult<Vec<(u64, RoomState)>> {
         Ok(self
-            .list_all_room_pipeline_states()?
+            .list_all_room_states()?
             .into_iter()
             .map(|(room_id, state)| (room_id, state.state))
             .collect())
     }
 
-    pub fn list_all_room_pipeline_states(&self) -> AppResult<Vec<(u64, RoomPipelineState)>> {
+    pub fn list_all_room_states(&self) -> AppResult<Vec<(u64, PersistedRoomState)>> {
         let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(PIPELINE_STATES)?;
+        let table = read_txn.open_table(ROOM_STATES)?;
         let mut states = Vec::new();
         for entry in table.iter()? {
             let (k, v) = entry?;
             let room_id = k.value();
-            let state = decode_room_pipeline_state(v.value())?;
+            let state = decode_room_state(v.value())?;
             states.push((room_id, state));
         }
         Ok(states)
@@ -300,11 +380,16 @@ impl StateStore {
             let table = read_txn.open_table(SUBMISSIONS)?;
             table.len()? as usize
         };
+        let submission_plan_count = {
+            let table = read_txn.open_table(SUBMISSION_PLANS)?;
+            table.len()? as usize
+        };
         Ok(StateSummary {
             session_count,
             segment_count,
             uploaded_parts_count,
             submission_count,
+            submission_plan_count,
         })
     }
 
@@ -314,6 +399,20 @@ impl StateStore {
 
     pub fn put_submission(&self, submission: &Submission) -> AppResult<()> {
         self.write(|txn| txn.put_submission(submission))
+    }
+
+    pub fn begin_submission(&self, submission: &Submission) -> AppResult<bool> {
+        self.write(|txn| {
+            if txn.get_submission(submission.session_id)?.is_some() {
+                return Ok(false);
+            }
+            txn.put_submission(submission)?;
+            Ok(true)
+        })
+    }
+
+    pub fn put_submission_plan(&self, plan: &SubmissionPlan) -> AppResult<()> {
+        self.write(|txn| txn.put_submission_plan(plan))
     }
 
     pub fn list_uploaded_parts(&self, session_id: Uuid) -> AppResult<Vec<UploadedPart>> {
@@ -344,6 +443,20 @@ impl StateStore {
                 let submission: Submission = serde_json::from_slice(v.value())
                     .map_err(|e| AppError::State(format!("deserialize submission: {e}")))?;
                 Ok(Some(submission))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_submission_plan(&self, session_id: Uuid) -> AppResult<Option<SubmissionPlan>> {
+        let key = session_id.to_string();
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(SUBMISSION_PLANS)?;
+        match table.get(key.as_str())? {
+            Some(v) => {
+                let plan: SubmissionPlan = serde_json::from_slice(v.value())
+                    .map_err(|e| AppError::State(format!("deserialize submission plan: {e}")))?;
+                Ok(Some(plan))
             }
             None => Ok(None),
         }
@@ -395,23 +508,59 @@ impl StoreTxn<'_> {
         Ok(())
     }
 
-    pub fn put_room_pipeline_state(
+    pub fn put_submission_plan(&self, plan: &SubmissionPlan) -> AppResult<()> {
+        let key = plan.session_id.to_string();
+        let value = serde_json::to_vec(plan)
+            .map_err(|e| AppError::State(format!("serialize submission plan: {e}")))?;
+        let mut table = self.txn.open_table(SUBMISSION_PLANS)?;
+        table.insert(key.as_str(), value.as_slice())?;
+        Ok(())
+    }
+
+    pub fn put_room_state(
         &self,
         room_id: u64,
-        state: PipelineState,
+        state: RoomState,
         active_session_id: Option<Uuid>,
         last_error: Option<String>,
     ) -> AppResult<()> {
-        let room_state = RoomPipelineState {
+        validate_room_state_shape(state, active_session_id)?;
+        let room_state = PersistedRoomState {
             state,
             active_session_id,
             last_error_at: last_error.as_ref().map(|_| jiff::Timestamp::now()),
             last_error,
         };
         let value = serde_json::to_vec(&room_state).map_err(|e| AppError::State(e.to_string()))?;
-        let mut table = self.txn.open_table(PIPELINE_STATES)?;
+        let mut table = self.txn.open_table(ROOM_STATES)?;
         table.insert(room_id, value.as_slice())?;
         Ok(())
+    }
+
+    pub fn get_session(&self, id: Uuid) -> AppResult<Option<LiveSession>> {
+        let key = id.to_string();
+        let table = self.txn.open_table(SESSIONS)?;
+        match table.get(key.as_str())? {
+            Some(v) => {
+                let session: LiveSession = serde_json::from_slice(v.value())
+                    .map_err(|e| AppError::State(format!("deserialize session: {e}")))?;
+                Ok(Some(session))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_submission(&self, session_id: Uuid) -> AppResult<Option<Submission>> {
+        let key = session_id.to_string();
+        let table = self.txn.open_table(SUBMISSIONS)?;
+        match table.get(key.as_str())? {
+            Some(v) => {
+                let submission: Submission = serde_json::from_slice(v.value())
+                    .map_err(|e| AppError::State(format!("deserialize submission: {e}")))?;
+                Ok(Some(submission))
+            }
+            None => Ok(None),
+        }
     }
 
     pub fn get_segment(&self, session_id: Uuid, index: u32) -> AppResult<Option<Segment>> {
@@ -428,26 +577,39 @@ impl StoreTxn<'_> {
     }
 }
 
-fn decode_room_pipeline_state(bytes: &[u8]) -> AppResult<RoomPipelineState> {
-    if let Ok(state) = serde_json::from_slice::<RoomPipelineState>(bytes) {
-        return Ok(state);
-    }
+fn decode_room_state(bytes: &[u8]) -> AppResult<PersistedRoomState> {
+    let room_state = serde_json::from_slice::<PersistedRoomState>(bytes)
+        .map_err(|e| AppError::State(format!("deserialize room state: {e}")))?;
+    validate_room_state_shape(room_state.state, room_state.active_session_id)?;
+    Ok(room_state)
+}
 
-    let legacy_state: PipelineState = serde_json::from_slice(bytes)
-        .map_err(|e| AppError::State(format!("deserialize pipeline state: {e}")))?;
-    Ok(RoomPipelineState {
-        state: legacy_state,
-        active_session_id: None,
-        last_error: None,
-        last_error_at: None,
-    })
+fn decode_schema_version(bytes: &[u8]) -> AppResult<u32> {
+    let arr: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| AppError::State("invalid schema version bytes".to_string()))?;
+    Ok(u32::from_be_bytes(arr))
+}
+
+fn validate_room_state_shape(state: RoomState, active_session_id: Option<Uuid>) -> AppResult<()> {
+    match (state.requires_active_session(), active_session_id) {
+        (true, None) => Err(AppError::State(format!(
+            "room state {state:?} requires active_session_id"
+        ))),
+        (false, Some(session_id)) => Err(AppError::State(format!(
+            "room state {state:?} must not carry active_session_id {session_id}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Copyright, SubmitApi};
+    use crate::credential::CredentialIdentity;
     use crate::state::model::{
-        LiveSession, SessionStatus,
+        LiveSession, SessionStatus, SubmissionPlan,
         fixtures::{finalized_segment, recording_segment},
     };
     use jiff::Timestamp;
@@ -461,6 +623,44 @@ mod tests {
         (store, dir)
     }
 
+    fn test_credential(name: &str) -> CredentialIdentity {
+        CredentialIdentity::new(name, format!("data/{name}.json"))
+    }
+
+    fn recording_session(room_id: u64, upload_credential: CredentialIdentity) -> LiveSession {
+        LiveSession {
+            id: Uuid::new_v4(),
+            room_key: room_id.to_string(),
+            title: "t".to_string(),
+            started_at: Timestamp::now(),
+            status: SessionStatus::Recording,
+            record_credential: None,
+            upload_credential: Some(upload_credential),
+        }
+    }
+
+    fn submission_plan(session_id: Uuid, upload_credential: CredentialIdentity) -> SubmissionPlan {
+        SubmissionPlan {
+            session_id,
+            upload_credential,
+            submit_api: SubmitApi::App,
+            title: "t".to_string(),
+            description: String::new(),
+            category_id: 171,
+            copyright: Copyright::Reprint,
+            source: "直播录像".to_string(),
+            tags: vec!["直播录像".to_string()],
+            private: false,
+            dynamic: String::new(),
+            forbid_reprint: false,
+            charging_panel: false,
+            close_reply: false,
+            close_danmu: false,
+            featured_reply: false,
+            delete_after_submit: false,
+        }
+    }
+
     #[test]
     fn open_creates_database() {
         let (_store, dir) = test_store();
@@ -468,9 +668,29 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_1() {
+    fn schema_version_is_2() {
         let (store, _dir) = test_store();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn open_rejects_unsupported_schema_version() {
+        let (store, dir) = test_store();
+        let write_txn = store.db.begin_write().unwrap();
+        {
+            let mut meta = write_txn.open_table(META).unwrap();
+            meta.insert("schema_version", 1_u32.to_be_bytes().as_slice())
+                .unwrap();
+        }
+        write_txn.commit().unwrap();
+        drop(store);
+
+        let err = match StateStore::open(dir.path().join("state.redb")) {
+            Ok(_) => panic!("expected unsupported schema error"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("unsupported state schema version"));
     }
 
     #[test]
@@ -628,17 +848,104 @@ mod tests {
     }
 
     #[test]
-    fn room_pipeline_state_preserves_active_session_id() {
+    fn room_state_preserves_active_session_id() {
         let (store, _dir) = test_store();
         let session_id = Uuid::new_v4();
 
         store
-            .put_room_pipeline_state(42, PipelineState::Recording, Some(session_id))
+            .put_room_state(42, RoomState::Recording, Some(session_id))
             .unwrap();
 
-        let loaded = store.get_room_pipeline_state(42).unwrap().unwrap();
-        assert_eq!(loaded.state, PipelineState::Recording);
+        let loaded = store.get_room_state(42).unwrap().unwrap();
+        assert_eq!(loaded.state, RoomState::Recording);
         assert_eq!(loaded.active_session_id, Some(session_id));
+    }
+
+    #[test]
+    fn room_state_requires_active_session_shape() {
+        let (store, _dir) = test_store();
+
+        let err = store
+            .put_room_state(42, RoomState::Recording, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("requires active_session_id"));
+
+        let err = store
+            .put_room_state(42, RoomState::Idle, Some(Uuid::new_v4()))
+            .unwrap_err();
+        assert!(err.to_string().contains("must not carry active_session_id"));
+    }
+
+    #[test]
+    fn create_recording_session_requires_recording_status() {
+        let (store, _dir) = test_store();
+        let credential = test_credential("main");
+        let mut session = recording_session(42, credential.clone());
+        session.status = SessionStatus::Finalized;
+        let plan = submission_plan(session.id, credential);
+
+        let err = store
+            .create_recording_session(&session, &plan, 42)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("not Recording"));
+        assert!(store.get_session(session.id).unwrap().is_none());
+        assert!(store.get_submission_plan(session.id).unwrap().is_none());
+        assert!(store.get_room_state(42).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_recording_session_requires_room_match() {
+        let (store, _dir) = test_store();
+        let credential = test_credential("main");
+        let session = recording_session(43, credential.clone());
+        let plan = submission_plan(session.id, credential);
+
+        let err = store
+            .create_recording_session(&session, &plan, 42)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("belongs to room 43"));
+        assert!(store.get_session(session.id).unwrap().is_none());
+        assert!(store.get_submission_plan(session.id).unwrap().is_none());
+        assert!(store.get_room_state(42).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_recording_session_requires_upload_credential_match() {
+        let (store, _dir) = test_store();
+        let session = recording_session(42, test_credential("session"));
+        let plan = submission_plan(session.id, test_credential("plan"));
+
+        let err = store
+            .create_recording_session(&session, &plan, 42)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("upload credential"));
+        assert!(store.get_session(session.id).unwrap().is_none());
+        assert!(store.get_submission_plan(session.id).unwrap().is_none());
+        assert!(store.get_room_state(42).unwrap().is_none());
+    }
+
+    #[test]
+    fn finalize_session_and_release_room_requires_room_match() {
+        let (store, _dir) = test_store();
+        let session = recording_session(43, test_credential("main"));
+        store.put_session(&session).unwrap();
+        store
+            .put_room_state(42, RoomState::Recording, Some(session.id))
+            .unwrap();
+
+        let err = store
+            .finalize_session_and_release_room(42, session.id)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("belongs to room 43"));
+        let loaded = store.get_session(session.id).unwrap().unwrap();
+        assert_eq!(loaded.status, SessionStatus::Recording);
+        let room_state = store.get_room_state(42).unwrap().unwrap();
+        assert_eq!(room_state.state, RoomState::Recording);
+        assert_eq!(room_state.active_session_id, Some(session.id));
     }
 
     #[test]
@@ -659,15 +966,15 @@ mod tests {
             .write(|txn| {
                 txn.put_session(&session)?;
                 txn.put_segment(&seg)?;
-                txn.put_room_pipeline_state(7, PipelineState::Recording, Some(session.id), None)
+                txn.put_room_state(7, RoomState::Recording, Some(session.id), None)
             })
             .unwrap();
 
         assert!(store.get_session(session.id).unwrap().is_some());
         assert_eq!(store.list_segments(session.id).unwrap().len(), 1);
         assert_eq!(
-            store.get_pipeline_state(7).unwrap(),
-            Some(PipelineState::Recording)
+            store.get_room_state_value(7).unwrap(),
+            Some(RoomState::Recording)
         );
     }
 

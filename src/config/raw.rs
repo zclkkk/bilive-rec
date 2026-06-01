@@ -234,7 +234,7 @@ impl Copyright {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SubmitApi {
     #[default]
@@ -290,7 +290,6 @@ impl AppConfig {
         let upload = self.upload_config()?;
         upload.validate()?;
 
-        let upload_transport = upload.transport();
         let mut rooms = Vec::with_capacity(self.rooms.len());
         for (name, room) in &self.rooms {
             rooms.push(self.resolve_room(name, room, upload)?);
@@ -299,7 +298,6 @@ impl AppConfig {
         Ok(RunConfig {
             data: self.data.clone(),
             pipeline: self.pipeline.clone(),
-            upload: upload_transport,
             rooms,
         })
     }
@@ -446,6 +444,9 @@ impl AppConfig {
                 credential_name,
                 &format!("rooms.{room_name}.upload.credential"),
             )?,
+            line: upload.line.clone(),
+            threads: upload.threads,
+            submit_api: upload.submit_api.clone(),
         })
     }
 
@@ -642,13 +643,13 @@ mod tests {
         let run = config.resolve_for_run().unwrap();
 
         assert_eq!(run.data.dir, std::path::PathBuf::from("./data"));
-        assert_eq!(run.upload.line, "auto");
-        assert_eq!(run.upload.threads, 3);
         assert_eq!(run.rooms.len(), 1);
 
         let room = &run.rooms[0];
         assert_eq!(room.name, "example");
         assert_eq!(room.url, "https://live.bilibili.com/123456");
+        assert_eq!(room.upload.line, "auto");
+        assert_eq!(room.upload.threads, 3);
         assert_eq!(room.record.qn, 10000);
         assert!(room.record.cdn.is_empty());
         assert!(!room.record.delete_after_submit);
