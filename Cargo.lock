@@ -146,8 +146,8 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "biliup"
-version = "0.2.4"
-source = "git+https://github.com/biliup/biliup.git?rev=62bd16de8e952328d9c1b84eeb555cdbdf024b35#62bd16de8e952328d9c1b84eeb555cdbdf024b35"
+version = "1.2.0"
+source = "git+https://github.com/biliup/biliup.git?rev=a529bbcbd2a3283efd9e2aeb204a32495391f702#a529bbcbd2a3283efd9e2aeb204a32495391f702"
 dependencies = [
  "async-trait",
  "base64",
@@ -157,6 +157,7 @@ dependencies = [
  "chrono",
  "cookie",
  "futures",
+ "libsm",
  "m3u8-rs",
  "md-5",
  "nom 8.0.0",
@@ -176,6 +177,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "urlencoding",
 ]
 
 [[package]]
@@ -1152,6 +1154,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libsm"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25251909572746d2902a35a591d82497c6b2f74dfca4f7eda57afd4a66b1992e"
+dependencies = [
+ "byteorder",
+ "lazy_static",
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+ "rand 0.9.4",
+ "yasna",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1290,6 +1307,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+dependencies = [
+ "num-integer",
+ "num-traits",
 ]
 
 [[package]]
@@ -2508,6 +2535,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
+
+[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3052,6 +3085,15 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "yasna"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
+dependencies = [
+ "num-bigint",
+]
 
 [[package]]
 name = "yoke"
