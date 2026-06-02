@@ -101,7 +101,7 @@ jobs:
           New-Item -ItemType Directory -Path staging, dist | Out-Null
 
           Copy-Item "target\${{ matrix.target }}\release\${{ matrix.exe }}" "staging\${{ matrix.exe }}"
-          Copy-Item config.example.toml LICENSE staging\
+          Copy-Item config.example.toml, LICENSE -Destination staging\
 
           Compress-Archive -Path staging\* -DestinationPath "dist\$archive" -Force
           "archive=dist/$archive" >> $env:GITHUB_OUTPUT
