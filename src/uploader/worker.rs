@@ -114,7 +114,7 @@ impl<U: Uploader + Send + Sync + 'static> UploadWorker<U> {
                 warn!(
                     session_id = %segment.session_id,
                     credential = %plan.upload_credential.name,
-                    submit_api = ?plan.submit_api,
+                    submit_api = %plan.submit_api.as_config_value(),
                     "No uploader configured for persisted submission plan"
                 );
                 continue;
@@ -223,7 +223,7 @@ impl<U: Uploader + Send + Sync + 'static> UploadWorker<U> {
                 warn!(
                     session_id = %session.id,
                     credential = %plan.upload_credential.name,
-                    submit_api = ?plan.submit_api,
+                    submit_api = %plan.submit_api.as_config_value(),
                     "No uploader configured for persisted submission plan"
                 );
                 continue;
@@ -263,12 +263,21 @@ impl<U: Uploader + Send + Sync + 'static> UploadWorker<U> {
                     sub.aid = aid;
                     sub.bvid = bvid;
                     self.store.put_submission(&sub)?;
+                    info!(
+                        session_id = %session.id,
+                        credential = %plan.upload_credential.name,
+                        submit_api = %plan.submit_api.as_config_value(),
+                        aid = ?sub.aid,
+                        bvid = ?sub.bvid,
+                        "Submission confirmed"
+                    );
                     if plan.delete_after_submit {
                         let cleaned =
                             cleanup_submitted_session_recordings(&self.store, session.id).await?;
                         if cleaned > 0 {
                             info!(
                                 session_id = %session.id,
+                                credential = %plan.upload_credential.name,
                                 cleaned,
                                 "Deleted local recordings after confirmed submission"
                             );
@@ -278,6 +287,8 @@ impl<U: Uploader + Send + Sync + 'static> UploadWorker<U> {
                 Ok(SubmissionOutcome::Ambiguous { reason }) => {
                     warn!(
                         session_id = %session.id,
+                        credential = %plan.upload_credential.name,
+                        submit_api = %plan.submit_api.as_config_value(),
                         "Submission outcome is ambiguous: {}",
                         reason
                     );
@@ -288,6 +299,8 @@ impl<U: Uploader + Send + Sync + 'static> UploadWorker<U> {
                 Err(error) => {
                     error!(
                         session_id = %session.id,
+                        credential = %plan.upload_credential.name,
+                        submit_api = %plan.submit_api.as_config_value(),
                         "Submission failed: {}",
                         error
                     );

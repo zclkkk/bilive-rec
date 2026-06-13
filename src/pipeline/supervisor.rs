@@ -196,7 +196,13 @@ impl RoomSupervisor {
             self.offline_since = None;
         }
         self.session.state = next;
-        info!(room_id = self.room_id, from = ?prev, to = ?next, "Room state transition");
+        info!(
+            room_name = %self.room_config.name,
+            room_id = self.room_id,
+            from = ?prev,
+            to = ?next,
+            "Room state transition"
+        );
         Ok(())
     }
 
@@ -230,7 +236,12 @@ impl RoomSupervisor {
 
     fn handle_room_info_error(&mut self, error: AppError) -> AppResult<()> {
         let reason = format!("fetch_room_info failed: {error}");
-        warn!("Failed to fetch room info for {}: {}", self.room_id, error);
+        warn!(
+            room_name = %self.room_config.name,
+            room_id = self.room_id,
+            "Failed to fetch room info: {}",
+            error
+        );
         if self.session.state == RoomState::Resolving {
             self.transition_with_error(RoomState::Offline, reason)
         } else {
@@ -371,7 +382,13 @@ impl RoomSupervisor {
                 Ok(info) => info,
                 Err(e) => {
                     let reason = format!("fetch_play_info failed: {e}");
-                    warn!("{}", reason);
+                    warn!(
+                        room_name = %self.room_config.name,
+                        room_id = self.room_id,
+                        session_id = %active_session,
+                        "fetch_play_info failed: {}",
+                        e
+                    );
                     self.wait_reconnect_with_error(reason)?;
                     return Ok(());
                 }
@@ -381,7 +398,13 @@ impl RoomSupervisor {
             Ok(c) => c,
             Err(e) => {
                 let reason = format!("parse_stream_candidates failed: {e}");
-                warn!("{}", reason);
+                warn!(
+                    room_name = %self.room_config.name,
+                    room_id = self.room_id,
+                    session_id = %active_session,
+                    "parse_stream_candidates failed: {}",
+                    e
+                );
                 self.wait_reconnect_with_error(reason)?;
                 return Ok(());
             }
@@ -397,7 +420,13 @@ impl RoomSupervisor {
             Ok(c) => c,
             Err(e) => {
                 let reason = format!("select_healthy_stream_candidate failed: {e}");
-                warn!("{}", reason);
+                warn!(
+                    room_name = %self.room_config.name,
+                    room_id = self.room_id,
+                    session_id = %active_session,
+                    "select_healthy_stream_candidate failed: {}",
+                    e
+                );
                 self.wait_reconnect_with_error(reason)?;
                 return Ok(());
             }
@@ -413,7 +442,13 @@ impl RoomSupervisor {
             Ok(r) => r,
             Err(e) => {
                 let reason = format!("stream connect failed: {e}");
-                warn!("{}", reason);
+                warn!(
+                    room_name = %self.room_config.name,
+                    room_id = self.room_id,
+                    session_id = %active_session,
+                    "stream connect failed: {}",
+                    e
+                );
                 self.wait_reconnect_with_error(reason)?;
                 return Ok(());
             }
@@ -427,7 +462,13 @@ impl RoomSupervisor {
             .max()
             .map_or(1, |idx| idx + 1);
 
-        info!("Starting record_flv from index {}", start_index);
+        info!(
+            room_name = %self.room_config.name,
+            room_id = self.room_id,
+            session_id = %active_session,
+            start_index,
+            "Starting record_flv"
+        );
         match record_flv(
             resp,
             active_session,
@@ -440,20 +481,42 @@ impl RoomSupervisor {
         .await
         {
             Ok(_) => {
-                info!("record_flv completed gracefully");
+                info!(
+                    room_name = %self.room_config.name,
+                    room_id = self.room_id,
+                    session_id = %active_session,
+                    "record_flv completed gracefully"
+                );
                 self.transition(RoomState::WaitingReconnect)?;
             }
             Err(AppError::GracefulShutdown) => {
-                info!("record_flv interrupted by graceful shutdown");
+                info!(
+                    room_name = %self.room_config.name,
+                    room_id = self.room_id,
+                    session_id = %active_session,
+                    "record_flv interrupted by graceful shutdown"
+                );
                 return Err(AppError::GracefulShutdown);
             }
             Err(e) => match recording_retry_reason(e) {
                 Ok(reason) => {
-                    warn!("record_flv retryable error: {}", reason);
+                    warn!(
+                        room_name = %self.room_config.name,
+                        room_id = self.room_id,
+                        session_id = %active_session,
+                        "record_flv retryable error: {}",
+                        reason
+                    );
                     self.wait_reconnect_with_error(reason)?;
                 }
                 Err(e) => {
-                    error!("record_flv fatal error: {}", e);
+                    error!(
+                        room_name = %self.room_config.name,
+                        room_id = self.room_id,
+                        session_id = %active_session,
+                        "record_flv fatal error: {}",
+                        e
+                    );
                     self.transition(RoomState::Failed)?;
                     return Err(e);
                 }
@@ -469,7 +532,12 @@ impl RoomSupervisor {
             let active_session = self.active_session_id.ok_or_else(|| {
                 AppError::State("WaitingReconnect state requires active_session_id".into())
             })?;
-            info!("Offline grace period expired. Finalizing session and releasing room.");
+            info!(
+                room_name = %self.room_config.name,
+                room_id = self.room_id,
+                session_id = %active_session,
+                "Offline grace period expired; finalizing session and releasing room"
+            );
             self.check_transition(RoomState::Idle)?;
             self.store
                 .finalize_session_and_release_room(self.room_id, active_session)?;

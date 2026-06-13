@@ -4,6 +4,7 @@ use bilive_rec::bilibili;
 use bilive_rec::bilibili::client::BiliClient;
 use bilive_rec::cli::{Cli, Command, ResolveOutcome, StateAction};
 use bilive_rec::config::AppConfig;
+use bilive_rec::credential::CredentialIdentity;
 use bilive_rec::error::AppResult;
 use bilive_rec::state;
 use bilive_rec::state::store::StateStore;
@@ -74,6 +75,10 @@ struct RunTaskOutcome {
     upload_worker_finished: bool,
 }
 
+fn record_credential_name(credential: Option<&CredentialIdentity>) -> &str {
+    credential.map_or("anonymous", |credential| credential.name.as_str())
+}
+
 async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
     let run_config = config.resolve_for_run()?;
@@ -99,6 +104,18 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let mut handles = futures::stream::FuturesUnordered::new();
     let prepared_rooms = run_config.rooms;
 
+    for room_config in &prepared_rooms {
+        tracing::info!(
+            room_name = %room_config.name,
+            room_url = %room_config.url,
+            record_credential = %record_credential_name(room_config.record.credential.as_ref()),
+            upload_credential = %room_config.upload.credential.name,
+            submit_api = %room_config.upload.submit_api.as_config_value(),
+            private = room_config.submit.private,
+            "Room configured"
+        );
+    }
+
     let mut uploaders = HashMap::new();
     for room_config in &prepared_rooms {
         let target = UploadTarget::new(
@@ -109,8 +126,10 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
             continue;
         }
         tracing::info!(
-            "Checking upload credential '{}'...",
-            room_config.upload.credential.name
+            credential = %room_config.upload.credential.name,
+            submit_api = %room_config.upload.submit_api.as_config_value(),
+            line = %room_config.upload.line,
+            "Checking upload credential"
         );
         let uploader = Arc::new(BiliupUploader::new(
             room_config.upload.credential.cookie_file.clone(),
@@ -153,13 +172,10 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
         let client = if let Some(client) = clients.get(&record_credential) {
             client.clone()
         } else {
-            if let Some(credential) = &record_credential {
-                tracing::info!(
-                    "Room '{}' uses record credential '{}'",
-                    room_config.name,
-                    credential.name
-                );
-            }
+            tracing::info!(
+                credential = %record_credential_name(record_credential.as_ref()),
+                "Initializing record client"
+            );
             let client = Arc::new(BiliClient::from_optional_cookie_file(
                 room_credentials.record_cookie_file(),
             )?);
@@ -192,23 +208,40 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                     shutdown_rx,
                 )?;
 
-                tracing::info!("Started supervisor for room {}", room_id);
+                tracing::info!(
+                    room_name = %supervisor.room_config.name,
+                    room_id,
+                    "Started supervisor"
+                );
 
                 loop {
                     // Check shutdown before each step
                     if *loop_shutdown_rx.borrow() {
-                        tracing::info!("Room {} shutting down (signal received)", room_id);
+                        tracing::info!(
+                            room_name = %supervisor.room_config.name,
+                            room_id,
+                            "Room shutting down (signal received)"
+                        );
                         return Ok::<(), bilive_rec::error::AppError>(());
                     }
 
                     match supervisor.run_step().await {
                         Ok(()) => {}
                         Err(bilive_rec::error::AppError::GracefulShutdown) => {
-                            tracing::info!("Room {} interrupted by graceful shutdown", room_id);
+                            tracing::info!(
+                                room_name = %supervisor.room_config.name,
+                                room_id,
+                                "Room interrupted by graceful shutdown"
+                            );
                             return Ok(());
                         }
                         Err(e) => {
-                            tracing::error!("Fatal supervisor error for room {}: {}", room_id, e);
+                            tracing::error!(
+                                room_name = %supervisor.room_config.name,
+                                room_id,
+                                "Fatal supervisor error: {}",
+                                e
+                            );
                             return Err(e);
                         }
                     }
@@ -229,7 +262,11 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                         tokio::select! {
                             _ = tokio::time::sleep(d) => {}
                             _ = loop_shutdown_rx.changed() => {
-                                tracing::info!("Room {} shutting down (signal during sleep)", room_id);
+                                tracing::info!(
+                                    room_name = %supervisor.room_config.name,
+                                    room_id,
+                                    "Room shutting down (signal during sleep)"
+                                );
                                 return Ok(());
                             }
                         }

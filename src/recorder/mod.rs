@@ -305,13 +305,18 @@ impl<'a> FlvRecorder<'a> {
                 threshold_exceeded: false,
                 media_tags,
             } => {
-                tracing::warn!(media_tags, "dropping duplicated FLV media group");
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    media_tags,
+                    "dropping duplicated FLV media group"
+                );
             }
             MediaGroupFlush::Duplicate {
                 threshold_exceeded: true,
                 media_tags,
             } => {
                 tracing::warn!(
+                    session_id = %self.session_id,
                     media_tags,
                     "dropping duplicated FLV media group — reconnect threshold exceeded"
                 );
@@ -754,7 +759,11 @@ pub async fn record_flv(
                         Ok(Ok(Some(data))) => {
                             if let Err(error) = recorder.push_chunk(&data).await {
                                 if matches!(error, AppError::StreamRepeatedData(_)) {
-                                    tracing::warn!("{}", error);
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        "stream repeated data: {}",
+                                        error
+                                    );
                                     break SegmentCloseReason::RepeatedMediaData;
                                 }
                                 return Err(error);
@@ -764,11 +773,16 @@ pub async fn record_flv(
                             break SegmentCloseReason::StreamEnded;
                         }
                         Ok(Err(e)) => {
-                            tracing::warn!("Stream connection dropped: {}", e);
+                            tracing::warn!(
+                                session_id = %session_id,
+                                "Stream connection dropped: {}",
+                                e
+                            );
                             break SegmentCloseReason::ConnectionDropped;
                         }
                         Err(_) => {
                             tracing::warn!(
+                                session_id = %session_id,
                                 "Stream idle timeout: no data received for {}s",
                                 STREAM_IDLE_TIMEOUT_SECS
                             );
@@ -779,7 +793,10 @@ pub async fn record_flv(
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    tracing::info!("Graceful shutdown requested, finalizing segment");
+                    tracing::info!(
+                        session_id = %session_id,
+                        "Graceful shutdown requested, finalizing segment"
+                    );
                     graceful_shutdown = true;
                     break SegmentCloseReason::GracefulShutdown;
                 }

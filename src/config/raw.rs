@@ -244,6 +244,16 @@ pub enum SubmitApi {
     BCutAndroid,
 }
 
+impl SubmitApi {
+    pub fn as_config_value(&self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Web => "web",
+            Self::BCutAndroid => "bcut_android",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
