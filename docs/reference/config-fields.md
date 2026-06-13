@@ -46,7 +46,7 @@
 | `description` | string | 无 | 否 | 投稿简介模板 |
 | `category_id` | u16 | `171` | 否 | 投稿分区 ID |
 | `copyright` | string | `reprint` | 否 | 版权类型：`original` 或 `reprint` |
-| `source` | string | `直播录像` | 否 | 转载来源（`reprint` 时必填） |
+| `source` | string | run: `{url}`；upload: 无 | 否 | 转载来源。run 模式支持房间模板；手动 upload 的 `reprint` 投稿必须显式填写普通字符串 |
 | `tags` | string[] | `[]` | 否 | 投稿标签 |
 | `private` | bool | `false` | 否 | 仅自己可见 |
 | `dynamic` | string | `""` | 否 | 同步动态文案 |
@@ -98,7 +98,7 @@
 | `description` | string | 投稿简介模板 |
 | `category_id` | u16 | 投稿分区 ID |
 | `copyright` | string | 版权类型 |
-| `source` | string | 转载来源 |
+| `source` | string | 转载来源；支持房间模板 |
 | `tags` | string[] | 投稿标签 |
 | `private` | bool | 仅自己可见 |
 | `dynamic` | string | 同步动态文案 |

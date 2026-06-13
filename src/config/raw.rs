@@ -115,8 +115,8 @@ pub struct SubmitConfig {
     pub category_id: u16,
     #[serde(default = "defaults::copyright")]
     pub copyright: Copyright,
-    #[serde(default = "defaults::source")]
-    pub source: String,
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -142,7 +142,7 @@ impl Default for SubmitConfig {
             description: None,
             category_id: defaults::category_id(),
             copyright: defaults::copyright(),
-            source: defaults::source(),
+            source: None,
             tags: Vec::new(),
             private: false,
             dynamic: String::new(),
@@ -325,7 +325,7 @@ impl AppConfig {
         let upload = self.upload_config()?;
         upload.validate()?;
         let credential = self.upload_credential_identity()?;
-        let submit = self.resolve_submit_config(None, "submit", false)?;
+        let submit = self.resolve_submit_config(None, "submit", false, None)?;
 
         Ok(UploadCommandConfig {
             data: self.data.clone(),
@@ -386,8 +386,12 @@ impl AppConfig {
         let record =
             self.resolve_record_config(Some(&room.record), &format!("rooms.{name}.record"))?;
         let upload = self.resolve_room_upload_config(name, room, upload)?;
-        let submit =
-            self.resolve_submit_config(Some(&room.submit), &format!("rooms.{name}.submit"), true)?;
+        let submit = self.resolve_submit_config(
+            Some(&room.submit),
+            &format!("rooms.{name}.submit"),
+            true,
+            Some("{url}"),
+        )?;
 
         Ok(ResolvedRoomConfig {
             name: name.to_string(),
@@ -465,6 +469,7 @@ impl AppConfig {
         room: Option<&RoomSubmitConfig>,
         label: &str,
         validate_templates: bool,
+        default_reprint_source: Option<&str>,
     ) -> AppResult<ResolvedSubmitConfig> {
         let submit = &self.submit;
         let title = room
@@ -479,9 +484,9 @@ impl AppConfig {
         let copyright = room
             .and_then(|room| room.copyright)
             .unwrap_or(submit.copyright);
-        let mut source = room
+        let source = room
             .and_then(|room| room.source.clone())
-            .unwrap_or_else(|| submit.source.clone());
+            .or_else(|| submit.source.clone());
         let tags = room
             .and_then(|room| room.tags.clone())
             .unwrap_or_else(|| submit.tags.clone());
@@ -501,15 +506,31 @@ impl AppConfig {
                     .map_err(|err| label_config_error(label, "description", err))?;
             }
         }
-        if copyright == Copyright::Reprint {
+        let source = if copyright == Copyright::Reprint {
+            let source = source
+                .or_else(|| default_reprint_source.map(str::to_owned))
+                .ok_or_else(|| {
+                    AppError::Config(format!(
+                        "{label}.source is required when copyright = \"reprint\""
+                    ))
+                })?;
             if source.trim().is_empty() {
                 return Err(AppError::Config(format!(
                     "{label}.source must not be empty when copyright = \"reprint\""
                 )));
             }
+            if validate_templates {
+                validate_room_template(&source)
+                    .map_err(|err| label_config_error(label, "source", err))?;
+            } else if source.contains('{') || source.contains('}') {
+                return Err(AppError::Config(format!(
+                    "{label}.source templates are only supported for room submissions"
+                )));
+            }
+            source
         } else {
-            source.clear();
-        }
+            String::new()
+        };
 
         Ok(ResolvedSubmitConfig {
             title,
@@ -669,7 +690,7 @@ mod tests {
         );
         assert_eq!(room.submit.category_id, 171);
         assert_eq!(room.submit.copyright, Copyright::Reprint);
-        assert_eq!(room.submit.source, "直播录像");
+        assert_eq!(room.submit.source, "{url}");
         assert_eq!(room.submit.tags, vec!["直播录像"]);
         assert!(!room.submit.private);
     }
@@ -847,6 +868,69 @@ source = ""
     }
 
     #[test]
+    fn upload_reprint_requires_explicit_source() {
+        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[credentials.main]
+cookie_file = "{}"
+
+[upload]
+credential = "main"
+"#,
+            cookie.path().display()
+        );
+        let config = AppConfig::parse(&toml).unwrap();
+        let err = config.resolve_for_upload().unwrap_err();
+        assert!(err.to_string().contains("submit.source"));
+    }
+
+    #[test]
+    fn upload_source_cannot_use_room_template() {
+        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[credentials.main]
+cookie_file = "{}"
+
+[upload]
+credential = "main"
+
+[submit]
+source = "{{url}}"
+"#,
+            cookie.path().display()
+        );
+        let config = AppConfig::parse(&toml).unwrap();
+        let err = config.resolve_for_upload().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only supported for room submissions")
+        );
+    }
+
+    #[test]
+    fn run_defaults_reprint_source_to_room_url_template() {
+        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[credentials.main]
+cookie_file = "{}"
+
+[upload]
+credential = "main"
+
+[rooms.test]
+url = "https://live.bilibili.com/1"
+"#,
+            cookie.path().display()
+        );
+        let config = AppConfig::parse(&toml).unwrap();
+        let run = config.resolve_for_run().unwrap();
+        assert_eq!(run.rooms[0].submit.source, "{url}");
+    }
+
+    #[test]
     fn run_rejects_invalid_submit_template() {
         let cookie = tempfile::NamedTempFile::new().unwrap();
         let toml = format!(
@@ -868,6 +952,30 @@ url = "https://live.bilibili.com/1"
         let config = AppConfig::parse(&toml).unwrap();
         let err = config.resolve_for_run().unwrap_err();
         assert!(err.to_string().contains("invalid started_at format"));
+    }
+
+    #[test]
+    fn run_rejects_invalid_source_template() {
+        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let toml = format!(
+            r#"
+[credentials.main]
+cookie_file = "{}"
+
+[upload]
+credential = "main"
+
+[submit]
+source = "{{unknown}}"
+
+[rooms.test]
+url = "https://live.bilibili.com/1"
+"#,
+            cookie.path().display()
+        );
+        let config = AppConfig::parse(&toml).unwrap();
+        let err = config.resolve_for_run().unwrap_err();
+        assert!(err.to_string().contains("submit.source"));
     }
 
     #[test]

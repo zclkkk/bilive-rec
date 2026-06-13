@@ -40,7 +40,10 @@ title = "{title} {started_at:%Y-%m-%d}"
 description = "{name} 直播录像\n录制开始：{started_at:%Y-%m-%d %H:%M:%S}\n原直播间：{url}"
 category_id = 171
 copyright = "reprint"
-source = "直播录像"
+# Reprint source supports the same room placeholders as title/description.
+# If omitted in `run`, reprint submissions default to "{url}".
+# Manual `upload` has no room context and requires an explicit literal source.
+# source = "{url}"
 tags = ["直播录像"]
 private = false
 dynamic = ""

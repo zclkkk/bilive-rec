@@ -97,7 +97,7 @@ title = "{title} {started_at:%Y-%m-%d}"
 description = "{name} 直播录像\n录制开始：{started_at:%Y-%m-%d %H:%M:%S}\n原直播间：{url}"
 category_id = 171
 copyright = "reprint"        # original 或 reprint
-source = "直播录像"           # reprint 时必填
+source = "{url}"              # reprint 来源；run 缺省为 {url}，upload 需显式填写
 tags = ["直播录像"]
 private = false
 dynamic = ""
@@ -107,6 +107,10 @@ close_reply = false
 close_danmu = false
 featured_reply = false
 ```
+
+`source` 是 B 站转载来源字段。`run` 模式有房间上下文，`copyright = "reprint"`
+且未配置 `source` 时会默认使用 `{url}`，即当前房间 URL。手动 `upload`
+没有房间上下文，因此 `reprint` 投稿必须显式配置一个普通字符串来源。
 
 ---
 

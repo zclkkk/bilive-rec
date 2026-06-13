@@ -291,6 +291,17 @@ impl RoomSupervisor {
             .transpose()?
             .unwrap_or_default();
         let submit = &self.room_config.submit;
+        let source = if submit.copyright == crate::config::Copyright::Reprint {
+            render_room_template(
+                &submit.source,
+                &self.room_config.name,
+                &self.room_config.url,
+                Some(session),
+                self.room_id,
+            )?
+        } else {
+            String::new()
+        };
 
         Ok(SubmissionPlan {
             session_id: session.id,
@@ -301,7 +312,7 @@ impl RoomSupervisor {
             category_id: submit.category_id,
             copyright: submit.copyright,
             tags: submit.tags.clone(),
-            source: submit.source.clone(),
+            source,
             private: submit.private,
             dynamic: submit.dynamic.clone(),
             forbid_reprint: submit.forbid_reprint,
@@ -675,6 +686,27 @@ mod tests {
         let room_state = store.get_room_state(1).unwrap().unwrap();
         assert_eq!(room_state.state, RoomState::Idle);
         assert_eq!(room_state.active_session_id, None);
+    }
+
+    #[test]
+    fn submission_plan_renders_source_template() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(StateStore::open(dir.path().join("state.redb")).unwrap());
+        let mut supervisor = test_supervisor(store, dir.path());
+        supervisor.room_config.submit.source = "{url}".into();
+        let session = LiveSession {
+            id: Uuid::new_v4(),
+            room_key: "1".into(),
+            title: "title".into(),
+            started_at: jiff::Timestamp::now(),
+            status: SessionStatus::Recording,
+            record_credential: None,
+            upload_credential: Some(supervisor.room_config.upload.credential.clone()),
+        };
+
+        let plan = supervisor.submission_plan_for_session(&session).unwrap();
+
+        assert_eq!(plan.source, "https://live.bilibili.com/1");
     }
 
     #[test]

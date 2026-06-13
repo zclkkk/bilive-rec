@@ -42,10 +42,6 @@ pub(super) fn copyright() -> Copyright {
     Copyright::Reprint
 }
 
-pub(super) fn source() -> String {
-    "直播录像".to_string()
-}
-
 pub(super) fn poll_interval_s() -> u64 {
     60
 }
