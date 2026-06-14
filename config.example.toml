@@ -13,8 +13,11 @@ cookie_file = "./data/cookies.json"
 [record]
 credential = "main"
 output_dir = "./data/recordings"
+# Rotation thresholds must be greater than zero when configured.
 segment_time = "01:00:00"
+# Size units: B, KiB, MiB, GiB. No unit means bytes.
 segment_size = "2GiB"
+# Set to "0" to keep every finalized segment.
 min_segment_size = "20MiB"
 qn = 10000
 # CDN preference list. Use the `cdn=...` names printed by `bilive-rec check`,

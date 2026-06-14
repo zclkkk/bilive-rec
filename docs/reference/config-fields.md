@@ -20,9 +20,9 @@
 |------|------|--------|------|------|
 | `credential` | string | 无 | 否 | 拉流账号名（不填则匿名拉流） |
 | `output_dir` | path | `./data/recordings` | 否 | 录制文件存放目录 |
-| `segment_time` | string | 无 | 否 | 分段时长阈值，格式 `HH:MM:SS` |
-| `segment_size` | string | 无 | 否 | 分段大小阈值，支持 `KiB`/`MiB`/`GiB` 后缀 |
-| `min_segment_size` | string | `20MiB` | 否 | 最小分段大小 |
+| `segment_time` | string | 无 | 否 | 分段时长阈值，格式 `HH:MM:SS`，配置后必须大于 0 |
+| `segment_size` | string | 无 | 否 | 分段大小阈值，支持 `B`/`KiB`/`MiB`/`GiB` 后缀，配置后必须大于 0 |
+| `min_segment_size` | string | `20MiB` | 否 | 最小分段大小；可设为 `0` 表示不过滤 |
 | `qn` | u32 | `10000` | 否 | 画质档位（10000 = 原画） |
 | `cdn` | string[] | `[]` | 否 | CDN 偏好列表 |
 | `delete_after_submit` | bool | `false` | 否 | 投稿确认后删除本地文件 |

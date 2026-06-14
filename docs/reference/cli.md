@@ -1,12 +1,18 @@
 # CLI Reference
 
-## 全局选项
+## 命令格式
 
 ```
-bilive-rec [--config <path>] <command>
+bilive-rec <command>
 ```
 
-- `--config`, `-c`：配置文件路径，默认为当前目录下的 `config.toml`
+`--config`, `-c` 不是全局选项；它由需要配置文件的子命令各自提供。用法示例：
+
+```bash
+bilive-rec run --config prod.toml
+bilive-rec state --config prod.toml inspect
+bilive-rec check https://live.bilibili.com/123456 --config prod.toml
+```
 
 ---
 

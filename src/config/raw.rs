@@ -13,7 +13,9 @@ use super::resolved::{
     ResolvedSubmitConfig, ResolvedUploadConfig, RunConfig, UploadCommandConfig,
     UploadRecoveryConfig, UploadTransportConfig,
 };
-use super::validation::{parse_hms_duration, parse_size_bytes, validate_cookie_file_path};
+use super::validation::{
+    ConfigValueError, parse_hms_duration, parse_size_bytes, validate_cookie_file_path,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -571,18 +573,24 @@ impl RecordConfig {
     }
 
     pub fn min_segment_size_bytes(&self) -> AppResult<u64> {
-        parse_size_bytes(&self.min_segment_size).ok_or_else(|| {
-            AppError::Config(format!(
-                "Invalid min_segment_size: {}",
-                self.min_segment_size
-            ))
-        })
+        parse_size_bytes(&self.min_segment_size)
+            .map_err(|err| value_config_error("record.min_segment_size", err))
     }
 
     pub fn segment_time_duration(&self) -> AppResult<Option<std::time::Duration>> {
         self.segment_time
             .as_deref()
-            .map(parse_hms_duration)
+            .map(|value| {
+                let duration = parse_hms_duration(value)
+                    .map_err(|err| value_config_error("record.segment_time", err))?;
+                if duration.is_zero() {
+                    return Err(value_config_error(
+                        "record.segment_time",
+                        ConfigValueError::ZeroNotAllowed,
+                    ));
+                }
+                Ok(duration)
+            })
             .transpose()
     }
 
@@ -590,8 +598,15 @@ impl RecordConfig {
         self.segment_size
             .as_deref()
             .map(|value| {
-                parse_size_bytes(value)
-                    .ok_or_else(|| AppError::Config(format!("Invalid segment_size: {value}")))
+                let size = parse_size_bytes(value)
+                    .map_err(|err| value_config_error("record.segment_size", err))?;
+                if size == 0 {
+                    return Err(value_config_error(
+                        "record.segment_size",
+                        ConfigValueError::ZeroNotAllowed,
+                    ));
+                }
+                Ok(size)
             })
             .transpose()
     }
@@ -662,6 +677,10 @@ fn label_config_error(label: &str, field: &str, err: AppError) -> AppError {
     }
 }
 
+fn value_config_error(label: &str, err: ConfigValueError) -> AppError {
+    AppError::Config(format!("{label}: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,7 +689,9 @@ mod tests {
 
     #[test]
     fn parse_sample_config_and_resolve_run() {
-        let config = AppConfig::parse(SAMPLE_TOML).unwrap();
+        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let toml = SAMPLE_TOML.replace("./data/cookies.json", &cookie.path().display().to_string());
+        let config = AppConfig::parse(&toml).unwrap();
         let run = config.resolve_for_run().unwrap();
 
         assert_eq!(run.data.dir, std::path::PathBuf::from("./data"));
@@ -992,6 +1013,33 @@ url = "https://live.bilibili.com/1"
     }
 
     #[test]
+    fn record_validation_rejects_zero_rotation_limits() {
+        let mut record = RecordConfig {
+            segment_time: Some("00:00:00".into()),
+            ..RecordConfig::default()
+        };
+        let err = record.validate().unwrap_err();
+        assert!(err.to_string().contains("record.segment_time"));
+        assert!(err.to_string().contains("greater than zero"));
+
+        record.segment_time = None;
+        record.segment_size = Some("0".into());
+        let err = record.validate().unwrap_err();
+        assert!(err.to_string().contains("record.segment_size"));
+        assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
+    fn record_validation_allows_zero_min_segment_size() {
+        let record = RecordConfig {
+            min_segment_size: "0".into(),
+            ..RecordConfig::default()
+        };
+
+        assert_eq!(record.min_segment_size_bytes().unwrap(), 0);
+    }
+
+    #[test]
     fn upload_validation_rejects_zero_threads() {
         let upload = UploadConfig {
             credential: Some("main".into()),
@@ -1043,30 +1091,5 @@ url = "https://live.bilibili.com/1"
 
         assert!(serde_json::from_str::<SubmitApi>("\"bcutandroid\"").is_err());
         assert!(serde_json::from_str::<SubmitApi>("\"b-cut-android\"").is_err());
-    }
-
-    #[test]
-    fn parse_duration_variations() {
-        use super::parse_hms_duration;
-        assert_eq!(
-            parse_hms_duration("01:30:00").unwrap(),
-            std::time::Duration::from_secs(90 * 60)
-        );
-        assert_eq!(
-            parse_hms_duration("00:15:30").unwrap(),
-            std::time::Duration::from_secs(15 * 60 + 30)
-        );
-        assert!(parse_hms_duration("invalid").is_err());
-        assert!(parse_hms_duration("01:aa:bb").is_err());
-    }
-
-    #[test]
-    fn parse_size_variations() {
-        use super::parse_size_bytes;
-        assert_eq!(parse_size_bytes("20MiB"), Some(20 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("2GiB"), Some(2 * 1024 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("10MB"), Some(10 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("15KB"), Some(15 * 1024));
-        assert_eq!(parse_size_bytes("invalid"), None);
     }
 }

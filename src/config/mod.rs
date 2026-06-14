@@ -18,4 +18,4 @@ pub use resolved::{
     ResolvedSubmitConfig, ResolvedUploadConfig, RoomCredentials, RunConfig, UploadCommandConfig,
     UploadRecoveryConfig, UploadTransportConfig,
 };
-pub use validation::{parse_hms_duration, parse_size_bytes};
+pub use validation::{ConfigValueError, parse_hms_duration, parse_size_bytes};

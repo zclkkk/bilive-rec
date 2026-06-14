@@ -62,12 +62,16 @@ cookie_file = "./data/captain_cookies.json"
 credential = "main"          # 拉流账号（用于获取最高画质），不填则匿名
 output_dir = "./data/recordings"  # 录制文件存放目录
 segment_time = "01:00:00"    # 分段时长阈值（HH:MM:SS 格式）
-segment_size = "2GiB"        # 分段大小阈值（支持 KiB/MiB/GiB 后缀）
+segment_size = "2GiB"        # 分段大小阈值（支持 B/KiB/MiB/GiB 后缀）
 min_segment_size = "20MiB"   # 最小分段大小，小于此值的分段会被过滤
 qn = 10000                   # 画质档位（10000 = 原画/蓝光）
 cdn = []                     # CDN 偏好列表（使用 `check` 输出中的名字）
 delete_after_submit = false  # 投稿确认后删除本地文件
 ```
+
+`segment_time` 和 `segment_size` 是轮转阈值，配置后必须大于 0。
+`min_segment_size = "0"` 合法，表示不按大小过滤分段。大小单位只接受
+`B`、`KiB`、`MiB`、`GiB`；不带单位时按字节解析。
 
 **`delete_after_submit` 注意事项**：仅在 B 站返回 `aid/bvid` 后触发删除。`Pending`、`Ambiguous`、`Failed` 状态不会删除。"成功"仅代表接口确认创建稿件，不代表审核通过。
 

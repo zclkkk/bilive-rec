@@ -20,17 +20,21 @@ cargo build --release
 cp config.example.toml config.toml
 ```
 
-最小配置只需要填写一个房间的 URL：
+`run` 的最小配置需要一个上传账号和一个房间：
 
 ```toml
 [credentials.main]
 cookie_file = "./data/cookies.json"
 
+[upload]
+credential = "main"
+
 [rooms.example]
 url = "https://live.bilibili.com/123456"
 ```
 
-其余配置项均有合理默认值，详见 [配置详解](configuration.md)。
+其余配置项均有默认值，详见 [配置详解](configuration.md)。`check` 和
+`record` 可以不配置 `[upload]`，它们只使用录制相关配置。
 
 ## 准备 Cookie
 
