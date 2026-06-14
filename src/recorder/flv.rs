@@ -230,7 +230,6 @@ pub(crate) struct AvcFillerRemoval {
     pub(crate) removed_filler_nalus: usize,
     pub(crate) removed_filler_payload_bytes: usize,
     pub(crate) removed_filler_total_bytes: usize,
-    pub(crate) cleaned_data: Option<Vec<u8>>,
 }
 
 impl AvcFillerRemoval {
@@ -303,11 +302,9 @@ pub(crate) fn avc_nalu_length_size_from_sequence_header(
 }
 
 pub(crate) fn remove_avc_filler_nalus(
-    data: &[u8],
+    data: &mut Vec<u8>,
     length_size: usize,
 ) -> Result<AvcFillerRemoval, AvcPayloadError> {
-    let payload = avc_nalu_payload(data, length_size)?;
-
     let mut inspection = AvcNaluInspection {
         has_sps: false,
         has_pps: false,
@@ -317,40 +314,32 @@ pub(crate) fn remove_avc_filler_nalus(
     let mut removed_filler_payload_bytes = 0usize;
     let mut removed_filler_total_bytes = 0usize;
 
-    let scanned = visit_length_prefixed_nalus(payload, length_size, |nalu| {
-        if nalu.nalu_type == 12 {
-            removed_filler_nalus += 1;
-            removed_filler_payload_bytes += nalu.payload_len;
-            removed_filler_total_bytes += length_size + nalu.payload_len;
-        } else {
-            retained_nalus += 1;
-            match nalu.nalu_type {
-                7 => inspection.has_sps = true,
-                8 => inspection.has_pps = true,
-                _ => {}
+    {
+        let payload = avc_nalu_payload(data, length_size)?;
+        let scanned = visit_length_prefixed_nalus(payload, length_size, |nalu| {
+            if nalu.nalu_type == 12 {
+                removed_filler_nalus += 1;
+                removed_filler_payload_bytes += nalu.payload_len;
+                removed_filler_total_bytes += length_size + nalu.payload_len;
+            } else {
+                retained_nalus += 1;
+                match nalu.nalu_type {
+                    7 => inspection.has_sps = true,
+                    8 => inspection.has_pps = true,
+                    _ => {}
+                }
             }
+        });
+        if scanned.is_err() && starts_with_annex_b_start_code(payload) {
+            return Err(AvcPayloadError::UnsupportedAnnexBStartCode);
         }
-    });
-    if scanned.is_err() && starts_with_annex_b_start_code(payload) {
-        return Err(AvcPayloadError::UnsupportedAnnexBStartCode);
+
+        scanned?;
     }
 
-    scanned?;
-
-    let cleaned_data = if removed_filler_nalus == 0 || retained_nalus == 0 {
-        None
-    } else {
-        let mut cleaned = Vec::with_capacity(data.len() - removed_filler_total_bytes);
-        cleaned.extend_from_slice(&data[..5]);
-        visit_length_prefixed_nalus(payload, length_size, |nalu| {
-            if nalu.nalu_type != 12 {
-                let start = nalu.length_offset;
-                let end = nalu.payload_offset + nalu.payload_len;
-                cleaned.extend_from_slice(&payload[start..end]);
-            }
-        })?;
-        Some(cleaned)
-    };
+    if removed_filler_nalus > 0 {
+        compact_non_filler_nalus(data, length_size);
+    }
 
     Ok(AvcFillerRemoval {
         inspection,
@@ -358,7 +347,6 @@ pub(crate) fn remove_avc_filler_nalus(
         removed_filler_nalus,
         removed_filler_payload_bytes,
         removed_filler_total_bytes,
-        cleaned_data,
     })
 }
 
@@ -396,39 +384,72 @@ fn visit_length_prefixed_nalus(
     let mut offset = 0;
 
     while offset < payload.len() {
-        if payload.len() - offset < length_size {
-            return Err(AvcPayloadError::TruncatedNaluLength);
-        }
-
-        let length_offset = offset;
-        let mut nalu_len = 0usize;
-        for byte in &payload[offset..offset + length_size] {
-            nalu_len = (nalu_len << 8) | usize::from(*byte);
-        }
-        offset += length_size;
-
-        if nalu_len == 0 {
-            return Err(AvcPayloadError::ZeroNaluLength);
-        }
-        if payload.len() - offset < nalu_len {
-            return Err(AvcPayloadError::TruncatedNalu);
-        }
-
-        let first = payload[offset];
-        if (first & 0x80) != 0 {
-            return Err(AvcPayloadError::InvalidNaluHeader);
-        }
-
-        visit(NaluSpan {
-            length_offset,
-            payload_offset: offset,
-            payload_len: nalu_len,
-            nalu_type: first & 0x1f,
-        });
-        offset += nalu_len;
+        let nalu = read_nalu_span(payload, length_size, offset)?;
+        offset = nalu.payload_offset + nalu.payload_len;
+        visit(nalu);
     }
 
     Ok(())
+}
+
+fn read_nalu_span(
+    payload: &[u8],
+    length_size: usize,
+    offset: usize,
+) -> Result<NaluSpan, AvcPayloadError> {
+    if offset > payload.len() || payload.len() - offset < length_size {
+        return Err(AvcPayloadError::TruncatedNaluLength);
+    }
+
+    let length_offset = offset;
+    let mut nalu_len = 0usize;
+    for byte in &payload[offset..offset + length_size] {
+        nalu_len = (nalu_len << 8) | usize::from(*byte);
+    }
+    let payload_offset = offset + length_size;
+
+    if nalu_len == 0 {
+        return Err(AvcPayloadError::ZeroNaluLength);
+    }
+    if payload.len() - payload_offset < nalu_len {
+        return Err(AvcPayloadError::TruncatedNalu);
+    }
+
+    let first = payload[payload_offset];
+    if (first & 0x80) != 0 {
+        return Err(AvcPayloadError::InvalidNaluHeader);
+    }
+
+    Ok(NaluSpan {
+        length_offset,
+        payload_offset,
+        payload_len: nalu_len,
+        nalu_type: first & 0x1f,
+    })
+}
+
+fn compact_non_filler_nalus(data: &mut Vec<u8>, length_size: usize) {
+    let mut read_offset = 0usize;
+    let mut write_offset = 5usize;
+
+    while read_offset < data.len() - 5 {
+        let span = read_nalu_span(&data[5..], length_size, read_offset)
+            .expect("validated AVC NALU payload changed before compaction");
+        let next_read_offset = span.payload_offset + span.payload_len;
+
+        if span.nalu_type != 12 {
+            let src_start = 5 + span.length_offset;
+            let src_end = 5 + next_read_offset;
+            if src_start != write_offset {
+                data.copy_within(src_start..src_end, write_offset);
+            }
+            write_offset += src_end - src_start;
+        }
+
+        read_offset = next_read_offset;
+    }
+
+    data.truncate(write_offset);
 }
 
 fn starts_with_annex_b_start_code(payload: &[u8]) -> bool {
@@ -620,22 +641,24 @@ mod tests {
 
     #[test]
     fn avc_nalu_packet_inspection_detects_sps_and_pps() {
-        let data = [
+        let mut data = vec![
             0x17, 0x01, 0, 0, 0, // FLV AVC video packet prefix
             0, 0, 0, 2, 0x67, 0x64, // SPS
             0, 0, 0, 2, 0x68, 0xee, // PPS
             0, 0, 0, 1, 0x65, // IDR
         ];
 
-        let removal = remove_avc_filler_nalus(&data, 4).unwrap();
+        let original = data.clone();
+        let removal = remove_avc_filler_nalus(&mut data, 4).unwrap();
         assert!(removal.inspection.has_sps);
         assert!(removal.inspection.has_pps);
         assert!(!removal.changed());
+        assert_eq!(data, original);
     }
 
     #[test]
     fn avc_filler_removal_rewrites_length_prefixed_payload() {
-        let data = [
+        let mut data = vec![
             0x17, 0x01, 0, 0, 0, // FLV AVC video packet prefix
             0, 0, 0, 2, 0x67, 0x64, // SPS
             0, 0, 0, 3, 0x0c, 0xaa, 0xbb, // Filler data
@@ -644,7 +667,8 @@ mod tests {
             0, 0, 0, 2, 0x68, 0xee, // PPS
         ];
 
-        let removal = remove_avc_filler_nalus(&data, 4).unwrap();
+        let old_capacity = data.capacity();
+        let removal = remove_avc_filler_nalus(&mut data, 4).unwrap();
         assert!(removal.changed());
         assert!(!removal.empty_after_removal());
         assert_eq!(removal.retained_nalus, 3);
@@ -655,7 +679,7 @@ mod tests {
         assert!(removal.inspection.has_pps);
 
         assert_eq!(
-            removal.cleaned_data.unwrap(),
+            data,
             vec![
                 0x17, 0x01, 0, 0, 0, // FLV AVC video packet prefix
                 0, 0, 0, 2, 0x67, 0x64, // SPS
@@ -663,74 +687,82 @@ mod tests {
                 0, 0, 0, 2, 0x68, 0xee, // PPS
             ]
         );
+        assert_eq!(data.capacity(), old_capacity);
     }
 
     #[test]
     fn avc_filler_removal_drops_all_filler_payload() {
-        let data = [
+        let mut data = vec![
             0x27, 0x01, 0, 0, 0, // FLV AVC video packet prefix
             0, 0, 0, 3, 0x0c, 0xaa, 0xbb, // Filler data
         ];
 
-        let removal = remove_avc_filler_nalus(&data, 4).unwrap();
+        let removal = remove_avc_filler_nalus(&mut data, 4).unwrap();
         assert!(removal.changed());
         assert!(removal.empty_after_removal());
         assert_eq!(removal.retained_nalus, 0);
         assert_eq!(removal.removed_filler_nalus, 1);
         assert_eq!(removal.removed_filler_payload_bytes, 3);
         assert_eq!(removal.removed_filler_total_bytes, 7);
-        assert!(removal.cleaned_data.is_none());
+        assert_eq!(data, vec![0x27, 0x01, 0, 0, 0]);
     }
 
     #[test]
     fn avc_filler_removal_leaves_payload_without_filler_unchanged() {
-        let data = [
+        let mut data = vec![
             0x27, 0x01, 0, 0, 0, // FLV AVC video packet prefix
             0, 0, 0, 2, 0x41, 0xaa, // non-IDR slice
         ];
 
-        let removal = remove_avc_filler_nalus(&data, 4).unwrap();
+        let original = data.clone();
+        let removal = remove_avc_filler_nalus(&mut data, 4).unwrap();
         assert!(!removal.changed());
         assert!(!removal.empty_after_removal());
         assert_eq!(removal.retained_nalus, 1);
         assert_eq!(removal.removed_filler_nalus, 0);
-        assert!(removal.cleaned_data.is_none());
+        assert_eq!(data, original);
     }
 
     #[test]
     fn avc_nalu_packet_rejects_malformed_lengths() {
-        let data = [
+        let mut data = vec![
             0x17, 0x01, 0, 0, 0, // FLV AVC video packet prefix
             0, 0, 0, 8, 0x65, 0x88,
         ];
+        let original = data.clone();
 
         assert_eq!(
-            remove_avc_filler_nalus(&data, 4).unwrap_err(),
+            remove_avc_filler_nalus(&mut data, 4).unwrap_err(),
             AvcPayloadError::TruncatedNalu
         );
+        assert_eq!(data, original);
     }
 
     #[test]
     fn avc_nalu_packet_rejects_short_packet_without_panicking() {
-        let data = [0x17, 0x01, 0, 0];
+        let mut data = vec![0x17, 0x01, 0, 0];
+        let original = data.clone();
 
         assert_eq!(
-            remove_avc_filler_nalus(&data, 4).unwrap_err(),
+            remove_avc_filler_nalus(&mut data, 4).unwrap_err(),
             AvcPayloadError::NaluPacketTooShort
         );
+        assert_eq!(data, original);
     }
 
     #[test]
     fn avc_nalu_packet_rejects_start_code_framing() {
-        let data = [
+        let mut data = vec![
             0x17, 0x01, 0, 0, 0, // FLV AVC video packet prefix
             0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 0, 1, 0x68, 0xee,
         ];
+        let original = data.clone();
 
         assert_eq!(
-            remove_avc_filler_nalus(&data, 4).unwrap_err(),
+            remove_avc_filler_nalus(&mut data, 4).unwrap_err(),
             AvcPayloadError::UnsupportedAnnexBStartCode
         );
+        assert_eq!(data, original);
     }
 
     #[test]

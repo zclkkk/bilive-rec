@@ -114,10 +114,11 @@ impl FlvNormalizer {
                     && is_avc_nalu_packet(&tag.data)
                 {
                     let removal =
-                        remove_avc_filler_nalus(&tag.data, length_size).map_err(|err| {
+                        remove_avc_filler_nalus(&mut tag.data, length_size).map_err(|err| {
                             AppError::StreamProtocol(format!("Invalid AVC NALU packet: {err}"))
                         })?;
                     if removal.changed() {
+                        tag.header.data_size = tag.data.len() as u32;
                         tracing::debug!(
                             removed_nalus = removal.removed_filler_nalus,
                             removed_payload_bytes = removal.removed_filler_payload_bytes,
@@ -130,10 +131,6 @@ impl FlvNormalizer {
                         return Ok(NormalizedAction::Drop);
                     }
                     let inspection = removal.inspection;
-                    if let Some(cleaned_data) = removal.cleaned_data {
-                        tag.header.data_size = cleaned_data.len() as u32;
-                        tag.data = cleaned_data;
-                    }
                     if is_keyframe && inspection.has_sps && inspection.has_pps {
                         self.note_in_band_parameter_sets();
                     }
