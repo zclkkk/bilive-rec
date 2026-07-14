@@ -1,20 +1,20 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::credential::CredentialIdentity;
+use crate::credential::{CredentialRef, UploadPrincipal};
 use crate::error::{AppError, AppResult};
 use crate::submission_template::validate_room_template;
 
 use super::defaults;
 use super::resolved::{
-    CheckConfig, ResolvedRecordConfig, ResolvedRoomConfig, ResolvedRoomUploadConfig,
-    ResolvedSubmitConfig, ResolvedUploadConfig, RunConfig, UploadCommandConfig,
-    UploadRecoveryConfig, UploadTransportConfig,
+    CheckConfig, ResolvedRecordConfig, ResolvedRoomConfig, ResolvedRoomOutput,
+    ResolvedRoomUploadConfig, ResolvedSubmitConfig, RunConfig,
 };
 use super::validation::{
     ConfigValueError, parse_hms_duration, parse_size_bytes, validate_cookie_file_path,
+    validate_upload_cookie_file,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,8 +74,6 @@ pub struct RecordConfig {
     pub qn: u32,
     #[serde(default)]
     pub cdn: Vec<String>,
-    #[serde(default)]
-    pub delete_after_submit: bool,
 }
 
 impl Default for RecordConfig {
@@ -88,7 +86,6 @@ impl Default for RecordConfig {
             min_segment_size: defaults::min_segment_size(),
             qn: defaults::qn(),
             cdn: Vec::new(),
-            delete_after_submit: false,
         }
     }
 }
@@ -104,6 +101,8 @@ pub struct UploadConfig {
     pub threads: usize,
     #[serde(default)]
     pub submit_api: SubmitApi,
+    #[serde(default)]
+    pub delete_after_submit: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,15 +177,17 @@ pub struct RoomRecordConfig {
     pub qn: Option<u32>,
     #[serde(default)]
     pub cdn: Option<Vec<String>>,
-    #[serde(default)]
-    pub delete_after_submit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoomUploadConfig {
     #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
     pub credential: Option<String>,
+    #[serde(default)]
+    pub delete_after_submit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -282,11 +283,20 @@ impl Default for PipelineConfig {
 
 impl AppConfig {
     pub fn load(path: &std::path::Path) -> AppResult<Self> {
-        let content = std::fs::read_to_string(path).map_err(|e| AppError::Io {
-            path: path.to_path_buf(),
+        let locator = absolute_locator(path)?;
+        let content = std::fs::read_to_string(&locator).map_err(|e| AppError::Io {
+            path: locator.clone(),
             source: e,
         })?;
-        Self::parse(&content)
+        let mut config = Self::parse(&content)?;
+        let base = locator.parent().ok_or_else(|| {
+            AppError::Config(format!(
+                "configuration locator has no parent: {}",
+                locator.display()
+            ))
+        })?;
+        config.resolve_path_locators(base);
+        Ok(config)
     }
 
     pub fn parse(content: &str) -> AppResult<Self> {
@@ -294,17 +304,15 @@ impl AppConfig {
     }
 
     pub fn resolve_for_run(&self) -> AppResult<RunConfig> {
-        if self.rooms.is_empty() {
-            return Err(AppError::Config("run requires at least one room".into()));
-        }
         self.pipeline.validate()?;
         self.record.validate()?;
-        let upload = self.upload_config()?;
-        upload.validate()?;
+        if let Some(upload) = &self.upload {
+            upload.validate()?;
+        }
 
         let mut rooms = Vec::with_capacity(self.rooms.len());
         for (name, room) in &self.rooms {
-            rooms.push(self.resolve_room(name, room, upload)?);
+            rooms.push(self.resolve_room(name, room, self.upload.as_ref())?);
         }
 
         Ok(RunConfig {
@@ -323,48 +331,7 @@ impl AppConfig {
         })
     }
 
-    pub fn resolve_for_upload(&self) -> AppResult<UploadCommandConfig> {
-        let upload = self.upload_config()?;
-        upload.validate()?;
-        let credential = self.upload_credential_identity()?;
-        let submit = self.resolve_submit_config(None, "submit", false, None)?;
-
-        Ok(UploadCommandConfig {
-            data: self.data.clone(),
-            upload: ResolvedUploadConfig {
-                credential,
-                line: upload.line.clone(),
-                threads: upload.threads,
-                submit_api: upload.submit_api.clone(),
-            },
-            submit,
-        })
-    }
-
-    pub fn resolve_for_upload_recovery(&self) -> AppResult<UploadRecoveryConfig> {
-        let upload = self.upload_config()?;
-        upload.validate()?;
-        Ok(UploadRecoveryConfig {
-            data: self.data.clone(),
-            upload: upload.transport(),
-        })
-    }
-
-    pub fn upload_config(&self) -> AppResult<&UploadConfig> {
-        self.upload
-            .as_ref()
-            .ok_or_else(|| AppError::Config("[upload] config is required for this command".into()))
-    }
-
-    pub fn upload_credential_identity(&self) -> AppResult<CredentialIdentity> {
-        let upload = self.upload_config()?;
-        let name = upload.credential.as_deref().ok_or_else(|| {
-            AppError::Config("upload.credential is required for this command".into())
-        })?;
-        self.credential_identity(name, "upload.credential")
-    }
-
-    pub fn credential_identity(&self, name: &str, label: &str) -> AppResult<CredentialIdentity> {
+    pub fn credential_identity(&self, name: &str, label: &str) -> AppResult<CredentialRef> {
         let credential = self.credentials.get(name).ok_or_else(|| {
             AppError::Config(format!("{label} references unknown credential '{name}'"))
         })?;
@@ -372,35 +339,50 @@ impl AppConfig {
             &credential.cookie_file,
             &format!("credentials.{name}.cookie_file"),
         )?;
-        Ok(CredentialIdentity::new(
-            name,
-            credential.cookie_file.clone(),
-        ))
+        Ok(CredentialRef::new(name, credential.cookie_file.clone()))
     }
 
     fn resolve_room(
         &self,
         name: &str,
         room: &RoomConfig,
-        upload: &UploadConfig,
+        upload: Option<&UploadConfig>,
     ) -> AppResult<ResolvedRoomConfig> {
         validate_name(name, &format!("rooms.{name}"))?;
         let record =
             self.resolve_record_config(Some(&room.record), &format!("rooms.{name}.record"))?;
-        let upload = self.resolve_room_upload_config(name, room, upload)?;
-        let submit = self.resolve_submit_config(
-            Some(&room.submit),
-            &format!("rooms.{name}.submit"),
-            true,
-            Some("{url}"),
-        )?;
+        let upload_enabled = room.upload.enabled.unwrap_or(upload.is_some());
+        let output = if upload_enabled {
+            let upload = upload.ok_or_else(|| {
+                AppError::Config(format!(
+                    "rooms.{name}.upload.enabled is true, but [upload] is not configured"
+                ))
+            })?;
+            let upload = self.resolve_room_upload_config(name, room, upload)?;
+            let submit = self.resolve_submit_config(
+                Some(&room.submit),
+                &format!("rooms.{name}.submit"),
+                true,
+                Some("{url}"),
+            )?;
+            ResolvedRoomOutput::Bilibili {
+                upload,
+                submit: Box::new(submit),
+            }
+        } else {
+            if room.upload.credential.is_some() || room.upload.delete_after_submit.is_some() {
+                return Err(AppError::Config(format!(
+                    "rooms.{name}.upload is disabled; credential and delete_after_submit must not be set"
+                )));
+            }
+            ResolvedRoomOutput::LocalOnly
+        };
 
         Ok(ResolvedRoomConfig {
             name: name.to_string(),
             url: room.url.clone(),
             record,
-            upload,
-            submit,
+            output,
         })
     }
 
@@ -422,10 +404,6 @@ impl AppConfig {
         let cdn = room
             .and_then(|room| room.cdn.clone())
             .unwrap_or_else(|| self.record.cdn.clone());
-        let delete_after_submit = room
-            .and_then(|room| room.delete_after_submit)
-            .unwrap_or(self.record.delete_after_submit);
-
         Ok(ResolvedRecordConfig {
             credential,
             output_dir: self.record.output_dir.clone(),
@@ -434,7 +412,6 @@ impl AppConfig {
             min_segment_size,
             qn,
             cdn,
-            delete_after_submit,
         })
     }
 
@@ -455,14 +432,24 @@ impl AppConfig {
                 ))
             })?;
 
+        let credential = self.credential_identity(
+            credential_name,
+            &format!("rooms.{room_name}.upload.credential"),
+        )?;
+        let expected_mid = validate_upload_cookie_file(
+            credential.cookie_file(),
+            &format!("credentials.{credential_name}.cookie_file"),
+        )?;
+
         Ok(ResolvedRoomUploadConfig {
-            credential: self.credential_identity(
-                credential_name,
-                &format!("rooms.{room_name}.upload.credential"),
-            )?,
+            principal: UploadPrincipal::new(credential, expected_mid),
             line: upload.line.clone(),
             threads: upload.threads,
             submit_api: upload.submit_api.clone(),
+            delete_after_submit: room
+                .upload
+                .delete_after_submit
+                .unwrap_or(upload.delete_after_submit),
         })
     }
 
@@ -562,13 +549,45 @@ impl AppConfig {
                 .unwrap_or(submit.featured_reply),
         })
     }
+
+    fn resolve_path_locators(&mut self, base: &Path) {
+        absolutize(&mut self.data.dir, base);
+        absolutize(&mut self.record.output_dir, base);
+        for credential in self.credentials.values_mut() {
+            absolutize(&mut credential.cookie_file, base);
+        }
+    }
+}
+
+fn absolute_locator(path: &Path) -> AppResult<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|source| AppError::Io {
+            path: PathBuf::from("."),
+            source,
+        })
+}
+
+fn absolutize(path: &mut PathBuf, base: &Path) {
+    if path.is_relative() {
+        *path = base.join(&*path);
+    }
 }
 
 impl RecordConfig {
     pub fn validate(&self) -> AppResult<()> {
-        self.min_segment_size_bytes()?;
+        let min_segment_size = self.min_segment_size_bytes()?;
         self.segment_time_duration()?;
-        self.segment_size_bytes()?;
+        if let Some(segment_size) = self.segment_size_bytes()?
+            && min_segment_size > segment_size
+        {
+            return Err(AppError::Config(format!(
+                "record.min_segment_size ({min_segment_size} bytes) must not exceed record.segment_size ({segment_size} bytes)"
+            )));
+        }
         Ok(())
     }
 
@@ -627,14 +646,6 @@ impl UploadConfig {
         }
         Ok(())
     }
-
-    pub fn transport(&self) -> UploadTransportConfig {
-        UploadTransportConfig {
-            line: self.line.clone(),
-            threads: self.threads,
-            submit_api: self.submit_api.clone(),
-        }
-    }
 }
 
 impl PipelineConfig {
@@ -684,12 +695,46 @@ fn value_config_error(label: &str, err: ConfigValueError) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ResolvedRoomOutput;
 
     const SAMPLE_TOML: &str = include_str!("../../config.example.toml");
 
+    fn upload_cookie() -> tempfile::NamedTempFile {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"{
+                "cookie_info": {
+                    "cookies": [{"name": "SESSDATA", "value": "test"}]
+                },
+                "sso": [],
+                "token_info": {
+                    "access_token": "test",
+                    "expires_in": 3600,
+                    "mid": 1,
+                    "refresh_token": "test"
+                },
+                "platform": null
+            }"#,
+        )
+        .unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    fn bilibili_output(
+        room: &ResolvedRoomConfig,
+    ) -> (&ResolvedRoomUploadConfig, &ResolvedSubmitConfig) {
+        match &room.output {
+            ResolvedRoomOutput::Bilibili { upload, submit } => (upload, submit),
+            ResolvedRoomOutput::LocalOnly => panic!("expected Bilibili room output"),
+        }
+    }
+
     #[test]
     fn parse_sample_config_and_resolve_run() {
-        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let cookie = upload_cookie();
         let toml = SAMPLE_TOML.replace("./data/cookies.json", &cookie.path().display().to_string());
         let config = AppConfig::parse(&toml).unwrap();
         let run = config.resolve_for_run().unwrap();
@@ -698,22 +743,23 @@ mod tests {
         assert_eq!(run.rooms.len(), 1);
 
         let room = &run.rooms[0];
+        let (upload, submit) = bilibili_output(room);
         assert_eq!(room.name, "example");
         assert_eq!(room.url, "https://live.bilibili.com/123456");
-        assert_eq!(room.upload.line, "auto");
-        assert_eq!(room.upload.threads, 3);
+        assert_eq!(upload.line, "auto");
+        assert_eq!(upload.threads, 3);
         assert_eq!(room.record.qn, 10000);
         assert!(room.record.cdn.is_empty());
-        assert!(!room.record.delete_after_submit);
         assert_eq!(
-            room.submit.title.as_deref(),
+            submit.title.as_deref(),
             Some("{title} {started_at:%Y-%m-%d}")
         );
-        assert_eq!(room.submit.category_id, 171);
-        assert_eq!(room.submit.copyright, Copyright::Reprint);
-        assert_eq!(room.submit.source, "{url}");
-        assert_eq!(room.submit.tags, vec!["直播录像"]);
-        assert!(!room.submit.private);
+        assert_eq!(submit.category_id, 171);
+        assert_eq!(submit.copyright, Copyright::Reprint);
+        assert_eq!(submit.source, "{url}");
+        assert_eq!(submit.tags, vec!["直播录像"]);
+        assert!(!submit.private);
+        assert!(!upload.delete_after_submit);
     }
 
     #[test]
@@ -732,9 +778,9 @@ mod tests {
 
     #[test]
     fn resolve_room_overrides_record_upload_and_submit() {
-        let main_cookie = tempfile::NamedTempFile::new().unwrap();
+        let main_cookie = upload_cookie();
         let record_cookie = tempfile::NamedTempFile::new().unwrap();
-        let upload_cookie = tempfile::NamedTempFile::new().unwrap();
+        let upload_cookie = upload_cookie();
         let toml = format!(
             r#"
 [credentials.main]
@@ -749,10 +795,10 @@ cookie_file = "{}"
 [record]
 credential = "main"
 cdn = ["global"]
-delete_after_submit = true
 
 [upload]
 credential = "main"
+delete_after_submit = true
 
 [submit]
 title = "{{title}}"
@@ -768,10 +814,10 @@ url = "https://live.bilibili.com/1"
 credential = "record_alt"
 qn = 400
 cdn = []
-delete_after_submit = false
 
 [rooms.test.upload]
 credential = "upload_alt"
+delete_after_submit = false
 
 [rooms.test.submit]
 category_id = 65
@@ -793,6 +839,7 @@ featured_reply = true
         let config = AppConfig::parse(&toml).unwrap();
         let run = config.resolve_for_run().unwrap();
         let room = &run.rooms[0];
+        let (upload, submit) = bilibili_output(room);
 
         assert_eq!(
             room.record
@@ -803,46 +850,187 @@ featured_reply = true
         );
         assert_eq!(room.record.qn, 400);
         assert!(room.record.cdn.is_empty());
-        assert!(!room.record.delete_after_submit);
-        assert_eq!(room.upload.credential.name, "upload_alt");
-        assert_eq!(room.upload.credential.cookie_file, upload_cookie.path());
-        assert_eq!(room.submit.category_id, 65);
-        assert_eq!(room.submit.copyright, Copyright::Original);
-        assert_eq!(room.submit.source, "");
-        assert!(room.submit.tags.is_empty());
-        assert!(room.submit.private);
-        assert_eq!(room.submit.dynamic, "room dynamic");
-        assert!(room.submit.forbid_reprint);
-        assert!(room.submit.charging_panel);
-        assert!(room.submit.close_reply);
-        assert!(room.submit.close_danmu);
-        assert!(room.submit.featured_reply);
+        assert!(!upload.delete_after_submit);
+        assert_eq!(upload.principal.credential.name, "upload_alt");
+        assert_eq!(upload.principal.expected_mid, 1);
+        assert_eq!(
+            upload.principal.credential.cookie_file,
+            upload_cookie.path()
+        );
+        assert_eq!(submit.category_id, 65);
+        assert_eq!(submit.copyright, Copyright::Original);
+        assert_eq!(submit.source, "");
+        assert!(submit.tags.is_empty());
+        assert!(submit.private);
+        assert_eq!(submit.dynamic, "room dynamic");
+        assert!(submit.forbid_reprint);
+        assert!(submit.charging_panel);
+        assert!(submit.close_reply);
+        assert!(submit.close_danmu);
+        assert!(submit.featured_reply);
     }
 
     #[test]
-    fn run_requires_upload_config_when_rooms_exist() {
+    fn run_without_upload_config_resolves_rooms_as_local_only() {
         let toml = r#"
 [rooms.test]
 url = "https://live.bilibili.com/1"
 "#;
         let config = AppConfig::parse(toml).unwrap();
+        let run = config.resolve_for_run().unwrap();
+        assert_eq!(run.rooms[0].output, ResolvedRoomOutput::LocalOnly);
+    }
+
+    #[test]
+    fn run_resolution_allows_zero_current_rooms() {
+        let run = AppConfig::parse("").unwrap().resolve_for_run().unwrap();
+        assert!(run.rooms.is_empty());
+    }
+
+    #[test]
+    fn record_rejects_retention_floor_above_rotation_limit() {
+        let config = AppConfig::parse(
+            r#"
+[record]
+segment_size = "10MiB"
+min_segment_size = "20MiB"
+"#,
+        )
+        .unwrap();
+        let error = config.resolve_for_run().unwrap_err();
+        assert!(error.to_string().contains("must not exceed"));
+    }
+
+    #[test]
+    fn load_makes_all_runtime_paths_absolute_from_config_locator() {
+        use std::io::Write;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_dir = dir.path().join("configuration");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let cookie_path = config_dir.join("cookie.json");
+        std::fs::write(&cookie_path, b"cookie").unwrap();
+        let config_path = config_dir.join("config.toml");
+        let mut file = std::fs::File::create(&config_path).unwrap();
+        writeln!(file, "[data]\ndir = '../state'").unwrap();
+        writeln!(file, "[record]\noutput_dir = './recordings'").unwrap();
+        writeln!(file, "[credentials.main]\ncookie_file = 'cookie.json'").unwrap();
+
+        let config = AppConfig::load(&config_path).unwrap();
+        assert_eq!(config.data.dir, config_dir.join("../state"));
+        assert_eq!(config.record.output_dir, config_dir.join("./recordings"));
+        assert_eq!(config.credentials["main"].cookie_file, cookie_path);
+        assert!(config.data.dir.is_absolute());
+        assert!(config.record.output_dir.is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_uses_the_symlink_locator_directory_as_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let target_dir = dir.path().join("target");
+        let locator_dir = dir.path().join("locator");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::create_dir_all(&locator_dir).unwrap();
+        let target = target_dir.join("config.toml");
+        std::fs::write(&target, "[data]\ndir = 'state'\n").unwrap();
+        let locator = locator_dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &locator).unwrap();
+
+        let config = AppConfig::load(&locator).unwrap();
+        assert_eq!(config.data.dir, locator_dir.join("state"));
+    }
+
+    #[test]
+    fn room_upload_is_enabled_by_default_when_global_upload_exists() {
+        let cookie = upload_cookie();
+        let toml = format!(
+            r#"
+[credentials.main]
+cookie_file = "{}"
+
+[upload]
+credential = "main"
+
+[rooms.test]
+url = "https://live.bilibili.com/1"
+"#,
+            cookie.path().display()
+        );
+        let run = AppConfig::parse(&toml).unwrap().resolve_for_run().unwrap();
+        assert!(matches!(
+            run.rooms[0].output,
+            ResolvedRoomOutput::Bilibili { .. }
+        ));
+    }
+
+    #[test]
+    fn room_can_disable_upload_in_mixed_run() {
+        let cookie = upload_cookie();
+        let toml = format!(
+            r#"
+[credentials.main]
+cookie_file = "{}"
+
+[upload]
+credential = "main"
+
+[rooms.uploaded]
+url = "https://live.bilibili.com/1"
+
+[rooms.local]
+url = "https://live.bilibili.com/2"
+
+[rooms.local.upload]
+enabled = false
+"#,
+            cookie.path().display()
+        );
+        let run = AppConfig::parse(&toml).unwrap().resolve_for_run().unwrap();
+        let local = run.rooms.iter().find(|room| room.name == "local").unwrap();
+        let uploaded = run
+            .rooms
+            .iter()
+            .find(|room| room.name == "uploaded")
+            .unwrap();
+        assert_eq!(local.output, ResolvedRoomOutput::LocalOnly);
+        assert!(matches!(
+            uploaded.output,
+            ResolvedRoomOutput::Bilibili { .. }
+        ));
+    }
+
+    #[test]
+    fn room_cannot_enable_upload_without_global_upload_config() {
+        let config = AppConfig::parse(
+            r#"
+[rooms.test]
+url = "https://live.bilibili.com/1"
+
+[rooms.test.upload]
+enabled = true
+"#,
+        )
+        .unwrap();
         let err = config.resolve_for_run().unwrap_err();
-        assert!(err.to_string().contains("[upload]"));
+        assert!(err.to_string().contains("[upload] is not configured"));
     }
 
     #[test]
-    fn upload_command_requires_upload_credential() {
-        let config = AppConfig::parse("[upload]\n").unwrap();
-        let err = config.resolve_for_upload().unwrap_err();
-        assert!(err.to_string().contains("upload.credential"));
-    }
+    fn disabled_room_rejects_unused_upload_overrides() {
+        let config = AppConfig::parse(
+            r#"
+[rooms.test]
+url = "https://live.bilibili.com/1"
 
-    #[test]
-    fn upload_recovery_does_not_require_upload_credential() {
-        let config = AppConfig::parse("[upload]\n").unwrap();
-        let recovery = config.resolve_for_upload_recovery().unwrap();
-        assert_eq!(recovery.upload.line, "auto");
-        assert_eq!(recovery.upload.threads, 3);
+[rooms.test.upload]
+enabled = false
+credential = "unused"
+"#,
+        )
+        .unwrap();
+        let err = config.resolve_for_run().unwrap_err();
+        assert!(err.to_string().contains("upload is disabled"));
     }
 
     #[test]
@@ -868,7 +1056,7 @@ mystery = true
 
     #[test]
     fn reprint_requires_source() {
-        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let cookie = upload_cookie();
         let toml = format!(
             r#"
 [credentials.main]
@@ -880,59 +1068,20 @@ credential = "main"
 [submit]
 copyright = "reprint"
 source = ""
+
+[rooms.test]
+url = "https://live.bilibili.com/1"
 "#,
             cookie.path().display()
         );
         let config = AppConfig::parse(&toml).unwrap();
-        let err = config.resolve_for_upload().unwrap_err();
+        let err = config.resolve_for_run().unwrap_err();
         assert!(err.to_string().contains("source"));
     }
 
     #[test]
-    fn upload_reprint_requires_explicit_source() {
-        let cookie = tempfile::NamedTempFile::new().unwrap();
-        let toml = format!(
-            r#"
-[credentials.main]
-cookie_file = "{}"
-
-[upload]
-credential = "main"
-"#,
-            cookie.path().display()
-        );
-        let config = AppConfig::parse(&toml).unwrap();
-        let err = config.resolve_for_upload().unwrap_err();
-        assert!(err.to_string().contains("submit.source"));
-    }
-
-    #[test]
-    fn upload_source_cannot_use_room_template() {
-        let cookie = tempfile::NamedTempFile::new().unwrap();
-        let toml = format!(
-            r#"
-[credentials.main]
-cookie_file = "{}"
-
-[upload]
-credential = "main"
-
-[submit]
-source = "{{url}}"
-"#,
-            cookie.path().display()
-        );
-        let config = AppConfig::parse(&toml).unwrap();
-        let err = config.resolve_for_upload().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("only supported for room submissions")
-        );
-    }
-
-    #[test]
     fn run_defaults_reprint_source_to_room_url_template() {
-        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let cookie = upload_cookie();
         let toml = format!(
             r#"
 [credentials.main]
@@ -948,12 +1097,13 @@ url = "https://live.bilibili.com/1"
         );
         let config = AppConfig::parse(&toml).unwrap();
         let run = config.resolve_for_run().unwrap();
-        assert_eq!(run.rooms[0].submit.source, "{url}");
+        let (_, submit) = bilibili_output(&run.rooms[0]);
+        assert_eq!(submit.source, "{url}");
     }
 
     #[test]
     fn run_rejects_invalid_submit_template() {
-        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let cookie = upload_cookie();
         let toml = format!(
             r#"
 [credentials.main]
@@ -977,7 +1127,7 @@ url = "https://live.bilibili.com/1"
 
     #[test]
     fn run_rejects_invalid_source_template() {
-        let cookie = tempfile::NamedTempFile::new().unwrap();
+        let cookie = upload_cookie();
         let toml = format!(
             r#"
 [credentials.main]
@@ -1046,6 +1196,7 @@ url = "https://live.bilibili.com/1"
             line: "auto".into(),
             threads: 0,
             submit_api: SubmitApi::App,
+            delete_after_submit: false,
         };
 
         let err = upload.validate().unwrap_err();
@@ -1060,6 +1211,7 @@ url = "https://live.bilibili.com/1"
                 line: "auto".into(),
                 threads: 3,
                 submit_api: api,
+                delete_after_submit: false,
             };
             upload.validate().expect("all submit APIs must validate");
         }

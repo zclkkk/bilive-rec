@@ -146,18 +146,28 @@ fn format_started_at(started_at: jiff::Timestamp, format: &str) -> AppResult<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::model::SessionStatus;
+    use crate::state::model::{OutputPlan, RecordingPlan, SessionLifecycle};
     use uuid::Uuid;
 
     fn test_live_session_with_started_at(started_at: jiff::Timestamp) -> LiveSession {
         LiveSession {
             id: Uuid::new_v4(),
-            room_key: "1".into(),
+            room_id: 1,
+            room_name: "test-room".into(),
             title: "Test Stream".into(),
             started_at,
-            status: SessionStatus::Recording,
-            record_credential: None,
-            upload_credential: None,
+            lifecycle: SessionLifecycle::Open,
+            recording_plan: RecordingPlan {
+                credential: None,
+                output_dir: "recordings".into(),
+                segment_time_ms: None,
+                segment_size: None,
+                min_segment_size: 0,
+                qn: 10_000,
+                cdn: Vec::new(),
+            },
+            output_plan: OutputPlan::LocalOnly,
+            recording_events: Vec::new(),
         }
     }
 

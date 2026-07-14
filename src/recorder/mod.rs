@@ -1,3 +1,4 @@
+pub mod artifact_commit;
 pub mod flv;
 mod flv_metadata;
 mod flv_pipeline;
@@ -13,10 +14,14 @@ use crate::recorder::segment::{
     RecorderPolicy, SegmentEvent, final_path, part_path, should_filter_by_size,
     should_rotate_by_elapsed, should_rotate_by_size,
 };
-use crate::state::model::{Segment, SegmentCloseReason, SegmentRotationTrigger, SegmentStatus};
+use crate::state::model::{
+    ArtifactState, Segment, SegmentCloseReason, SegmentRotationTrigger, UploadState,
+};
 use crate::state::store::StateStore;
+use crate::state::transitions;
 
 use reqwest::Response;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
@@ -382,31 +387,24 @@ impl<'a> FlvRecorder<'a> {
                 path: seg.part_path.clone(),
                 source: e,
             }) {
-                return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+                return self.persist_failed_segment(seg.index, e);
             }
-            drop(seg.writer);
-
-            let db_seg = Segment {
-                session_id: self.session_id,
-                index: seg.index,
-                path: final_p.clone(),
-                status: SegmentStatus::Filtered,
-                close_reason: Some(close_reason.clone()),
-                error: None,
-            };
-            if let Err(e) = self.store.put_segment(&db_seg) {
-                return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
-            }
-
-            if let Err(e) = tokio::fs::remove_file(&seg.part_path)
+            if let Err(e) = seg
+                .writer
+                .get_ref()
+                .sync_all()
                 .await
                 .map_err(|e| AppError::Io {
                     path: seg.part_path.clone(),
                     source: e,
                 })
             {
-                return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+                return self.persist_failed_segment(seg.index, e);
             }
+            drop(seg.writer);
+
+            artifact_commit::discard(self.store, self.session_id, seg.index, close_reason.clone())
+                .await?;
 
             self.emit_event(SegmentEvent::Filtered {
                 session_id: self.session_id,
@@ -419,59 +417,31 @@ impl<'a> FlvRecorder<'a> {
         }
 
         if let Err(e) = rewrite_segment_metadata(&mut seg).await {
-            return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+            return self.persist_failed_segment(seg.index, e);
         }
 
         if let Err(e) = seg.writer.flush().await.map_err(|e| AppError::Io {
             path: seg.part_path.clone(),
             source: e,
         }) {
-            return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+            return self.persist_failed_segment(seg.index, e);
         }
-        drop(seg.writer);
-
-        if let Err(e) = tokio::fs::rename(&seg.part_path, &final_p)
+        if let Err(e) = seg
+            .writer
+            .get_ref()
+            .sync_all()
             .await
             .map_err(|e| AppError::Io {
-                path: final_p.clone(),
+                path: seg.part_path.clone(),
                 source: e,
             })
         {
-            return self.persist_failed_segment(seg.index, seg.part_path.clone(), e);
+            return self.persist_failed_segment(seg.index, e);
         }
+        drop(seg.writer);
 
-        let db_seg = Segment {
-            session_id: self.session_id,
-            index: seg.index,
-            path: final_p.clone(),
-            status: SegmentStatus::Finalized,
-            close_reason: Some(close_reason.clone()),
-            error: None,
-        };
-        if let Err(e) = self.store.put_segment(&db_seg) {
-            let rollback_res =
-                tokio::fs::rename(&final_p, &seg.part_path)
-                    .await
-                    .map_err(|rollback_err| AppError::Io {
-                        path: seg.part_path.clone(),
-                        source: rollback_err,
-                    });
-
-            let failure_path = if rollback_res.is_ok() {
-                seg.part_path.clone()
-            } else {
-                final_p.clone()
-            };
-            let mut error = e.to_string();
-            if let Err(rollback_err) = rollback_res {
-                error = format!(
-                    "{error}; additionally failed to roll back finalized file from {} to {}: {rollback_err}",
-                    final_p.display(),
-                    seg.part_path.display()
-                );
-            }
-            return self.persist_failed_segment(seg.index, failure_path, AppError::State(error));
-        }
+        artifact_commit::finalize(self.store, self.session_id, seg.index, close_reason.clone())
+            .await?;
 
         self.emit_event(SegmentEvent::Finalized {
             session_id: self.session_id,
@@ -484,22 +454,16 @@ impl<'a> FlvRecorder<'a> {
         Ok(())
     }
 
-    fn persist_failed_segment(
-        &self,
-        index: u32,
-        path: PathBuf,
-        original: AppError,
-    ) -> AppResult<()> {
+    fn persist_failed_segment(&self, index: u32, original: AppError) -> AppResult<()> {
         let original_msg = original.to_string();
-        let db_seg = Segment {
-            session_id: self.session_id,
+        transitions::fail_artifact(
+            self.store,
+            self.session_id,
             index,
-            path,
-            status: SegmentStatus::Failed,
-            close_reason: None,
-            error: Some(original_msg.clone()),
-        };
-        self.store.put_segment(&db_seg).map_err(|persist_err| {
+            original_msg.clone(),
+            None,
+        )
+        .map_err(|persist_err| {
             AppError::State(format!(
                 "{original_msg}; additionally failed to persist failed segment state: {persist_err}"
             ))
@@ -510,6 +474,7 @@ impl<'a> FlvRecorder<'a> {
     async fn open_new_segment(&mut self) -> AppResult<()> {
         let idx = self.next_index;
         let p_path = part_path(&self.policy.layout, &self.session_id, idx);
+        let final_p = final_path(&self.policy.layout, &self.session_id, idx);
 
         // Persist truth before risk: the segment row goes into redb *before*
         // we create a file on disk. If we crashed between File::create and
@@ -520,26 +485,32 @@ impl<'a> FlvRecorder<'a> {
         let db_seg = Segment {
             session_id: self.session_id,
             index: idx,
-            path: p_path.clone(),
-            status: SegmentStatus::Recording,
-            close_reason: None,
-            error: None,
+            part_path: p_path.clone(),
+            final_path: final_p,
+            artifact: ArtifactState::Writing,
+            artifact_resolutions: Vec::new(),
+            upload: UploadState::NotPlanned,
+            upload_attempts: Vec::new(),
+            upload_resolutions: Vec::new(),
         };
-        self.store.put_segment(&db_seg)?;
+        transitions::open_segment(self.store, db_seg)?;
 
-        let mut file = match tokio::fs::File::create(&p_path)
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&p_path)
             .await
             .map_err(|e| AppError::Io {
                 path: p_path.clone(),
                 source: e,
             }) {
             Ok(f) => f,
-            Err(create_err) => return self.persist_failed_segment(idx, p_path.clone(), create_err),
+            Err(create_err) => return self.persist_failed_segment(idx, create_err),
         };
 
         let initial = match self.write_initial_segment_headers(&mut file, &p_path).await {
             Ok(initial) => initial,
-            Err(write_err) => return self.persist_failed_segment(idx, p_path.clone(), write_err),
+            Err(write_err) => return self.persist_failed_segment(idx, write_err),
         };
 
         // Both DB and initial file writes are in place — advance next_index now
@@ -673,15 +644,7 @@ impl<'a> FlvRecorder<'a> {
             };
             drop(seg.writer);
 
-            let db_seg = Segment {
-                session_id: self.session_id,
-                index: seg.index,
-                path: seg.part_path.clone(),
-                status: SegmentStatus::Failed,
-                close_reason: None,
-                error: Some(error),
-            };
-            self.store.put_segment(&db_seg)?;
+            transitions::fail_artifact(self.store, self.session_id, seg.index, error, None)?;
         }
         Ok(())
     }
@@ -853,6 +816,39 @@ mod tests {
         }
     }
 
+    async fn test_recorder<'a>(
+        session_id: Uuid,
+        policy: RecorderPolicy,
+        store: &'a StateStore,
+        event_tx: Option<mpsc::UnboundedSender<SegmentEvent>>,
+        start_index: u32,
+    ) -> AppResult<FlvRecorder<'a>> {
+        let output_dir = policy.layout.output_dir.clone();
+        transitions::create_session(
+            store,
+            &crate::state::model::LiveSession {
+                id: session_id,
+                room_id: 1,
+                room_name: "recorder-test".into(),
+                title: "recorder test".into(),
+                started_at: jiff::Timestamp::now(),
+                lifecycle: crate::state::model::SessionLifecycle::Open,
+                recording_plan: crate::state::model::RecordingPlan {
+                    credential: None,
+                    output_dir,
+                    segment_time_ms: policy.segment.segment_time.map(duration_millis_u64),
+                    segment_size: policy.segment.segment_size,
+                    min_segment_size: policy.filter.min_segment_size,
+                    qn: 10_000,
+                    cdn: Vec::new(),
+                },
+                output_plan: crate::state::model::OutputPlan::LocalOnly,
+                recording_events: Vec::new(),
+            },
+        )?;
+        FlvRecorder::new(session_id, policy, store, event_tx, start_index).await
+    }
+
     fn write_tag(tag: FlvTag) -> Vec<u8> {
         let mut buf = Vec::new();
         tag.write(&mut buf).unwrap();
@@ -970,13 +966,13 @@ mod tests {
     async fn test_flv_recorder_push_chunk() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), Some(1024), None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1092,21 +1088,21 @@ mod tests {
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].index, 1);
-        assert_eq!(segments[0].path, final_p);
-        assert_eq!(segments[0].status, SegmentStatus::Finalized);
+        assert_eq!(segments[0].final_path, final_p);
+        assert!(matches!(segments[0].artifact, ArtifactState::Ready { .. }));
     }
 
     #[tokio::test]
     async fn test_flv_recorder_filtering() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), None, None, 99999);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1163,20 +1159,23 @@ mod tests {
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].status, SegmentStatus::Filtered);
+        assert!(matches!(
+            segments[0].artifact,
+            ArtifactState::Filtered { .. }
+        ));
     }
 
     #[tokio::test]
     async fn test_flv_recorder_rotation() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), Some(50), None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1265,15 +1264,15 @@ mod tests {
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 2);
         assert!(matches!(
-            segments[0].close_reason.as_ref(),
+            segments[0].close_reason(),
             Some(SegmentCloseReason::Rotation { triggers })
                 if triggers
                     .iter()
                     .any(|trigger| matches!(trigger, SegmentRotationTrigger::SizeLimit { .. }))
         ));
         assert_eq!(
-            segments[1].close_reason,
-            Some(SegmentCloseReason::StreamEnded)
+            segments[1].close_reason(),
+            Some(&SegmentCloseReason::StreamEnded)
         );
     }
 
@@ -1281,13 +1280,13 @@ mod tests {
     async fn test_flv_recorder_incomplete_eof() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy, &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy, &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1358,19 +1357,19 @@ mod tests {
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].status, SegmentStatus::Finalized);
+        assert!(matches!(segments[0].artifact, ArtifactState::Ready { .. }));
     }
 
     #[tokio::test]
     async fn test_flv_recorder_drops_redundant_headers_without_rotating() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1407,7 +1406,7 @@ mod tests {
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].status, SegmentStatus::Finalized);
+        assert!(matches!(segments[0].artifact, ArtifactState::Ready { .. }));
 
         let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
         assert_eq!(
@@ -1438,12 +1437,12 @@ mod tests {
     async fn test_flv_recorder_rebases_timestamp_jump_without_rotating() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1485,12 +1484,12 @@ mod tests {
     async fn test_flv_recorder_drops_duplicated_media_group() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1522,12 +1521,12 @@ mod tests {
     async fn test_flv_recorder_finalizes_when_duplicate_threshold_hits_on_final_flush() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1547,7 +1546,7 @@ mod tests {
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].status, SegmentStatus::Finalized);
+        assert!(matches!(segments[0].artifact, ArtifactState::Ready { .. }));
 
         let tags = read_recorded_tags(&final_path(&policy.layout, &session_id, 1));
         let media_video_timestamps: Vec<_> = tags
@@ -1564,12 +1563,12 @@ mod tests {
     async fn test_flv_recorder_keeps_same_media_data_with_new_timestamp() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1603,12 +1602,12 @@ mod tests {
     async fn test_flv_recorder_rewrites_metadata_duration_and_keyframes() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1652,12 +1651,12 @@ mod tests {
     async fn test_flv_recorder_drops_media_until_keyframe_after_header_change() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1714,12 +1713,12 @@ mod tests {
     async fn test_flv_recorder_does_not_rotate_on_in_band_parameter_set_refresh() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1754,20 +1753,20 @@ mod tests {
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].status, SegmentStatus::Finalized);
+        assert!(matches!(segments[0].artifact, ArtifactState::Ready { .. }));
     }
 
     #[tokio::test]
-    async fn test_flv_recorder_marks_failed_when_final_rename_fails() {
+    async fn test_flv_recorder_blocks_room_with_finalizing_intent_when_rename_fails() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1825,23 +1824,29 @@ mod tests {
 
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].status, SegmentStatus::Failed);
-        assert_eq!(segments[0].path, part_p);
-        assert!(segments[0].error.as_ref().unwrap().contains("io error"));
+        assert!(matches!(
+            segments[0].artifact,
+            ArtifactState::Finalizing { .. }
+        ));
+        assert_eq!(segments[0].part_path, part_p);
         assert!(part_p.exists(), ".part file should remain recoverable");
+        assert!(matches!(
+            store.get_session(session_id).unwrap().unwrap().lifecycle,
+            crate::state::model::SessionLifecycle::RecoveryRequired { .. }
+        ));
     }
 
     #[tokio::test]
     async fn test_flv_recorder_drop_orphan_frames() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy, &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy, &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -1906,13 +1911,13 @@ mod tests {
     async fn test_flv_recorder_sequence_change() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy, &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy, &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -2010,7 +2015,7 @@ mod tests {
         assert_eq!(segments, 2);
         let stored = store.list_segments(session_id).unwrap();
         assert!(matches!(
-            stored[0].close_reason.as_ref(),
+            stored[0].close_reason(),
             Some(SegmentCloseReason::Rotation { triggers })
                 if triggers
                     .iter()
@@ -2025,7 +2030,7 @@ mod tests {
     async fn test_flv_recorder_db_record_survives_file_create_failure() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
@@ -2038,7 +2043,7 @@ mod tests {
         std::fs::create_dir(&blocking_path).unwrap();
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy.clone(), &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy.clone(), &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -2095,21 +2100,20 @@ mod tests {
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].index, 1);
-        assert_eq!(segments[0].status, SegmentStatus::Failed);
-        assert!(segments[0].error.is_some());
+        assert!(matches!(segments[0].artifact, ArtifactState::Failed { .. }));
     }
 
     #[tokio::test]
     async fn test_flv_recorder_marks_failed_when_initial_header_write_fails() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let store = StateStore::open(&db_path).unwrap();
+        let store = StateStore::create_or_open(&db_path).unwrap();
 
         let policy = test_policy(dir.path().to_path_buf(), None, None, 0);
 
         let session_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut recorder = FlvRecorder::new(session_id, policy, &store, Some(tx), 1)
+        let mut recorder = test_recorder(session_id, policy, &store, Some(tx), 1)
             .await
             .unwrap();
 
@@ -2154,12 +2158,10 @@ mod tests {
         let segments = store.list_segments(session_id).unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].index, 1);
-        assert_eq!(segments[0].status, SegmentStatus::Failed);
-        assert!(
-            segments[0]
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("data size mismatch"))
-        );
+        assert!(matches!(segments[0].artifact, ArtifactState::Failed { .. }));
+        assert!(matches!(
+            &segments[0].artifact,
+            ArtifactState::Failed { reason, .. } if reason.contains("data size mismatch")
+        ));
     }
 }

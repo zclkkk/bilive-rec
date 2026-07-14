@@ -2,9 +2,9 @@ use std::process;
 
 use bilive_rec::bilibili;
 use bilive_rec::bilibili::client::BiliClient;
-use bilive_rec::cli::{Cli, Command, ResolveOutcome, StateAction};
+use bilive_rec::cli::{Cli, Command, RecoverAction};
 use bilive_rec::config::AppConfig;
-use bilive_rec::credential::CredentialIdentity;
+use bilive_rec::credential::CredentialRef;
 use bilive_rec::error::AppResult;
 use bilive_rec::state;
 use bilive_rec::state::store::StateStore;
@@ -16,34 +16,85 @@ async fn main() {
     // Initialize tracing once, before dispatch. Every subcommand's
     // info!/warn!/error! output should reach the operator on stderr,
     // regardless of which command they invoked. stdout stays reserved
-    // for machine-readable command output (e.g. `state inspect`,
-    // `state recover` dry-run plans).
+    // for command output such as `status` and `recover` results.
     init_tracing();
 
     let cli = Cli::parse();
+    let config = cli.config;
+    let persistent_config = config
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
 
     let result = match cli.command {
-        Command::Check { room_url, config } => check_cmd(&room_url, config.as_deref()).await,
-        Command::Record { room_url, config } => record_cmd(&room_url, config.as_deref()).await,
-        Command::Upload {
-            files,
-            title,
-            config,
-        } => upload_cmd(files, title, config.as_deref()).await,
-        Command::Run { config } => run_cmd(&config).await,
-        Command::State { config, action } => match action {
-            StateAction::Inspect => state_inspect_cmd(&config),
-            StateAction::Recover {
-                apply,
-                reset_room,
-                retry_upload,
-            } => state_recover_cmd(&config, apply, reset_room, retry_upload).await,
-            StateAction::ResolveSubmission {
+        Command::Check { room_url } => check_cmd(&room_url, config.as_deref()).await,
+        Command::Run => run_cmd(&persistent_config).await,
+        Command::Status { verbose } => status_cmd(&persistent_config, verbose),
+        Command::Recover { action } => match action {
+            RecoverAction::Recording {
                 session_id,
-                outcome,
+                finalize,
+                abandon,
+                exclude_failed,
+                note,
+            } => recover_recording_cmd(
+                &persistent_config,
+                session_id,
+                finalize,
+                abandon,
+                exclude_failed,
+                note,
+            ),
+            RecoverAction::Upload {
+                session_id,
+                segment_index,
+                not_uploaded,
+                uploaded,
+                part_title,
+                note,
+            } => recover_upload_cmd(
+                &persistent_config,
+                session_id,
+                segment_index,
+                not_uploaded,
+                uploaded,
+                part_title,
+                note,
+            ),
+            RecoverAction::Submission {
+                session_id,
+                not_submitted,
+                submitted,
                 aid,
                 bvid,
-            } => state_resolve_submission_cmd(&config, session_id, outcome, aid, bvid),
+                note,
+            } => recover_submission_cmd(
+                &persistent_config,
+                session_id,
+                not_submitted,
+                submitted,
+                aid,
+                bvid,
+                note,
+            ),
+            RecoverAction::Segment {
+                session_id,
+                segment_index,
+                keep_part,
+                keep_final,
+                exclude,
+                note,
+            } => {
+                recover_segment_cmd(
+                    &persistent_config,
+                    session_id,
+                    segment_index,
+                    keep_part,
+                    keep_final,
+                    exclude,
+                    note,
+                )
+                .await
+            }
         },
     };
 
@@ -75,7 +126,87 @@ struct RunTaskOutcome {
     upload_worker_finished: bool,
 }
 
-fn record_credential_name(credential: Option<&CredentialIdentity>) -> &str {
+struct RunTaskCoordinator {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    handles: futures::stream::FuturesUnordered<tokio::task::JoinHandle<RunTaskResult>>,
+}
+
+impl RunTaskCoordinator {
+    fn new(shutdown_tx: tokio::sync::watch::Sender<bool>) -> Self {
+        Self {
+            shutdown_tx,
+            handles: futures::stream::FuturesUnordered::new(),
+        }
+    }
+
+    fn push(&self, handle: tokio::task::JoinHandle<RunTaskResult>) {
+        self.handles.push(handle);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+
+    fn signal_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    fn abort_all(&self) {
+        for handle in self.handles.iter() {
+            handle.abort();
+        }
+    }
+
+    async fn next(&mut self) -> Option<Result<RunTaskResult, tokio::task::JoinError>> {
+        futures::StreamExt::next(&mut self.handles).await
+    }
+
+    /// Every exit after the first task starts passes here. Fatal bootstrap and
+    /// state errors stop new work, then wait for the current remote/file
+    /// boundary to persist its result before the top-level process may exit.
+    async fn finish(&mut self, result: AppResult<()>) -> AppResult<()> {
+        if self.handles.is_empty() {
+            return result;
+        }
+
+        self.signal_shutdown();
+        let mut drain_failed = false;
+        let mut forced = false;
+        while !self.handles.is_empty() {
+            tokio::select! {
+                task = self.next() => {
+                    if process_run_task_result(task.expect("guarded non-empty run task set")).failed {
+                        drain_failed = true;
+                    }
+                }
+                _ = tokio::signal::ctrl_c(), if !forced => {
+                    tracing::warn!("Second Ctrl-C received while draining; forcing task cancellation. In-flight remote operations may become ambiguous.");
+                    self.abort_all();
+                    forced = true;
+                }
+            }
+        }
+        if forced {
+            return Err(bilive_rec::error::AppError::State(
+                "Forced exit by second Ctrl-C".into(),
+            ));
+        }
+        if result.is_ok() && drain_failed {
+            Err(bilive_rec::error::AppError::State(
+                "One or more run tasks failed while shutdown was draining; run `bilive-rec status --verbose` for details"
+                    .into(),
+            ))
+        } else {
+            result
+        }
+    }
+}
+
+fn record_credential_name(credential: Option<&CredentialRef>) -> &str {
     credential.map_or("anonymous", |credential| credential.name.as_str())
 }
 
@@ -84,125 +215,282 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     let run_config = config.resolve_for_run()?;
     tracing::info!("config loaded from {}", config_path.display());
 
-    use bilive_rec::pipeline::state_machine::RoomState;
-    use bilive_rec::pipeline::supervisor::{RoomSupervisor, RoomSupervisorDeps};
+    use bilive_rec::pipeline::bootstrap::prepare_rooms;
+    use bilive_rec::state::model::{OutputPlan, RoomLifecycle, UploadTarget};
+    use bilive_rec::state::transitions;
     use bilive_rec::uploader::biliup_adapter::BiliupUploader;
-    use bilive_rec::uploader::worker::{UploadTarget, UploadWorker};
+    use bilive_rec::uploader::worker::UploadWorker;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::time::Duration;
 
     let db_path = run_config.data.dir.join("state.redb");
-    let store = Arc::new(StateStore::open(&db_path)?);
+    let store = if db_path.exists() {
+        Arc::new(StateStore::open_existing(&db_path)?)
+    } else if run_config.rooms.is_empty() {
+        return Err(bilive_rec::error::AppError::State(format!(
+            "no configured rooms and no state database at {}; refusing to create empty state",
+            db_path.display()
+        )));
+    } else {
+        Arc::new(StateStore::create_or_open(&db_path)?)
+    };
     let store_clone = store.clone();
-    use bilive_rec::uploader::types::Uploader;
 
-    let pipeline_config = run_config.pipeline.clone();
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    let mut handles = futures::stream::FuturesUnordered::new();
-    let prepared_rooms = run_config.rooms;
-
-    for room_config in &prepared_rooms {
-        tracing::info!(
-            room_name = %room_config.name,
-            room_url = %room_config.url,
-            record_credential = %record_credential_name(room_config.record.credential.as_ref()),
-            upload_credential = %room_config.upload.credential.name,
-            submit_api = %room_config.upload.submit_api.as_config_value(),
-            private = room_config.submit.private,
-            "Room configured"
-        );
+    for message in bilive_rec::state::ownership::audit(store.as_ref())? {
+        tracing::warn!("startup ownership recovery: {message}");
+    }
+    for message in bilive_rec::recorder::artifact_commit::reconcile(store.as_ref()).await? {
+        tracing::info!("startup recovery: {message}");
+    }
+    for message in transitions::reconcile_interrupted_remote_attempts(store.as_ref())? {
+        tracing::info!("startup recovery: {message}");
     }
 
+    // With no current rooms the canonical registry is already known to be
+    // empty, so persist removed-room recovery before deciding whether any
+    // executable historical work remains.
+    if run_config.rooms.is_empty() {
+        for (room_id, room_state) in store.list_room_states()? {
+            if let RoomLifecycle::Owned { session_id } = room_state.lifecycle {
+                transitions::require_recovery(
+                    &store,
+                    session_id,
+                    format!("room {room_id} was removed from the current configuration"),
+                )?;
+            }
+        }
+    }
+
+    let pipeline_config = run_config.pipeline.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (open_sessions_ready_tx, open_sessions_ready_rx) = tokio::sync::watch::channel(false);
+    let (worker_stop_when_idle_tx, worker_stop_when_idle_rx) = tokio::sync::watch::channel(false);
+
     let mut uploaders = HashMap::new();
-    for room_config in &prepared_rooms {
-        let target = UploadTarget::new(
-            room_config.upload.credential.clone(),
-            room_config.upload.submit_api.clone(),
-        );
+    let has_bilibili_room = run_config.rooms.iter().any(|room| {
+        matches!(
+            room.output,
+            bilive_rec::config::ResolvedRoomOutput::Bilibili { .. }
+        )
+    });
+    for room_config in &run_config.rooms {
+        let bilive_rec::config::ResolvedRoomOutput::Bilibili { upload, .. } = &room_config.output
+        else {
+            continue;
+        };
+        let target = UploadTarget {
+            principal: upload.principal.clone(),
+            line: upload.line.clone(),
+            threads: upload.threads,
+            submit_api: upload.submit_api.clone(),
+        };
         if uploaders.contains_key(&target) {
             continue;
         }
         tracing::info!(
-            credential = %room_config.upload.credential.name,
-            submit_api = %room_config.upload.submit_api.as_config_value(),
-            line = %room_config.upload.line,
-            "Checking upload credential"
+            credential = %upload.principal.credential.name,
+            submit_api = %upload.submit_api.as_config_value(),
+            line = %upload.line,
+            "Preparing lazy upload target"
         );
         let uploader = Arc::new(BiliupUploader::new(
-            room_config.upload.credential.cookie_file.clone(),
-            room_config.upload.line.clone(),
-            room_config.upload.threads,
-            room_config.upload.submit_api.clone(),
+            upload.principal.clone(),
+            upload.line.clone(),
+            upload.threads,
+            upload.submit_api.clone(),
         ));
-        uploader.check_login().await?;
         uploaders.insert(target, uploader);
     }
 
-    let mut clients: HashMap<Option<bilive_rec::credential::CredentialIdentity>, Arc<BiliClient>> =
-        HashMap::new();
-
-    let mut active_room_tasks = prepared_rooms.len();
-    let mut upload_worker_running = false;
-    if active_room_tasks > 0 {
-        upload_worker_running = true;
-        handles.push(tokio::spawn({
-            let store = store_clone.clone();
-            let uploaders = uploaders.clone();
-            let shutdown_rx = shutdown_rx.clone();
-            let poll_interval = Duration::from_secs(pipeline_config.poll_interval_s);
-            async move {
-                RunTaskResult::UploadWorker(
-                    UploadWorker::new(store, uploaders, poll_interval, shutdown_rx)
-                        .run()
-                        .await,
-                )
-            }
-        }));
+    for session in store.list_sessions()? {
+        let OutputPlan::Bilibili { upload, .. } = &session.output_plan else {
+            continue;
+        };
+        let target = UploadTarget::from(upload);
+        if uploaders.contains_key(&target) {
+            continue;
+        }
+        tracing::info!(
+            session_id = %session.id,
+            credential = %upload.principal.credential.name,
+            submit_api = %upload.submit_api.as_config_value(),
+            line = %upload.line,
+            "Preparing lazy persisted-session upload target"
+        );
+        let uploader = Arc::new(BiliupUploader::new(
+            upload.principal.clone(),
+            upload.line.clone(),
+            upload.threads,
+            upload.submit_api.clone(),
+        ));
+        uploaders.insert(target, uploader);
     }
 
-    for room_config in prepared_rooms {
-        let room_url = room_config.url.clone();
-        let store = store_clone.clone();
-        let room_credentials = room_config.credentials();
+    let has_durable_work =
+        bilive_rec::uploader::work::has_executable_durable_work(&store, |target| {
+            uploaders.contains_key(target)
+        })?;
+    if run_config.rooms.is_empty() && !has_durable_work {
+        return Err(bilive_rec::error::AppError::State(
+            "no configured rooms or executable durable work; inspect blocked state with `bilive-rec status --verbose`"
+                .into(),
+        ));
+    }
 
-        let record_credential = room_credentials.record.clone();
-        let client = if let Some(client) = clients.get(&record_credential) {
-            client.clone()
+    let mut tasks = RunTaskCoordinator::new(shutdown_tx);
+    let run_result: AppResult<()> = async {
+        let mut upload_worker_running = false;
+        if has_bilibili_room || has_durable_work {
+            upload_worker_running = true;
+            let worker_handle = tokio::spawn({
+                let store = store_clone.clone();
+                let uploaders = uploaders.clone();
+                let shutdown_rx = shutdown_rx.clone();
+                let poll_interval = Duration::from_secs(pipeline_config.poll_interval_s);
+                async move {
+                    let worker = UploadWorker::new(store, uploaders, poll_interval, shutdown_rx)
+                        .with_open_session_barrier(open_sessions_ready_rx)
+                        .with_stop_when_idle_signal(worker_stop_when_idle_rx);
+                    RunTaskResult::UploadWorker(worker.run().await)
+                }
+            });
+            tasks.push(worker_handle);
+        }
+
+        let prepared_rooms = if run_config.rooms.is_empty() {
+            Vec::new()
         } else {
-            tracing::info!(
-                credential = %record_credential_name(record_credential.as_ref()),
-                "Initializing record client"
-            );
-            let client = Arc::new(BiliClient::from_optional_cookie_file(
-                room_credentials.record_cookie_file(),
-            )?);
-            clients.insert(record_credential, client.clone());
-            client
+            loop {
+                let preparation = tokio::select! {
+                    result = prepare_rooms(run_config.rooms.clone()) => result,
+                    task = tasks.next(), if upload_worker_running => {
+                        let outcome = process_run_task_result(task.expect("guarded upload worker task"));
+                        upload_worker_running = !outcome.upload_worker_finished;
+                        if outcome.failed {
+                            return Err(bilive_rec::error::AppError::State(
+                                "upload worker failed while the room registry was being prepared".into(),
+                            ));
+                        }
+                        continue;
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("Ctrl-C received while preparing room registry");
+                        return Ok(());
+                    }
+                };
+                match preparation {
+                    Ok(rooms) => break rooms,
+                    Err(error) if error.is_retryable() => {
+                        tracing::warn!("Room registry preparation failed; retrying: {error}");
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(pipeline_config.backoff_s)) => {}
+                            _ = tokio::signal::ctrl_c() => {
+                                tracing::info!("Ctrl-C received during room registry retry backoff");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error.into_app_error()),
+                }
+            }
         };
 
+        run_prepared_rooms(
+            &mut tasks,
+            prepared_rooms,
+            store_clone.clone(),
+            pipeline_config.clone(),
+            open_sessions_ready_tx,
+            worker_stop_when_idle_tx,
+            upload_worker_running,
+        )
+        .await
+    }
+    .await;
+
+    tasks.finish(run_result).await
+}
+
+async fn run_prepared_rooms(
+    tasks: &mut RunTaskCoordinator,
+    prepared_rooms: Vec<bilive_rec::pipeline::bootstrap::PreparedRoom>,
+    store: std::sync::Arc<StateStore>,
+    pipeline_config: bilive_rec::config::PipelineConfig,
+    open_sessions_ready_tx: tokio::sync::watch::Sender<bool>,
+    worker_stop_when_idle_tx: tokio::sync::watch::Sender<bool>,
+    mut upload_worker_running: bool,
+) -> AppResult<()> {
+    use bilive_rec::pipeline::supervisor::{RoomSupervisor, RoomSupervisorDeps};
+    use bilive_rec::state::model::RoomLifecycle;
+    use bilive_rec::state::transitions;
+    use std::collections::HashSet;
+
+    let shutdown_rx = tasks.subscribe_shutdown();
+    let configured_room_ids: HashSet<u64> =
+        prepared_rooms.iter().map(|room| room.room_id).collect();
+    for (room_id, room_state) in store.list_room_states()? {
+        if let RoomLifecycle::Owned { session_id } = room_state.lifecycle
+            && !configured_room_ids.contains(&room_id)
+        {
+            transitions::require_recovery(
+                &store,
+                session_id,
+                format!("room {room_id} was removed from the current configuration"),
+            )?;
+        }
+    }
+    let _ = open_sessions_ready_tx.send(true);
+
+    for prepared in &prepared_rooms {
+        let room_config = &prepared.room_config;
+        tracing::info!(
+            room_name = %room_config.name,
+            room_url = %room_config.url,
+            room_id = prepared.room_id,
+            record_credential = %record_credential_name(room_config.record.credential.as_ref()),
+            "Room registry ready"
+        );
+    }
+
+    let mut runnable_rooms = Vec::new();
+    for room in prepared_rooms {
+        if store
+            .get_room_state(room.room_id)?
+            .is_some_and(|state| matches!(state.lifecycle, RoomLifecycle::Blocked { .. }))
+        {
+            tracing::warn!(
+                room_id = room.room_id,
+                room_name = %room.room_config.name,
+                "Room is blocked by durable recovery state; skipping supervisor"
+            );
+        } else {
+            runnable_rooms.push(room);
+        }
+    }
+
+    let has_future_upload_producer = runnable_rooms.iter().any(|room| {
+        matches!(
+            room.room_config.output,
+            bilive_rec::config::ResolvedRoomOutput::Bilibili { .. }
+        )
+    });
+    let _ = worker_stop_when_idle_tx.send(!has_future_upload_producer);
+
+    let mut active_room_tasks = runnable_rooms.len();
+    for prepared in runnable_rooms {
+        let room_id = prepared.room_id;
+        let room_config = prepared.room_config;
+        let client = prepared.client;
+        let store = store.clone();
         let shutdown_rx = shutdown_rx.clone();
         let pipeline_config = pipeline_config.clone();
 
         let handle = tokio::spawn(async move {
             let result = async move {
-                let room_id =
-                    match bilive_rec::bilibili::room::resolve_room_id(&client, &room_url).await {
-                        Ok(id) => id,
-                        Err(e) => {
-                            return Err(bilive_rec::error::AppError::Bilibili(format!(
-                                "Failed to resolve room URL {}: {}",
-                                room_url, e
-                            )));
-                        }
-                    };
-
-                let mut loop_shutdown_rx = shutdown_rx.clone();
-                let mut supervisor = RoomSupervisor::new(
+                let supervisor = RoomSupervisor::new(
                     room_id,
-                    pipeline_config.clone(),
+                    pipeline_config,
                     room_config,
                     RoomSupervisorDeps { store, client },
                     shutdown_rx,
@@ -213,95 +501,36 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                     room_id,
                     "Started supervisor"
                 );
-
-                loop {
-                    // Check shutdown before each step
-                    if *loop_shutdown_rx.borrow() {
-                        tracing::info!(
-                            room_name = %supervisor.room_config.name,
-                            room_id,
-                            "Room shutting down (signal received)"
-                        );
-                        return Ok::<(), bilive_rec::error::AppError>(());
-                    }
-
-                    match supervisor.run_step().await {
-                        Ok(()) => {}
-                        Err(bilive_rec::error::AppError::GracefulShutdown) => {
-                            tracing::info!(
-                                room_name = %supervisor.room_config.name,
-                                room_id,
-                                "Room interrupted by graceful shutdown"
-                            );
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                room_name = %supervisor.room_config.name,
-                                room_id,
-                                "Fatal supervisor error: {}",
-                                e
-                            );
-                            return Err(e);
-                        }
-                    }
-
-                    let state = supervisor.session.state;
-                    let sleep_duration = match state {
-                        RoomState::Idle => {
-                            Some(Duration::from_secs(pipeline_config.poll_interval_s))
-                        }
-                        RoomState::Failed | RoomState::Offline => {
-                            Some(Duration::from_secs(pipeline_config.poll_interval_s))
-                        }
-                        RoomState::WaitingReconnect => Some(supervisor.reconnect_delay()),
-                        _ => None, // Recording blocks/pumps immediately
-                    };
-
-                    if let Some(d) = sleep_duration {
-                        tokio::select! {
-                            _ = tokio::time::sleep(d) => {}
-                            _ = loop_shutdown_rx.changed() => {
-                                tracing::info!(
-                                    room_name = %supervisor.room_config.name,
-                                    room_id,
-                                    "Room shutting down (signal during sleep)"
-                                );
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
+                supervisor.run().await
             }
             .await;
 
             RunTaskResult::Room(result)
         });
-
-        handles.push(handle);
+        tasks.push(handle);
     }
 
-    use futures::StreamExt;
+    if tasks.is_empty() {
+        return Err(bilive_rec::error::AppError::State(
+            "no runnable rooms or upload work; inspect blocked sessions with `bilive-rec status --verbose`"
+                .into(),
+        ));
+    }
 
-    // Each room runs independently. A failure in one room is logged and
-    // recorded in redb but must not terminate sibling rooms — operators
-    // can inspect failures via `bilive-rec state inspect` after the run.
-    //
-    // Shutdown contract:
-    //   - First Ctrl-C: broadcast shutdown, drain handles cleanly.
-    //   - Second Ctrl-C: forced exit; in-flight uploads may be lost.
+    // First Ctrl-C drains cleanly. A forced second exit can leave Attempting;
+    // startup turns those durable intents into Ambiguous, never Pending.
     let mut shutdown_initiated = false;
     let mut any_failed = false;
 
-    while !handles.is_empty() {
+    while !tasks.is_empty() {
         if !shutdown_initiated {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("Ctrl-C received, signaling graceful shutdown...");
-                    let _ = shutdown_tx.send(true);
+                    tasks.signal_shutdown();
                     shutdown_initiated = true;
                 }
-                Some(res) = handles.next() => {
+                Some(res) = tasks.next() => {
                     let outcome = process_run_task_result(res);
                     if outcome.failed {
                         any_failed = true;
@@ -313,13 +542,12 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                         upload_worker_running = false;
                     }
                     if outcome.global_failure && !shutdown_initiated {
-                        let _ = shutdown_tx.send(true);
+                        tasks.signal_shutdown();
                         shutdown_initiated = true;
                     }
                     if active_room_tasks == 0 && upload_worker_running && !shutdown_initiated {
-                        tracing::info!("All room tasks finished; signaling upload worker shutdown...");
-                        let _ = shutdown_tx.send(true);
-                        shutdown_initiated = true;
+                        tracing::info!("All room tasks finished; upload worker will drain durable work and stop when idle");
+                        let _ = worker_stop_when_idle_tx.send(true);
                     }
                 }
             }
@@ -327,11 +555,12 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::warn!("Second Ctrl-C received; forcing exit. In-flight uploads may be lost.");
+                    tasks.abort_all();
                     return Err(bilive_rec::error::AppError::State(
                         "Forced exit by second Ctrl-C".into(),
                     ));
                 }
-                Some(res) = handles.next() => {
+                Some(res) = tasks.next() => {
                     let outcome = process_run_task_result(res);
                     if outcome.failed {
                         any_failed = true;
@@ -343,11 +572,10 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
                         upload_worker_running = false;
                     }
                     if outcome.global_failure {
-                        let _ = shutdown_tx.send(true);
+                        tasks.signal_shutdown();
                     }
                     if active_room_tasks == 0 && upload_worker_running {
-                        tracing::info!("All room tasks finished; signaling upload worker shutdown...");
-                        let _ = shutdown_tx.send(true);
+                        let _ = worker_stop_when_idle_tx.send(true);
                     }
                 }
             }
@@ -355,10 +583,9 @@ async fn run_cmd(config_path: &std::path::Path) -> AppResult<()> {
     }
 
     tracing::info!("All run tasks finished.");
-
     if any_failed {
         Err(bilive_rec::error::AppError::State(
-            "One or more run tasks failed; run `state inspect` for details".into(),
+            "One or more run tasks failed; run `bilive-rec status --verbose` for details".into(),
         ))
     } else {
         Ok(())
@@ -382,14 +609,29 @@ fn process_room_outcome(result: bilive_rec::error::AppResult<()>) -> bool {
     }
 }
 
+fn is_global_run_error(error: &bilive_rec::error::AppError) -> bool {
+    matches!(
+        error,
+        bilive_rec::error::AppError::Database(_)
+            | bilive_rec::error::AppError::Table(_)
+            | bilive_rec::error::AppError::Transaction(_)
+            | bilive_rec::error::AppError::Storage(_)
+            | bilive_rec::error::AppError::Commit(_)
+            | bilive_rec::error::AppError::State(_)
+    )
+}
+
 fn process_run_task_result(res: Result<RunTaskResult, tokio::task::JoinError>) -> RunTaskOutcome {
     match res {
-        Ok(RunTaskResult::Room(result)) => RunTaskOutcome {
-            failed: process_room_outcome(result),
-            global_failure: false,
-            room_finished: true,
-            upload_worker_finished: false,
-        },
+        Ok(RunTaskResult::Room(result)) => {
+            let global_failure = result.as_ref().err().is_some_and(is_global_run_error);
+            RunTaskOutcome {
+                failed: process_room_outcome(result),
+                global_failure,
+                room_finished: true,
+                upload_worker_finished: false,
+            }
+        }
         Ok(RunTaskResult::UploadWorker(Ok(()))) => {
             tracing::info!("Upload worker shut down cleanly");
             RunTaskOutcome {
@@ -420,346 +662,289 @@ fn process_run_task_result(res: Result<RunTaskResult, tokio::task::JoinError>) -
     }
 }
 
-fn state_inspect_cmd(config_path: &std::path::Path) -> AppResult<()> {
+fn status_cmd(config_path: &std::path::Path, verbose: bool) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
     let db_path = config.data.dir.join("state.redb");
-    let store = StateStore::open(&db_path)?;
+    let store = StateStore::open_existing(&db_path)?;
+    let inspection = state::inspection::StateInspection::load(&store)?;
 
-    // Schema version
-    let schema_version = store.schema_version()?;
-    println!("=== State Inspection ===");
-    println!("Schema version: {}", schema_version);
+    println!("=== bilive-rec status ===");
+    println!("State format: {}", state::store::STATE_FORMAT_ID);
+    println!("Schema version: {}", store.schema_version()?);
     println!();
 
-    // Summary counts
-    let summary = store.summary()?;
     println!("Summary:");
-    println!("  sessions: {}", summary.session_count);
-    println!("  segments: {}", summary.segment_count);
-    println!("  uploaded_parts: {}", summary.uploaded_parts_count);
-    println!("  submissions: {}", summary.submission_count);
-    println!("  submission_plans: {}", summary.submission_plan_count);
+    println!("  sessions: {}", inspection.summary.session_count);
+    println!("  segments: {}", inspection.summary.segment_count);
+    println!("  submissions: {}", inspection.summary.submission_count);
+    println!("  rooms: {}", inspection.summary.room_count);
+    println!(
+        "  upload_targets: {}",
+        inspection.summary.upload_target_count
+    );
     println!();
 
-    // Room states
-    let room_states = store.list_all_room_states()?;
-    if !room_states.is_empty() {
+    if !inspection.room_states.is_empty() {
         println!("Room states:");
-        for (room_id, room_state) in &room_states {
-            print!("  room {}: {:?}", room_id, room_state.state);
-            if let Some(session_id) = room_state.active_session_id {
-                print!("  session={session_id}");
-            }
-            if let (Some(err), Some(ts)) = (&room_state.last_error, &room_state.last_error_at) {
-                print!("  last_error=[{ts}] {err}");
+        for (room_id, room) in &inspection.room_states {
+            print!(
+                "  room {room_id}: {:?}, changed_at={}",
+                room.lifecycle, room.changed_at
+            );
+            if let Some(message) = &room.message {
+                print!(", message={message:?}");
             }
             println!();
         }
         println!();
     }
 
-    // Sessions
-    let sessions = store.list_all_sessions()?;
-    if !sessions.is_empty() {
-        println!("Sessions:");
-        for session in &sessions {
-            println!("  id: {}", session.id);
-            println!("    room_key: {}", session.room_key);
-            println!("    title: {}", session.title);
-            println!("    started_at: {}", session.started_at);
-            println!("    status: {:?}", session.status);
-        }
-        println!();
-    }
-
-    // Segments grouped by session
-    let all_segments = store.list_all_segments()?;
-    if !all_segments.is_empty() {
-        // Group by session_id
-        let mut segments_by_session: std::collections::HashMap<uuid::Uuid, Vec<_>> =
-            std::collections::HashMap::new();
-        for seg in &all_segments {
-            segments_by_session
-                .entry(seg.session_id)
-                .or_default()
-                .push(seg);
-        }
-
-        println!("Segments:");
-        for (session_id, segs) in &segments_by_session {
-            println!("  session {}:", session_id);
-            // Sort by index
-            let mut sorted_segs = segs.clone();
-            sorted_segs.sort_by_key(|s| s.index);
-            for seg in &sorted_segs {
-                print!(
-                    "    index={}: status={:?}, path={}",
-                    seg.index,
-                    seg.status,
-                    seg.path.display()
-                );
-                if let Some(ref err) = seg.error {
-                    print!(", error={}", err);
+    if verbose {
+        if !inspection.sessions.is_empty() {
+            println!("Sessions:");
+            for session in &inspection.sessions {
+                println!("  id: {}", session.id);
+                println!("    room_id: {}", session.room_id);
+                println!("    room_name: {}", session.room_name);
+                println!("    title: {}", session.title);
+                println!("    started_at: {}", session.started_at);
+                println!("    lifecycle: {:?}", session.lifecycle);
+                println!("    recording_plan: {:?}", session.recording_plan);
+                println!("    output_plan: {:?}", session.output_plan);
+                for event in &session.recording_events {
+                    println!("    recording_event: {event:?}");
                 }
-                println!();
-            }
-        }
-        println!();
-    }
-
-    // Uploaded parts grouped by session
-    let all_parts = store.list_all_uploaded_parts()?;
-    if !all_parts.is_empty() {
-        let mut parts_by_session: std::collections::HashMap<uuid::Uuid, Vec<_>> =
-            std::collections::HashMap::new();
-        for part in &all_parts {
-            parts_by_session
-                .entry(part.session_id)
-                .or_default()
-                .push(part);
-        }
-
-        println!("Uploaded parts:");
-        for (session_id, parts) in &parts_by_session {
-            println!("  session {}:", session_id);
-            let mut sorted_parts = parts.clone();
-            sorted_parts.sort_by_key(|p| p.segment_index);
-            for part in &sorted_parts {
-                println!(
-                    "    segment_index={}, bili_filename={}, part_title={}",
-                    part.segment_index, part.bili_filename, part.part_title
-                );
-            }
-        }
-        println!();
-    }
-
-    // Submissions
-    let all_submissions = store.list_all_submissions()?;
-    if !all_submissions.is_empty() {
-        println!("Submissions:");
-        for sub in &all_submissions {
-            print!("  session {}: status={:?}", sub.session_id, sub.status);
-            if let Some(aid) = sub.aid {
-                print!(", aid={}", aid);
-            }
-            if let Some(ref bvid) = sub.bvid {
-                print!(", bvid={}", bvid);
-            }
-            if let Some(ref err) = sub.error {
-                print!(", error={}", err);
             }
             println!();
         }
-        println!();
+
+        if !inspection.segments.is_empty() {
+            println!("Segments:");
+            for segment in &inspection.segments {
+                let files = inspection.file_presence.iter().find(|files| {
+                    files.session_id == segment.session_id && files.segment_index == segment.index
+                });
+                println!(
+                    "  {}/{}: artifact={:?}, upload={:?}",
+                    segment.session_id, segment.index, segment.artifact, segment.upload
+                );
+                println!("    part_path: {}", segment.part_path.display());
+                println!("    final_path: {}", segment.final_path.display());
+                if let Some(files) = files {
+                    println!(
+                        "    files: part={:?}, final={:?}",
+                        files.part, files.final_file
+                    );
+                }
+                for attempt in &segment.upload_attempts {
+                    println!("    upload_attempt: {attempt:?}");
+                }
+                for resolution in &segment.upload_resolutions {
+                    println!("    upload_resolution: {resolution:?}");
+                }
+            }
+            println!();
+        }
+
+        if !inspection.submissions.is_empty() {
+            println!("Submissions:");
+            for submission in &inspection.submissions {
+                println!(
+                    "  session {}: state={:?}",
+                    submission.session_id, submission.state
+                );
+                for attempt in &submission.attempts {
+                    println!("    attempt: {attempt:?}");
+                }
+                for resolution in &submission.resolutions {
+                    println!("    resolution: {resolution:?}");
+                }
+            }
+            println!();
+        }
+
+        if !inspection.upload_targets.is_empty() {
+            println!("Upload targets:");
+            for target in &inspection.upload_targets {
+                println!("  {:?}: {:?}", target.target, target.gate);
+            }
+            println!();
+        }
     }
 
-    // Anomalies
-    let anomalies = bilive_rec::state::recovery::detect_anomalies(&store)?;
-    if anomalies.is_empty() {
+    if inspection.anomalies.is_empty() {
         println!("No anomalies detected.");
     } else {
-        println!("Anomalies ({}):", anomalies.len());
-        for anomaly in &anomalies {
+        println!("Anomalies ({}):", inspection.anomalies.len());
+        for anomaly in &inspection.anomalies {
             println!();
-            println!(
-                "  [{}] {}",
-                format!("{:?}", anomaly.kind).to_lowercase(),
-                anomaly.description
-            );
+            println!("  [{}] {}", anomaly.kind.as_str(), anomaly.description);
+            println!("    next: {}", anomaly.next_action);
         }
     }
 
     Ok(())
 }
 
-struct RecoveryUploader {
-    by_session: std::collections::HashMap<
-        uuid::Uuid,
-        std::sync::Arc<bilive_rec::uploader::biliup_adapter::BiliupUploader>,
-    >,
-}
-
-impl bilive_rec::uploader::types::Uploader for RecoveryUploader {
-    async fn check_login(&self) -> AppResult<()> {
-        for uploader in self.by_session.values() {
-            uploader.check_login().await?;
-        }
-        Ok(())
-    }
-
-    async fn upload_segment(
-        &self,
-        req: bilive_rec::uploader::types::UploadRequest,
-    ) -> AppResult<bilive_rec::state::model::UploadedPart> {
-        let uploader = self.by_session.get(&req.session_id).ok_or_else(|| {
-            bilive_rec::error::AppError::State(format!(
-                "no recovery uploader initialized for session {}",
-                req.session_id
-            ))
-        })?;
-        uploader.upload_segment(req).await
-    }
-
-    async fn submit(
-        &self,
-        _req: bilive_rec::uploader::types::SubmissionRequest,
-    ) -> AppResult<bilive_rec::uploader::types::SubmissionOutcome> {
-        Err(bilive_rec::error::AppError::State(
-            "recovery uploader does not submit videos".into(),
-        ))
-    }
-}
-
-async fn state_recover_cmd(
-    config_path: &std::path::Path,
-    apply: bool,
-    reset_room: Option<u64>,
-    retry_upload: Option<uuid::Uuid>,
-) -> AppResult<()> {
-    let config = AppConfig::load(config_path)?;
-    let db_path = config.data.dir.join("state.redb");
-    let store = StateStore::open(&db_path)?;
-
-    let mut reset_rooms = std::collections::HashSet::new();
-    if let Some(room) = reset_room {
-        reset_rooms.insert(room);
-    }
-
-    let mut retry_upload_sessions = std::collections::HashSet::new();
-    if let Some(session) = retry_upload {
-        retry_upload_sessions.insert(session);
-    }
-
-    let plan = state::recovery::plan_recovery(&store, &reset_rooms, &retry_upload_sessions)?;
-
-    if apply {
-        if state::recovery::plan_has_upload_actions(&plan) {
-            let upload_recovery = config.resolve_for_upload_recovery()?;
-            let mut uploaders_by_credential: std::collections::HashMap<
-                bilive_rec::credential::CredentialIdentity,
-                std::sync::Arc<bilive_rec::uploader::biliup_adapter::BiliupUploader>,
-            > = std::collections::HashMap::new();
-            let mut uploaders_by_session = std::collections::HashMap::new();
-
-            for action in &plan.actions {
-                let state::recovery::RecoveryAction::ScheduleUploadReconciliation {
-                    session_id,
-                    ..
-                } = action
-                else {
-                    continue;
-                };
-
-                let session = store.get_session(*session_id)?.ok_or_else(|| {
-                    bilive_rec::error::AppError::State(format!(
-                        "session {} not found for upload recovery",
-                        session_id
-                    ))
-                })?;
-                let session_upload_credential =
-                    session.upload_credential.clone().ok_or_else(|| {
-                        bilive_rec::error::AppError::State(format!(
-                            "session {} has no upload credential; cannot retry upload automatically",
-                            session.id
-                        ))
-                    })?;
-                let current = config.credential_identity(
-                    &session_upload_credential.name,
-                    &format!("session {} upload_credential", session.id),
-                )?;
-                if current != session_upload_credential {
-                    return Err(bilive_rec::error::AppError::Config(format!(
-                        "session {} was recorded with upload credential '{}' at {}, but current config resolves it to {}",
-                        session.id,
-                        session_upload_credential.name,
-                        session_upload_credential.cookie_file.display(),
-                        current.cookie_file.display()
-                    )));
-                }
-
-                let uploader = if let Some(uploader) =
-                    uploaders_by_credential.get(&session_upload_credential)
-                {
-                    uploader.clone()
-                } else {
-                    let uploader = std::sync::Arc::new(
-                        bilive_rec::uploader::biliup_adapter::BiliupUploader::new(
-                            session_upload_credential.cookie_file.clone(),
-                            upload_recovery.upload.line.clone(),
-                            upload_recovery.upload.threads,
-                            upload_recovery.upload.submit_api.clone(),
-                        ),
-                    );
-                    uploaders_by_credential.insert(session_upload_credential, uploader.clone());
-                    uploader
-                };
-                uploaders_by_session.insert(*session_id, uploader);
-            }
-
-            let uploader = RecoveryUploader {
-                by_session: uploaders_by_session,
-            };
-            use bilive_rec::uploader::types::Uploader;
-            uploader.check_login().await?;
-
-            let results = state::recovery::apply_recovery(&store, &plan, Some(&uploader)).await?;
-            for result in &results {
-                match result {
-                    state::recovery::ApplyResult::Applied(msg) => println!("[applied] {}", msg),
-                    state::recovery::ApplyResult::Skipped(msg) => println!("[skipped] {}", msg),
-                }
-            }
-        } else {
-            // Local-only apply — no uploader needed
-            use bilive_rec::uploader::biliup_adapter::BiliupUploader;
-            let results =
-                state::recovery::apply_recovery::<BiliupUploader>(&store, &plan, None).await?;
-            for result in &results {
-                match result {
-                    state::recovery::ApplyResult::Applied(msg) => println!("[applied] {}", msg),
-                    state::recovery::ApplyResult::Skipped(msg) => println!("[skipped] {}", msg),
-                }
-            }
-        }
-    } else {
-        if plan.is_empty() {
-            println!("No recovery actions needed.");
-        } else {
-            println!("{}", plan);
-        }
-    }
-
-    Ok(())
-}
-
-fn state_resolve_submission_cmd(
+fn recover_upload_cmd(
     config_path: &std::path::Path,
     session_id: uuid::Uuid,
-    outcome: ResolveOutcome,
-    aid: Option<u64>,
-    bvid: Option<String>,
+    segment_index: u32,
+    not_uploaded: bool,
+    uploaded: Option<String>,
+    part_title: Option<String>,
+    note: Option<String>,
 ) -> AppResult<()> {
     let config = AppConfig::load(config_path)?;
     let db_path = config.data.dir.join("state.redb");
-    let store = StateStore::open(&db_path)?;
+    let store = StateStore::open_existing(&db_path)?;
 
-    let target = match outcome {
-        ResolveOutcome::Submitted => bilive_rec::state::model::SubmissionStatus::Submitted,
-        ResolveOutcome::Failed => bilive_rec::state::model::SubmissionStatus::Failed,
+    let target = match (not_uploaded, uploaded) {
+        (true, None) => state::recovery::UploadResolutionTarget::NotUploaded,
+        (false, Some(bili_filename)) => state::recovery::UploadResolutionTarget::Uploaded {
+            proof: state::model::UploadedPart {
+                bili_filename,
+                part_title: part_title.unwrap_or_else(|| format!("Part {segment_index}")),
+            },
+        },
+        _ => {
+            return Err(bilive_rec::error::AppError::Config(
+                "choose exactly one of --not-uploaded or --uploaded".into(),
+            ));
+        }
     };
 
-    let resolved = state::recovery::resolve_submission(&store, session_id, target, aid, bvid)?;
+    let resolved =
+        state::recovery::resolve_upload(&store, session_id, segment_index, target, note)?;
     println!(
-        "session {}: {:?} -> {:?}",
-        resolved.session_id, resolved.from, resolved.to
+        "segment {}/{}: upload={:?}",
+        resolved.session_id, resolved.index, resolved.upload
     );
-    if let Some(a) = resolved.aid {
-        println!("aid = {a}");
+    Ok(())
+}
+
+fn recover_recording_cmd(
+    config_path: &std::path::Path,
+    session_id: uuid::Uuid,
+    finalize: bool,
+    abandon: bool,
+    exclude_failed: bool,
+    note: Option<String>,
+) -> AppResult<()> {
+    if finalize == abandon {
+        return Err(bilive_rec::error::AppError::Config(
+            "choose exactly one of --finalize or --abandon".into(),
+        ));
     }
-    if let Some(b) = resolved.bvid {
-        println!("bvid = {b}");
+    if abandon && exclude_failed {
+        return Err(bilive_rec::error::AppError::Config(
+            "--exclude-failed is only valid with --finalize".into(),
+        ));
     }
+    let config = AppConfig::load(config_path)?;
+    let store = StateStore::open_existing(config.data.dir.join("state.redb"))?;
+    let target = if finalize {
+        state::recovery::RecordingResolutionTarget::Finalize { exclude_failed }
+    } else {
+        state::recovery::RecordingResolutionTarget::Abandon
+    };
+    let resolved = state::recovery::resolve_recording(&store, session_id, target, note)?;
+    println!(
+        "recording {}: lifecycle={:?}",
+        resolved.session_id, resolved.lifecycle
+    );
+    if !resolved.excluded_segments.is_empty() {
+        println!(
+            "excluded failed segments: {}",
+            resolved
+                .excluded_segments
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("room ownership released; `run` may monitor it again");
+    Ok(())
+}
+
+fn recover_submission_cmd(
+    config_path: &std::path::Path,
+    session_id: uuid::Uuid,
+    not_submitted: bool,
+    submitted: bool,
+    aid: Option<u64>,
+    bvid: Option<String>,
+    note: Option<String>,
+) -> AppResult<()> {
+    if not_submitted == submitted {
+        return Err(bilive_rec::error::AppError::Config(
+            "choose exactly one of --not-submitted or --submitted".into(),
+        ));
+    }
+    if not_submitted && (aid.is_some() || bvid.is_some()) {
+        return Err(bilive_rec::error::AppError::Config(
+            "--aid and --bvid are only valid with --submitted".into(),
+        ));
+    }
+    if submitted && aid.is_none() && bvid.is_none() {
+        return Err(bilive_rec::error::AppError::Config(
+            "--submitted requires at least one of --aid or --bvid".into(),
+        ));
+    }
+
+    let config = AppConfig::load(config_path)?;
+    let db_path = config.data.dir.join("state.redb");
+    let store = StateStore::open_existing(&db_path)?;
+    let target = if submitted {
+        state::recovery::SubmissionResolutionTarget::Submitted { aid, bvid }
+    } else {
+        state::recovery::SubmissionResolutionTarget::NotSubmitted
+    };
+    let resolved = state::recovery::resolve_submission(&store, session_id, target, note)?;
+    println!(
+        "submission {}: state={:?}",
+        resolved.session_id, resolved.state
+    );
+    Ok(())
+}
+
+async fn recover_segment_cmd(
+    config_path: &std::path::Path,
+    session_id: uuid::Uuid,
+    segment_index: u32,
+    keep_part: bool,
+    keep_final: bool,
+    exclude: bool,
+    note: Option<String>,
+) -> AppResult<()> {
+    let selected = u8::from(keep_part) + u8::from(keep_final) + u8::from(exclude);
+    if selected != 1 {
+        return Err(bilive_rec::error::AppError::Config(
+            "choose exactly one of --keep-part, --keep-final, or --exclude".into(),
+        ));
+    }
+    let decision = if keep_part {
+        state::model::ArtifactResolutionDecision::KeepPart
+    } else if keep_final {
+        state::model::ArtifactResolutionDecision::KeepFinal
+    } else {
+        state::model::ArtifactResolutionDecision::Exclude
+    };
+    let config = AppConfig::load(config_path)?;
+    let store = StateStore::open_existing(config.data.dir.join("state.redb"))?;
+    let segment = bilive_rec::recorder::artifact_commit::resolve_conflict(
+        &store,
+        session_id,
+        segment_index,
+        decision,
+        note,
+    )
+    .await?;
+    println!(
+        "segment {}/{}: artifact={:?}",
+        segment.session_id, segment.index, segment.artifact
+    );
     Ok(())
 }
 
@@ -825,365 +1010,6 @@ async fn check_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> App
     Ok(())
 }
 
-/// One-shot recording. Resolves the room, captures the stream into the
-/// configured output dir, and persists a LiveSession + segment rows. No
-/// upload, no persisted room state. Stops on Ctrl-C or when the stream
-/// ends. For long-running multi-room operation with auto-upload, use `run`.
-async fn record_cmd(room_url: &str, config_path: Option<&std::path::Path>) -> AppResult<()> {
-    use bilive_rec::recorder::record_flv;
-    use bilive_rec::recorder::segment::{
-        RecorderPolicy, SegmentEvent, SegmentFilter, SegmentLayout, SegmentPolicy,
-    };
-    use bilive_rec::state::model::{LiveSession, SessionStatus};
-    use std::sync::Arc;
-    use uuid::Uuid;
-
-    let config = match config_path {
-        None => {
-            let default_path = std::path::Path::new("config.toml");
-            if default_path.exists() {
-                AppConfig::load(default_path)?
-            } else {
-                AppConfig::parse("")?
-            }
-        }
-        Some(path) => AppConfig::load(path)?,
-    };
-    let check_config = config.resolve_for_check()?;
-
-    let record_credential = check_config.record.credential.clone();
-    let client = BiliClient::from_optional_cookie_file(
-        record_credential
-            .as_ref()
-            .map(|credential| credential.cookie_file()),
-    )?;
-    let room_id = bilibili::room::resolve_room_id(&client, room_url).await?;
-
-    let room_info = bilibili::room::fetch_room_info(&client, room_id).await?;
-    if !room_info.live_status.is_live() {
-        println!("offline");
-        println!("room_id = {}", room_info.room_id);
-        println!("title = {}", room_info.title);
-        return Ok(());
-    }
-
-    let play_info_resp =
-        bilibili::stream::fetch_play_info(&client, room_info.room_id, check_config.record.qn)
-            .await?;
-    let candidates = bilibili::stream::parse_stream_candidates(&play_info_resp)?;
-    let candidate = bilibili::stream::select_healthy_stream_candidate(
-        &candidates,
-        &check_config.record,
-        &client,
-    )
-    .await?;
-
-    tracing::info!(
-        room_id = room_info.room_id,
-        url = candidate.url.as_str(),
-        "selected stream candidate"
-    );
-
-    // Persist truth before risk: create the LiveSession row before we open
-    // the network stream. If the process dies mid-record, `state inspect`
-    // can still see the session and its segments.
-    let db_path = check_config.data.dir.join("state.redb");
-    let store = Arc::new(bilive_rec::state::store::StateStore::open(&db_path)?);
-
-    let session_id = Uuid::new_v4();
-    let live_session = LiveSession {
-        id: session_id,
-        room_key: room_info.room_id.to_string(),
-        title: room_info.title.clone(),
-        started_at: jiff::Timestamp::now(),
-        status: SessionStatus::Recording,
-        record_credential,
-        upload_credential: None,
-    };
-    store.put_session(&live_session)?;
-    println!("session_id = {session_id}");
-
-    let policy = RecorderPolicy {
-        layout: SegmentLayout {
-            output_dir: check_config.record.output_dir.clone(),
-        },
-        segment: SegmentPolicy {
-            segment_time: check_config.record.segment_time,
-            segment_size: check_config.record.segment_size,
-        },
-        filter: SegmentFilter {
-            min_segment_size: check_config.record.min_segment_size,
-        },
-    };
-
-    let resp = client
-        .stream_client()
-        .get(&candidate.url)
-        .header("User-Agent", "Mozilla/5.0")
-        .header("Referer", "https://live.bilibili.com/")
-        .send()
-        .await?;
-
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SegmentEvent>();
-    let event_drain = tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                SegmentEvent::Started {
-                    index, part_path, ..
-                } => {
-                    println!("started segment {index} at {}", part_path.display());
-                }
-                SegmentEvent::Finalized {
-                    index,
-                    path,
-                    size,
-                    close_reason,
-                    ..
-                } => {
-                    println!(
-                        "finalized segment {index} ({size} bytes, reason={close_reason}) at {}",
-                        path.display()
-                    );
-                }
-                SegmentEvent::Filtered {
-                    index,
-                    size,
-                    close_reason,
-                    ..
-                } => {
-                    println!(
-                        "filtered segment {index} (too small: {size} bytes, reason={close_reason})"
-                    );
-                }
-            }
-        }
-    });
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    // Forward the first Ctrl-C into the shared shutdown channel. We don't
-    // spawn the recorder itself in a task because record_flv takes
-    // &StateStore (no Arc), which can't live on a 'static future.
-    let shutdown_tx_clone = shutdown_tx.clone();
-    let signal_task = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("Ctrl-C received; signaling graceful shutdown");
-            let _ = shutdown_tx_clone.send(true);
-        }
-    });
-
-    let record_result = record_flv(
-        resp,
-        session_id,
-        policy,
-        store.as_ref(),
-        Some(event_tx),
-        1,
-        shutdown_rx,
-    )
-    .await;
-
-    signal_task.abort();
-    let _ = event_drain.await;
-
-    // Persist session status reflecting the outcome.
-    let session_status = match &record_result {
-        Ok(()) | Err(bilive_rec::error::AppError::GracefulShutdown) => SessionStatus::Finalized,
-        Err(_) => SessionStatus::Failed,
-    };
-    let mut updated = live_session;
-    updated.status = session_status;
-    store.put_session(&updated)?;
-
-    match record_result {
-        Ok(()) => {
-            println!("recording complete");
-            Ok(())
-        }
-        Err(bilive_rec::error::AppError::GracefulShutdown) => {
-            println!("recording interrupted by Ctrl-C; session marked Finalized");
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
-async fn upload_cmd(
-    files: Vec<std::path::PathBuf>,
-    title: Option<String>,
-    config_path: Option<&std::path::Path>,
-) -> AppResult<()> {
-    use bilive_rec::state::model::{Submission, SubmissionStatus};
-    use bilive_rec::state::store::StateStore;
-    use bilive_rec::uploader::biliup_adapter::BiliupUploader;
-    use bilive_rec::uploader::types::{
-        SubmissionOutcome, SubmissionRequest, UploadRequest, Uploader,
-    };
-    use uuid::Uuid;
-
-    let config = match config_path {
-        None => {
-            let default_path = std::path::Path::new("config.toml");
-            if default_path.exists() {
-                AppConfig::load(default_path)?
-            } else {
-                return Err(bilive_rec::error::AppError::Config(
-                    "No config file provided for upload command".into(),
-                ));
-            }
-        }
-        Some(path) => AppConfig::load(path)?,
-    };
-    let upload_command = config.resolve_for_upload()?;
-
-    if files.is_empty() {
-        return Err(bilive_rec::error::AppError::Config(
-            "No files provided for upload.".into(),
-        ));
-    }
-
-    for file in &files {
-        if !file.exists() {
-            return Err(bilive_rec::error::AppError::Config(format!(
-                "Upload file does not exist: {}",
-                file.display()
-            )));
-        }
-        if !file.is_file() {
-            return Err(bilive_rec::error::AppError::Config(format!(
-                "Upload path is not a regular file: {}",
-                file.display()
-            )));
-        }
-        if !file
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("flv"))
-        {
-            return Err(bilive_rec::error::AppError::Config(format!(
-                "Upload file is not a .flv: {}",
-                file.display()
-            )));
-        }
-    }
-
-    println!("Checking login...");
-    let uploader = BiliupUploader::new(
-        upload_command.upload.credential.cookie_file.clone(),
-        upload_command.upload.line.clone(),
-        upload_command.upload.threads,
-        upload_command.upload.submit_api.clone(),
-    );
-    uploader.check_login().await?;
-
-    // Open store
-    let db_path = upload_command.data.dir.join("state.redb");
-    let store = StateStore::open(&db_path)?;
-
-    let session_id = Uuid::new_v4();
-    println!("Session ID: {}", session_id);
-    let mut uploaded_parts = Vec::new();
-
-    let display_title = title.unwrap_or_else(|| {
-        files
-            .first()
-            .and_then(|p| p.file_stem())
-            .and_then(|s| s.to_str())
-            .unwrap_or("Untitled")
-            .to_string()
-    });
-
-    for (index, file) in files.into_iter().enumerate() {
-        println!("Uploading: {}", file.display());
-        let part_title = if index == 0 {
-            display_title.clone()
-        } else {
-            format!("{} P{}", display_title, index + 1)
-        };
-
-        let req = UploadRequest {
-            session_id,
-            segment_index: index as u32,
-            path: file,
-            part_title,
-        };
-
-        let part = uploader.upload_segment(req).await?;
-        println!("Uploaded part: {}", part.bili_filename);
-        store.put_uploaded_part(&part)?;
-        uploaded_parts.push(part);
-    }
-
-    println!("Submitting...");
-    let submit = upload_command.submit;
-    let submit_req = SubmissionRequest {
-        title: display_title,
-        description: String::new(),
-        category_id: submit.category_id,
-        copyright: submit.copyright,
-        tags: submit.tags,
-        source: submit.source,
-        private: submit.private,
-        dynamic: submit.dynamic,
-        forbid_reprint: submit.forbid_reprint,
-        charging_panel: submit.charging_panel,
-        close_reply: submit.close_reply,
-        close_danmu: submit.close_danmu,
-        featured_reply: submit.featured_reply,
-        parts: uploaded_parts,
-    };
-
-    let mut submission = Submission {
-        session_id,
-        upload_credential: upload_command.upload.credential,
-        status: SubmissionStatus::Pending,
-        aid: None,
-        bvid: None,
-        error: None,
-    };
-    store.put_submission(&submission)?;
-
-    let res = uploader.submit(submit_req).await;
-    match res {
-        Ok(SubmissionOutcome::Confirmed { aid, bvid }) => {
-            submission.status = SubmissionStatus::Submitted;
-            submission.aid = aid;
-            submission.bvid = bvid.clone();
-            store.put_submission(&submission)?;
-
-            println!("Submission complete!");
-            if let Some(ref b) = bvid {
-                println!("BVID: {}", b);
-            }
-            if let Some(a) = aid {
-                println!("AID: {}", a);
-            }
-        }
-        Ok(SubmissionOutcome::Ambiguous { reason }) => {
-            submission.status = SubmissionStatus::Ambiguous;
-            submission.error = Some(reason.clone());
-            store.put_submission(&submission)?;
-
-            println!("Submission accepted but outcome is AMBIGUOUS.");
-            println!("Bilibili did not return aid/bvid; verify on Bilibili and");
-            println!(
-                "resolve via: bilive-rec state resolve-submission {} --as submitted|failed",
-                session_id
-            );
-            println!("Reason: {}", reason);
-            return Err(bilive_rec::error::AppError::Bilibili(format!(
-                "submission ambiguous: {reason}"
-            )));
-        }
-        Err(e) => {
-            submission.status = SubmissionStatus::Failed;
-            submission.error = Some(e.to_string());
-            store.put_submission(&submission)?;
-            return Err(e);
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,8 +1024,50 @@ mod tests {
         let res = run_cmd(temp_file.path()).await;
         assert!(res.is_err());
         if let Err(e) = res {
-            assert!(matches!(e, bilive_rec::error::AppError::Config(_)));
+            assert!(matches!(e, bilive_rec::error::AppError::State(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn zero_room_run_marks_an_owned_session_for_recovery_before_reporting_idle() {
+        use bilive_rec::state::model::{LiveSession, OutputPlan, RecordingPlan, SessionLifecycle};
+        use std::io::Write;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let mut config = std::fs::File::create(&config_path).unwrap();
+        writeln!(config, "[data]\ndir = 'data'").unwrap();
+        let state_path = dir.path().join("data/state.redb");
+        let store = StateStore::create_or_open(&state_path).unwrap();
+        let session = LiveSession {
+            id: uuid::Uuid::new_v4(),
+            room_id: 1,
+            room_name: "removed".into(),
+            title: "live".into(),
+            started_at: jiff::Timestamp::now(),
+            lifecycle: SessionLifecycle::Open,
+            recording_plan: RecordingPlan {
+                credential: None,
+                output_dir: dir.path().join("recordings"),
+                segment_time_ms: None,
+                segment_size: None,
+                min_segment_size: 0,
+                qn: 10_000,
+                cdn: Vec::new(),
+            },
+            output_plan: OutputPlan::LocalOnly,
+            recording_events: Vec::new(),
+        };
+        bilive_rec::state::transitions::create_session(&store, &session).unwrap();
+        drop(store);
+
+        let error = run_cmd(&config_path).await.unwrap_err();
+        assert!(error.to_string().contains("no configured rooms"));
+        let store = StateStore::open_existing(&state_path).unwrap();
+        assert!(matches!(
+            store.get_session(session.id).unwrap().unwrap().lifecycle,
+            SessionLifecycle::RecoveryRequired { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1271,7 +1139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_run_task_result_room_error_is_not_global_failure() {
+    async fn test_process_run_task_result_state_error_is_global_failure() {
         let handle = tokio::spawn(async {
             RunTaskResult::Room(Err(bilive_rec::error::AppError::State(
                 "room failed".into(),
@@ -1281,9 +1149,40 @@ mod tests {
         let outcome = process_run_task_result(handle.await);
 
         assert!(outcome.failed);
-        assert!(!outcome.global_failure);
+        assert!(outcome.global_failure);
         assert!(outcome.room_finished);
         assert!(!outcome.upload_worker_finished);
+    }
+
+    #[tokio::test]
+    async fn test_process_run_task_result_room_io_error_is_scoped() {
+        let handle = tokio::spawn(async {
+            RunTaskResult::Room(Err(bilive_rec::error::AppError::Io {
+                path: "/recordings/room.flv".into(),
+                source: std::io::Error::other("disk failure"),
+            }))
+        });
+
+        let outcome = process_run_task_result(handle.await);
+
+        assert!(outcome.failed);
+        assert!(!outcome.global_failure);
+        assert!(outcome.room_finished);
+    }
+
+    #[tokio::test]
+    async fn test_process_run_task_result_recovery_required_is_room_scoped() {
+        let handle = tokio::spawn(async {
+            RunTaskResult::Room(Err(bilive_rec::error::AppError::RecoveryRequired(
+                "operator decision needed".into(),
+            )))
+        });
+
+        let outcome = process_run_task_result(handle.await);
+
+        assert!(outcome.failed);
+        assert!(!outcome.global_failure);
+        assert!(outcome.room_finished);
     }
 
     #[tokio::test]
@@ -1302,6 +1201,38 @@ mod tests {
         assert!(outcome.upload_worker_finished);
     }
 
+    #[tokio::test]
+    async fn coordinator_drains_started_tasks_before_returning_a_fatal_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_completed = completed.clone();
+        let mut coordinator = RunTaskCoordinator::new(shutdown_tx);
+        coordinator.push(tokio::spawn(async move {
+            while !*shutdown_rx.borrow() {
+                shutdown_rx.changed().await.unwrap();
+            }
+            tokio::task::yield_now().await;
+            task_completed.store(true, Ordering::SeqCst);
+            RunTaskResult::UploadWorker(Ok(()))
+        }));
+
+        let result = coordinator
+            .finish(Err(bilive_rec::error::AppError::Config(
+                "fatal registry error".into(),
+            )))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(bilive_rec::error::AppError::Config(_))
+        ));
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(coordinator.is_empty());
+    }
+
     /// Smoke test: drain loop sees room task outcomes through the same enum the
     /// run loop uses, instead of preserving the pre-worker task shape.
     #[tokio::test]
@@ -1312,9 +1243,10 @@ mod tests {
             FuturesUnordered::new();
         handles.push(tokio::spawn(async { RunTaskResult::Room(Ok(())) }));
         handles.push(tokio::spawn(async {
-            RunTaskResult::Room(Err(bilive_rec::error::AppError::State(
-                "simulated room failure".into(),
-            )))
+            RunTaskResult::Room(Err(bilive_rec::error::AppError::Io {
+                path: "/recordings/room.flv".into(),
+                source: std::io::Error::other("simulated room failure"),
+            }))
         }));
         handles.push(tokio::spawn(async {
             RunTaskResult::Room(Err(bilive_rec::error::AppError::GracefulShutdown))

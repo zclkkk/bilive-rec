@@ -113,7 +113,9 @@ impl BiliClient {
             .await?
             .json()
             .await
-            .map_err(|e| AppError::Bilibili(format!("Failed to parse nav response: {e}")))?;
+            .map_err(|e| {
+                AppError::BilibiliResponse(format!("Failed to parse nav response: {e}"))
+            })?;
 
         let keys = parse_wbi_keys(&resp)?;
         self.wbi_cache.store(keys.clone()).await;
@@ -201,7 +203,7 @@ pub fn cookie_header_from_file(path: &Path) -> AppResult<String> {
 fn parse_wbi_keys(resp: &NavResponse) -> AppResult<WbiKeys> {
     let is_ok = resp.code == 0 || (resp.code == -101 && resp.message == "账号未登录");
     if !is_ok {
-        return Err(AppError::Bilibili(format!(
+        return Err(AppError::BilibiliResponse(format!(
             "nav API returned code {}: {}",
             resp.code, resp.message
         )));
@@ -210,20 +212,19 @@ fn parse_wbi_keys(resp: &NavResponse) -> AppResult<WbiKeys> {
     let data = resp
         .data
         .as_ref()
-        .ok_or_else(|| AppError::Bilibili("nav API returned empty data".to_string()))?;
-    let wbi_img = data
-        .wbi_img
-        .as_ref()
-        .ok_or_else(|| AppError::Bilibili("wbi_img is missing in nav response".to_string()))?;
+        .ok_or_else(|| AppError::BilibiliResponse("nav API returned empty data".to_string()))?;
+    let wbi_img = data.wbi_img.as_ref().ok_or_else(|| {
+        AppError::BilibiliResponse("wbi_img is missing in nav response".to_string())
+    })?;
 
     let img_key = extract_key(&wbi_img.img_url).ok_or_else(|| {
-        AppError::Bilibili(format!(
+        AppError::BilibiliResponse(format!(
             "failed to extract img_key from {}",
             wbi_img.img_url
         ))
     })?;
     let sub_key = extract_key(&wbi_img.sub_url).ok_or_else(|| {
-        AppError::Bilibili(format!(
+        AppError::BilibiliResponse(format!(
             "failed to extract sub_key from {}",
             wbi_img.sub_url
         ))
@@ -362,7 +363,9 @@ mod tests {
             data: None,
         };
 
-        let res = parse_wbi_keys(&resp);
-        assert!(res.is_err());
+        assert!(matches!(
+            parse_wbi_keys(&resp),
+            Err(AppError::BilibiliResponse(_))
+        ));
     }
 }

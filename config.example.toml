@@ -1,7 +1,12 @@
 [data]
+# Relative paths are resolved from this config file's locator directory,
+# not from the process working directory.
 dir = "./data"
 
 [credentials.main]
+# Upload credentials must be writable biliup LoginInfo JSON files because
+# biliup may refresh tokens in place. A credential used only by [record] may
+# alternatively contain a raw `name=value; ...` Cookie header.
 cookie_file = "./data/cookies.json"
 
 # Optional additional accounts can be named and reused by rooms.
@@ -24,19 +29,18 @@ qn = 10000
 # for example "cn-gotcha04". This is a preference order, not a whitelist:
 # unavailable or unhealthy candidates are skipped.
 cdn = []
-# Delete local .flv files after Bilibili returns a confirmed submission
-# (aid/bvid). This does not mean the video has passed Bilibili review.
-# Keep this false unless you accept that a later review rejection may leave
-# you without the local recording. Ambiguous or failed submissions are never
-# cleaned.
-delete_after_submit = false
-
 [upload]
 credential = "main"
 line = "auto"
 threads = 3
 # app, web, or bcut_android
 submit_api = "app"
+# Delete local .flv files after Bilibili returns a confirmed submission
+# (aid/bvid). This does not mean the video has passed Bilibili review.
+# Keep this false unless you accept that a later review rejection may leave
+# you without the local recording. Ambiguous or failed submissions are never
+# cleaned.
+delete_after_submit = false
 
 [submit]
 title = "{title} {started_at:%Y-%m-%d}"
@@ -45,7 +49,6 @@ category_id = 171
 copyright = "reprint"
 # Reprint source supports the same room placeholders as title/description.
 # If omitted in `run`, reprint submissions default to "{url}".
-# Manual `upload` has no room context and requires an explicit literal source.
 # source = "{url}"
 tags = ["直播录像"]
 private = false
@@ -70,11 +73,12 @@ url = "https://live.bilibili.com/123456"
 # credential = "captain"
 # qn = 10000
 # cdn = ["cn-gotcha04", "cn-gotcha01"]
-# delete_after_submit = true
 
 # Per-room upload override (optional). Missing fields inherit [upload].
 # [rooms.example.upload]
+# enabled = false  # keep this room local-only
 # credential = "alt_uploader"
+# delete_after_submit = true
 
 # Per-room submission metadata override (optional). Missing fields inherit [submit].
 # [rooms.example.submit]

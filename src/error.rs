@@ -31,11 +31,20 @@ pub enum AppError {
     #[error("state store error: {0}")]
     State(String),
 
+    #[error("recovery required: {0}")]
+    RecoveryRequired(String),
+
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
     #[error("bilibili error: {0}")]
     Bilibili(String),
+
+    /// A safe, pre-risk Bilibili response was transiently unavailable,
+    /// undecodable, or structurally incomplete. This is kept distinct from a
+    /// deterministic API rejection so retry policy stays explicit.
+    #[error("bilibili response error: {0}")]
+    BilibiliResponse(String),
 
     #[error("stream protocol error: {0}")]
     StreamProtocol(String),

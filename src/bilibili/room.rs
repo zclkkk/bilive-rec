@@ -3,7 +3,70 @@ use std::collections::HashMap;
 use crate::bilibili::client::BiliClient;
 use crate::bilibili::types::{BiliRoomInfo, LiveStatus, RoomInfoResponse};
 use crate::bilibili::wbi::{mix_wbi_keys, sign_wbi_query};
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
+
+/// Failure classification owned by the room lookup boundary.
+///
+/// Callers do not need to infer retry safety from a broad application error:
+/// transport/protocol failures and deterministic room/configuration failures
+/// are separated while the external response is still understood.
+#[derive(Debug, thiserror::Error)]
+pub enum RoomLookupError {
+    #[error("{source}")]
+    Retryable {
+        #[source]
+        source: AppError,
+    },
+    #[error("{source}")]
+    Fatal {
+        #[source]
+        source: AppError,
+    },
+}
+
+impl RoomLookupError {
+    fn retryable(source: AppError) -> Self {
+        Self::Retryable { source }
+    }
+
+    fn fatal(source: AppError) -> Self {
+        Self::Fatal { source }
+    }
+
+    fn transport(error: reqwest::Error) -> Self {
+        if error.is_builder() || error.is_redirect() {
+            Self::fatal(AppError::Network(error))
+        } else {
+            Self::retryable(AppError::Network(error))
+        }
+    }
+
+    fn wbi(error: AppError) -> Self {
+        match error {
+            AppError::Network(error) => Self::transport(error),
+            error @ AppError::BilibiliResponse(_) => Self::retryable(error),
+            error => Self::fatal(error),
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Retryable { .. })
+    }
+
+    pub fn into_app_error(self) -> AppError {
+        match self {
+            Self::Retryable { source } | Self::Fatal { source } => source,
+        }
+    }
+}
+
+impl From<RoomLookupError> for AppError {
+    fn from(error: RoomLookupError) -> Self {
+        error.into_app_error()
+    }
+}
+
+pub type RoomLookupResult<T> = Result<T, RoomLookupError>;
 
 /// Extracts the numerical room ID from a raw input string or Bilibili URL.
 ///
@@ -60,7 +123,7 @@ pub fn is_b23_url(input: &str) -> bool {
 }
 
 /// Resolves a room ID from an input string, following b23.tv redirects if necessary.
-pub async fn resolve_room_id(_client: &BiliClient, input: &str) -> AppResult<u64> {
+pub async fn resolve_room_id(_client: &BiliClient, input: &str) -> RoomLookupResult<u64> {
     if let Some(id) = extract_room_id(input) {
         return Ok(id);
     }
@@ -78,39 +141,54 @@ pub async fn resolve_room_id(_client: &BiliClient, input: &str) -> AppResult<u64
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()
-            .map_err(|e| {
-                AppError::Bilibili(format!(
-                    "Failed to build transient client for b23.tv: {}",
-                    e
-                ))
-            })?;
+            .map_err(RoomLookupError::transport)?;
 
-        let resp =
-            transient_client.get(&url_str).send().await.map_err(|e| {
-                AppError::Bilibili(format!("Failed to resolve b23.tv redirect: {}", e))
-            })?;
+        let resp = transient_client
+            .get(&url_str)
+            .send()
+            .await
+            .map_err(RoomLookupError::transport)?;
+        validate_b23_status(resp.status(), &url_str)?;
 
         let final_url = resp.url().as_str();
         if let Some(id) = extract_room_id(final_url) {
             return Ok(id);
         } else {
-            return Err(AppError::Bilibili(format!(
-                "b23.tv link resolved to non-live URL: {}",
-                final_url
-            )));
+            return Err(RoomLookupError::fatal(AppError::Config(format!(
+                "b23.tv link resolved to non-live URL: {final_url}"
+            ))));
         }
     }
 
-    Err(AppError::Config(format!(
+    Err(RoomLookupError::fatal(AppError::Config(format!(
         "Failed to extract room ID from '{}'. Not a valid live.bilibili.com or b23.tv URL.",
         input
-    )))
+    ))))
+}
+
+fn validate_b23_status(status: reqwest::StatusCode, url: &str) -> RoomLookupResult<()> {
+    if status.is_server_error() || matches!(status.as_u16(), 408 | 412 | 425 | 429) {
+        return Err(RoomLookupError::retryable(AppError::BilibiliResponse(
+            format!("b23.tv returned retryable HTTP {status} for {url}"),
+        )));
+    }
+    if !status.is_success() {
+        return Err(RoomLookupError::fatal(AppError::Config(format!(
+            "b23.tv link {url} returned permanent HTTP {status}"
+        ))));
+    }
+    Ok(())
 }
 
 /// Fetches room details using `/xlive/web-room/v1/index/getInfoByRoom`.
-pub async fn fetch_room_info(client: &BiliClient, room_id: u64) -> AppResult<BiliRoomInfo> {
-    let keys = client.fetch_wbi_keys().await?;
-    let mixed_key = mix_wbi_keys(&keys.img_key, &keys.sub_key)?;
+pub async fn fetch_room_info(client: &BiliClient, room_id: u64) -> RoomLookupResult<BiliRoomInfo> {
+    let keys = client
+        .fetch_wbi_keys()
+        .await
+        .map_err(RoomLookupError::wbi)?;
+    let mixed_key = mix_wbi_keys(&keys.img_key, &keys.sub_key).map_err(|error| {
+        RoomLookupError::retryable(AppError::BilibiliResponse(error.to_string()))
+    })?;
     let params = build_room_info_params(room_id, &mixed_key, current_unix_timestamp());
 
     let resp: RoomInfoResponse = client
@@ -119,10 +197,15 @@ pub async fn fetch_room_info(client: &BiliClient, room_id: u64) -> AppResult<Bil
         .query(&params)
         .header("Referer", "https://live.bilibili.com")
         .send()
-        .await?
+        .await
+        .map_err(RoomLookupError::transport)?
         .json()
         .await
-        .map_err(|e| AppError::Bilibili(format!("Failed to parse getInfoByRoom response: {e}")))?;
+        .map_err(|e| {
+            RoomLookupError::retryable(AppError::BilibiliResponse(format!(
+                "Failed to parse getInfoByRoom response: {e}"
+            )))
+        })?;
 
     parse_room_info(&resp)
 }
@@ -146,18 +229,27 @@ fn build_room_info_params(
 }
 
 /// Converts a RoomInfoResponse to BiliRoomInfo domain object and handles error cases.
-fn parse_room_info(resp: &RoomInfoResponse) -> AppResult<BiliRoomInfo> {
-    if resp.code != 0 {
-        return Err(AppError::Bilibili(format!(
+fn parse_room_info(resp: &RoomInfoResponse) -> RoomLookupResult<BiliRoomInfo> {
+    if resp.code == -400 {
+        return Err(RoomLookupError::fatal(AppError::Config(format!(
             "getInfoByRoom API returned code {}: {}",
             resp.code, resp.message
+        ))));
+    }
+    if resp.code != 0 {
+        return Err(RoomLookupError::retryable(AppError::BilibiliResponse(
+            format!(
+                "getInfoByRoom API returned unknown code {}: {}",
+                resp.code, resp.message
+            ),
         )));
     }
 
-    let data = resp
-        .data
-        .as_ref()
-        .ok_or_else(|| AppError::Bilibili("getInfoByRoom API returned empty data".to_string()))?;
+    let data = resp.data.as_ref().ok_or_else(|| {
+        RoomLookupError::retryable(AppError::BilibiliResponse(
+            "getInfoByRoom API returned empty data".to_string(),
+        ))
+    })?;
 
     let detail = &data.room_info;
     let live_start_time = if detail.live_start_time <= 0 {
@@ -166,11 +258,19 @@ fn parse_room_info(resp: &RoomInfoResponse) -> AppResult<BiliRoomInfo> {
         Some(detail.live_start_time)
     };
 
+    let live_status = LiveStatus::from_i32(detail.live_status);
+    if let LiveStatus::Unknown(code) = live_status {
+        return Err(RoomLookupError::fatal(AppError::Bilibili(format!(
+            "getInfoByRoom returned unknown live_status {code} for room {}",
+            detail.room_id
+        ))));
+    }
+
     Ok(BiliRoomInfo {
         room_id: detail.room_id,
         short_id: detail.short_id,
         uid: detail.uid,
-        live_status: LiveStatus::from_i32(detail.live_status),
+        live_status,
         title: detail.title.clone(),
         cover_url: detail.cover.clone(),
         live_start_time,
@@ -233,6 +333,23 @@ mod tests {
         assert!(!is_b23_url("https://live.bilibili.com/123456"));
         assert!(!is_b23_url("google.com/b23.tv"));
         assert!(!is_b23_url("123456"));
+    }
+
+    #[test]
+    fn b23_status_distinguishes_retryable_service_failure_from_bad_link() {
+        assert!(matches!(
+            validate_b23_status(reqwest::StatusCode::BAD_GATEWAY, "https://b23.tv/test"),
+            Err(RoomLookupError::Retryable {
+                source: AppError::BilibiliResponse(_)
+            })
+        ));
+        assert!(matches!(
+            validate_b23_status(reqwest::StatusCode::NOT_FOUND, "https://b23.tv/test"),
+            Err(RoomLookupError::Fatal {
+                source: AppError::Config(_)
+            })
+        ));
+        assert!(validate_b23_status(reqwest::StatusCode::OK, "https://b23.tv/test").is_ok());
     }
 
     #[test]
@@ -321,9 +438,62 @@ mod tests {
         }"#;
 
         let resp: RoomInfoResponse = serde_json::from_str(json_data).unwrap();
-        let res = parse_room_info(&resp);
-        assert!(res.is_err());
-        let err_msg = res.unwrap_err().to_string();
+        let error = parse_room_info(&resp).unwrap_err();
+        assert!(!error.is_retryable());
+        assert!(matches!(
+            &error,
+            RoomLookupError::Fatal {
+                source: AppError::Config(_)
+            }
+        ));
+        let err_msg = error.to_string();
         assert!(err_msg.contains("getInfoByRoom API returned code -400"));
+    }
+
+    #[test]
+    fn transient_room_api_and_protocol_failures_are_retryable() {
+        let service_failure: RoomInfoResponse = serde_json::from_value(serde_json::json!({
+            "code": -500,
+            "message": "temporary service failure",
+            "data": null
+        }))
+        .unwrap();
+        assert!(
+            parse_room_info(&service_failure)
+                .unwrap_err()
+                .is_retryable()
+        );
+
+        let missing_data: RoomInfoResponse = serde_json::from_value(serde_json::json!({
+            "code": 0,
+            "message": "ok",
+            "data": null
+        }))
+        .unwrap();
+        assert!(parse_room_info(&missing_data).unwrap_err().is_retryable());
+    }
+
+    #[test]
+    fn test_parse_room_info_rejects_unknown_live_status() {
+        let json_data = r#"{
+            "code": 0,
+            "message": "0",
+            "data": {
+                "room_info": {
+                    "room_id": 456,
+                    "short_id": 0,
+                    "uid": 9999,
+                    "live_status": 99,
+                    "title": "unknown",
+                    "cover": ""
+                }
+            }
+        }"#;
+        let resp: RoomInfoResponse = serde_json::from_str(json_data).unwrap();
+
+        let error = parse_room_info(&resp).unwrap_err();
+
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("unknown live_status 99"));
     }
 }

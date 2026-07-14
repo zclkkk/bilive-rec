@@ -14,8 +14,7 @@ pub use raw::{
     RoomRecordConfig, RoomSubmitConfig, RoomUploadConfig, SubmitApi, SubmitConfig, UploadConfig,
 };
 pub use resolved::{
-    CheckConfig, ResolvedRecordConfig, ResolvedRoomConfig, ResolvedRoomUploadConfig,
-    ResolvedSubmitConfig, ResolvedUploadConfig, RoomCredentials, RunConfig, UploadCommandConfig,
-    UploadRecoveryConfig, UploadTransportConfig,
+    CheckConfig, ResolvedRecordConfig, ResolvedRoomConfig, ResolvedRoomOutput,
+    ResolvedRoomUploadConfig, ResolvedSubmitConfig, RoomCredentials, RunConfig,
 };
 pub use validation::{ConfigValueError, parse_hms_duration, parse_size_bytes};

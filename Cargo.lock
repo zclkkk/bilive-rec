@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "bilive-rec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "biliup",
  "clap",
@@ -191,8 +191,10 @@ dependencies = [
  "md5",
  "redb",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

@@ -5,7 +5,7 @@
 从源码编译：
 
 ```bash
-git clone https://github.com/your-org/bilive-rec.git
+git clone https://github.com/zclkkk/bilive-rec.git
 cd bilive-rec
 cargo build --release
 ```
@@ -20,7 +20,14 @@ cargo build --release
 cp config.example.toml config.toml
 ```
 
-`run` 的最小配置需要一个上传账号和一个房间：
+只录制的最小配置只需要一个房间：
+
+```toml
+[rooms.example]
+url = "https://live.bilibili.com/123456"
+```
+
+需要自动上传时增加上传账号和 `[upload]`：
 
 ```toml
 [credentials.main]
@@ -33,12 +40,13 @@ credential = "main"
 url = "https://live.bilibili.com/123456"
 ```
 
-其余配置项均有默认值，详见 [配置详解](configuration.md)。`check` 和
-`record` 可以不配置 `[upload]`，它们只使用录制相关配置。
+其余配置项均有默认值，详见 [配置详解](configuration.md)。没有 `[upload]`
+时，`run` 仍使用完整的持久化录制和崩溃恢复流程，但不会上传或投稿。
 
 ## 准备 Cookie
 
-录制和上传需要 Bilibili 登录 Cookie：
+上传需要 Bilibili 登录 Cookie。匿名可访问的直播流可以不带 Cookie 录制；
+需要登录画质时可单独配置录制账号。
 
 1. 在浏览器中登录 [bilibili.com](https://www.bilibili.com)
 2. 导出 Cookie 为 JSON 格式，保存到 `data/cookies.json`

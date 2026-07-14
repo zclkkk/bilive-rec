@@ -1,198 +1,173 @@
 # Architecture
 
-> 面向贡献者和 AI agent 的内部架构文档。用户文档参阅 [How It Works](../guide/how-it-works.md)。
+> 面向贡献者和 AI agent。设计约束以仓库根目录 `AGENTS.md` 为准。
 
----
+## 边界与所有权
 
-## 模块结构
-
-```
+```text
 src/
-├── main.rs              # 入口，CLI 分发，优雅退出
-├── cli.rs               # Clap CLI 定义
-├── credential.rs        # CredentialIdentity（凭据标识）
-├── error.rs             # AppError 枚举，AppResult 类型别名
-├── submission_template.rs # 标题/简介模板渲染
-├── config/              # 配置解析与校验
-│   ├── raw.rs           # TOML 反序列化结构体（deny_unknown_fields）
-│   ├── resolved.rs      # 运行时解析后的配置类型
-│   ├── defaults.rs      # 默认值
-│   └── validation.rs    # 时长/大小解析
-├── bilibili/            # B 站 API 客户端
-│   ├── client.rs        # HTTP 客户端，WBI key 缓存
-│   ├── room.rs          # 房间 ID 解析，房间信息获取
-│   ├── stream.rs        # PlayInfo 获取，流候选排序，CDN 健康检查
-│   ├── cdn.rs           # CDN 健康探测
-│   ├── wbi.rs           # WBI 签名
-│   └── types.rs         # API 响应类型
-├── pipeline/            # 房间状态机与录制协调器
-│   ├── state_machine.rs # RoomState 枚举，can_transition_to()
-│   ├── session.rs       # RoomStateMachine（状态机包装）
-│   └── supervisor.rs    # RoomSupervisor（房间生命周期管理）
-├── recorder/            # FLV 录制引擎
-│   ├── mod.rs           # FlvRecorder，record_flv() 核心循环
-│   ├── flv.rs           # FLV 标签/头部解析与写入
-│   ├── flv_pipeline.rs  # FlvNormalizer，MediaGroupBuffer
-│   ├── flv_metadata.rs  # FLV 元数据重写
-│   └── segment.rs       # 分段策略，路径辅助，事件类型
-├── state/               # 持久化状态中心
-│   ├── model.rs         # 数据模型：LiveSession，Segment，Submission 等
-│   ├── store.rs         # StateStore（redb 封装）
-│   └── recovery.rs      # 崩溃恢复：异常检测 → 计划生成 → 执行
-└── uploader/            # 上传与投稿
-    ├── types.rs         # Uploader trait，UploadRequest，SubmissionRequest
-    ├── biliup_adapter.rs # BiliupUploader（biliup crate 适配）
-    ├── validation.rs    # 上传对账，分段校验
-    └── worker.rs        # UploadWorker（从 redb 推导上传/投稿任务）
+├── main.rs                    CLI 分发、bootstrap、任务协调与停机
+├── config/                    严格 TOML 边界与 resolved config
+├── bilibili/                  房间、直播流、WBI 与 B 站响应边界
+├── pipeline/
+│   ├── bootstrap.rs           全量 canonicalize、去重、owner 对账
+│   ├── state_machine.rs       仅进程内的瞬时 RoomState
+│   └── supervisor.rs          单房间网络与录制控制流
+├── recorder/
+│   ├── artifact_commit.rs     rename/remove/delete 的唯一提交与恢复协议
+│   └── ...                    FLV 解析、规范化、分段
+├── state/
+│   ├── model.rs               持久化领域聚合
+│   ├── store.rs               redb codec 与受限事务原语
+│   ├── transitions.rs         所有领域状态变化的唯一入口
+│   ├── inspection.rs          一致的只读诊断投影
+│   └── recovery.rs            需要操作者确认的事实裁决
+└── uploader/
+    ├── types.rs               远端 boundary outcome
+    ├── biliup_adapter.rs      biliup 协议适配和错误分类
+    └── worker.rs              仅从 durable state 推导工作
 ```
 
----
+Supervisor 不直接写数据库，Recorder 不直接改 Segment，Worker 不重建或覆盖历史行。
+所有写操作进入 `state::transitions`，在一个 redb write transaction 中重新读取相关聚合并
+校验 expected state。raw `StoreTxn` 不对 state 模块外公开。
 
-## 错误分类体系
+单房间 I/O 故障或 `RecoveryRequired` 只结束该房间 task；其他房间继续运行。数据库、事务、
+状态不变量破坏和 upload worker 失败才触发全局停机。
 
-`AppError` 枚举（`error.rs`）是全项目统一的错误类型。错误在边界处按语义分类，由上下文决定是否重试。
+## Fresh Start schema
 
-### 错误变体
+状态库固定为 `data.dir/state.redb`，`format_id = "bilive-rec-state"`，schema 2。
+0.2.x 是 Fresh Start：没有迁移器、字段 fallback、serde alias 或旧状态测试。
 
-| 变体 | 来源 | 语义 |
-|------|------|------|
-| `Io { path, source }` | 文件系统 | IO 错误，携带路径上下文 |
-| `Config(String)` | 配置解析 | 配置错误 |
-| `Database/Table/Transaction/Storage/Commit` | redb | 数据库各层错误 |
-| `State(String)` | 内部逻辑 | 状态不变量违反 |
-| `Network(reqwest::Error)` | HTTP 层 | 网络连接错误（send 失败） |
-| `Bilibili(String)` | B 站 API | API 响应异常（code≠0、json 解析失败等） |
-| `StreamProtocol(String)` | FLV 流 | 流协议格式错误（FLV 解析、AVC 格式等） |
-| `StreamRepeatedData(String)` | FLV 流 | 重复媒体数据，指示需要重连 |
-| `GracefulShutdown` | 信号 | 优雅关闭 |
+| 表 | Key | Value |
+|---|---|---|
+| `meta` | string | format identity 与 schema version |
+| `sessions` | UUID | `LiveSession`，包含冻结的录制与输出计划 |
+| `segments` | `{uuid}:{index:010}` | `Segment`，包含 artifact、上传 proof 和完整历史 |
+| `submissions` | UUID | `Submission` 尝试、结果与人工裁决历史 |
+| `room_states` | canonical room ID | `RoomState` |
+| `upload_target_states` | serialized target | 跨重启 target backoff / blocked gate；非 Ready gate 携带具体 remote attempt owner |
 
-### 上下文局部分类
+`run` 对已有状态使用 `StateStore::open_existing`，仅在存在当前房间的首次启动中创建新库；`status` 与 `recover` 只能使用 `StateStore::open_existing`。给错 `data.dir` 时必须报错，不能生成一个看似正常的空库。
 
-错误的重试/致命分类不是全局的，而是由调用上下文决定。`recording_retry_reason()` 函数（`supervisor.rs`）为录制上下文定义分类：
+## Session 聚合
 
-- **可重试**：`Network`、`Bilibili`、`StreamProtocol`、`StreamRepeatedData` → 持久化错误信息，进入 `WaitingReconnect`
-- **致命**：`Io`、`Config`、`Database`、`Table`、`Transaction`、`Storage`、`Commit`、`State`、`GracefulShutdown` → 终止当前房间
+每个 Session 冻结完整的 `RecordingPlan` 和 `OutputPlan`。恢复旧 Session 时使用其历史
+credential、output directory、分段阈值、清晰度、CDN、上传 principal/target 和投稿内容；上传 principal 包含配置时读取的非零 `expected_mid`。每次上传或投稿都重新登录并用 Bilibili 认证响应核对真实 mid；当前配置只
+影响未来 Session。
 
-其他上下文（上传、投稿）有自己的错误处理逻辑，不复用此函数。
-
----
-
-## 持久化设计
-
-### redb 表结构
-
-| 表 | Key | Value | 用途 |
-|----|-----|-------|------|
-| `meta` | `&str` | `&[u8]` | schema_version |
-| `sessions` | UUID 字符串 | JSON `LiveSession` | 直播会话 |
-| `segments` | `{uuid}:{index:010}` | JSON `Segment` | 录制分段 |
-| `uploaded_parts` | `{uuid}:{index:010}` | JSON `UploadedPart` | 已上传分段 |
-| `submissions` | UUID 字符串 | JSON `Submission` | 投稿记录 |
-| `submission_plans` | UUID 字符串 | JSON `SubmissionPlan` | session 创建时冻结的投稿计划 |
-| `room_states` | `u64` (room_id) | JSON `PersistedRoomState` | 房间录制状态 |
-
-### 事务性写入
-
-`StateStore::write()` 在单个 redb 事务中执行闭包内的所有写入。原子写入的关键场景：
-
-- `create_recording_session()`：`LiveSession`、`SubmissionPlan` 和 `RoomState::Recording` 同时写入
-- `finalize_session_and_release_room()`：`LiveSession::Finalized` 和 `RoomState::Idle` 同时写入
-- 分段 finalize：rename `.part` → `.flv` 后立即更新 DB 状态；rename 失败时回滚
-
-### PersistedRoomState
-
-```rust
-struct PersistedRoomState {
-    state: RoomState,
-    active_session_id: Option<Uuid>,
-    last_error: Option<String>,        // 最近一次暂时性错误
-    last_error_at: Option<Timestamp>,  // 错误发生时间
-}
+```text
+SessionLifecycle
+├── Open
+├── RecoveryRequired { reason, detected_at }
+└── Closed
+    ├── Completed
+    ├── NoUsableRecording
+    └── Abandoned
 ```
 
-`last_error` 在暂时性错误时持久化（如网络断开、流异常），在成功状态转换时清除。`state inspect` 命令会显示该字段。
+房间 durable lifecycle 只有 `Ready / Owned(session) / Blocked(session)`。`Blocked` 必须指向
+一个真实 Session，不存在没有 owner 的泛化 Failed 状态。
 
-### SubmissionPlan
+`close_session` 是唯一关门入口：
 
-`SubmissionPlan` 在 session 创建时写入，用来冻结本次投稿的标题、简介、分区、tag、投稿身份、提交接口和清理策略。上传 worker 后续只读取这个计划，不从当前配置重新推导历史 session 的投稿事实。
+- `Writing / Finalizing / Discarding / Deleting` 表示仍有未对账的本地 intent，Session 进入
+  `RecoveryRequired`；
+- 任一 `Failed` artifact 令 Session 进入 `RecoveryRequired`；
+- 没有可用 Segment（包括全部被过滤）得到 `NoUsableRecording`，不会创建失败投稿；
+- 有可用 Segment 才得到 `Completed`；
+- 所有判断、Session 更新和房间 release/block 在同一事务内完成。
 
----
+## Artifact 文件事务
 
-## FLV 录制引擎
+Artifact state 自己携带 close reason 或 failure reason，不再依赖可产生无效组合的顶层
+`Segment.error` / `close_reason`。
 
-### FlvRecorder
+```text
+Writing
+  ├─> Finalizing(close_reason) -> Ready(close_reason)
+  ├─> Discarding(close_reason) -> Filtered(close_reason)
+  └─> Failed(reason)
 
-两阶段运行：
-
-1. **WaitSync**：缓存 FLV 标签直到元数据、AVC 序列头、AAC 序列头、第一个关键帧全部到齐
-2. **Recording**：写入分段文件
-
-关键设计：
-- `push_chunk()` 使用 `read_pos` 前缀推进而非逐标签 drain，避免 O(n²)
-- `open_new_segment()` 先写 DB 再创建文件（persist truth before risk）
-- `finalize_current_segment()` rename 失败时回滚并持久化 Failed 状态
-
-### FlvNormalizer
-
-- 缓存序列头，检测序列头变更（触发分段轮转）
-- 跨 CDN 切换的时间戳规范化（WaitSync 重基）
-- AVC filler NALU 清理
-- 重复媒体组检测（指纹哈希，阈值触发重连）
-
-### MediaGroupBuffer
-
-媒体标签按关键帧边界分组。每组计算指纹哈希，与前一组比较。连续重复组超过阈值（`DUPLICATE_RECONNECT_THRESHOLD`）时返回 `Duplicate`，触发 `StreamRepeatedData` 错误和重连。
-
----
-
-## Uploader 设计
-
-上传和投稿不属于房间状态机。`RoomSupervisor` 只负责录制并把 session 标记为 `Finalized`；`UploadWorker` 扫描 redb，从 `Segment`、`UploadedPart`、`SubmissionPlan` 和 `Submission` 推导下一步动作。
-
-### Uploader trait
-
-```rust
-trait Uploader {
-    async fn check_login(&self) -> AppResult<()>;
-    async fn upload_segment(&self, req: UploadRequest) -> AppResult<UploadedPart>;
-    async fn submit(&self, req: SubmissionRequest) -> AppResult<SubmissionOutcome>;
-}
+Ready -> Deleting -> Deleted
 ```
 
-### SubmissionOutcome
+保留文件：
 
-```rust
-enum SubmissionOutcome {
-    Confirmed { aid: Option<u64>, bvid: Option<String> },
-    Ambiguous { reason: String },
-}
+```text
+create_new(part) -> rewrite metadata -> flush -> file sync_all
+-> persist Finalizing -> atomic no-replace rename -> parent directory sync_all -> persist Ready
 ```
 
-`Ambiguous` 处理 B 站 API 返回 HTTP 200 + code=0 但不返回 aid/bvid 的情况。不自动重试，交由人工确认。
+过滤文件：
 
-### 上传对账
+```text
+flush -> file sync_all
+-> persist Discarding -> remove -> parent directory sync_all -> persist Filtered
+```
 
-`reconcile_session_uploads()` 比较 Segment 状态和 UploadedPart 记录，生成：
-- `needs_upload`：Finalized 但无 UploadedPart 的分段
-- `blocked`：Recording/Uploading/Failed 等不能自动处理的分段
-- `ready`：所有分段已满足上传条件
+投稿后清理：
 
----
+```text
+persist Deleting -> remove -> parent directory sync_all -> persist Deleted
+```
 
-## Recovery 设计
+Recorder、Worker 和启动恢复共用 `artifact_commit`，不重复实现文件矩阵。part 使用
+`create_new`，final commit 使用操作系统的 no-replace rename，因此既不复用旧 part，也不
+覆盖已有 final。part 与 final 同时存在，或 discard intent 意外遇到 final 时，没有唯一
+安全答案，必须通过
+`recover segment --keep-part | --keep-final | --exclude` 记录操作者决定。
 
-### 三阶段架构
+## 上传与投稿边界
 
-1. **`detect_anomalies(store)`**：只读扫描，返回 `Vec<Anomaly>`
-2. **`plan_recovery(store, flags)`**：基于异常和用户标志生成 `RecoveryPlan`
-3. **`apply_recovery(store, plan, uploader)`**：幂等执行恢复计划
+远端调用只有四类结果：
 
-`RecoveryContext` 结构体共享数据加载和 lookup 构建，避免 `detect_anomalies` 和 `plan_recovery` 之间的代码重复。
+- `Confirmed`：有 durable proof；
+- `RetryableKnownFailure`：确定未越过接受边界，可以按持久化 `retry_at` 自动重试；
+- `BlockedKnownFailure`：明确失败但需要修正文件、配置、Cookie 或远端拒绝原因，不轮询重试；
+- `Ambiguous`：B 站可能已接受，禁止自动重试。
 
-### 幂等性
+上传 proof 内嵌在 `UploadState::Uploaded`，不再存在第二张 `uploaded_parts` 真相表。Segment
+分别保存 append-only attempt history 和 operator resolution history。投稿同理；不存在
+Submission row 表示尚未跨越风险边界，而不是一种伪 Pending 状态。
 
-每个恢复动作在执行前重新验证前提条件。如果状态已变化（如 Segment 已从 Recording 变为 Failed），动作被跳过而非报错。
+安全的瞬时失败使用指数退避。target scope 的失败同时更新带 attempt owner 的持久化 target gate，防止一份坏 Cookie 或上传线路在所有 Segment 上放大。普通 item 结果不写共享 gate；只有 owner 对应的显式恢复可以清除 Blocked gate。Abandon 也不能用“放弃 Session”冒充“target 已修复”。
 
-### 投稿边界
+Worker gating：
 
-`plan_recovery` 拒绝对已有 Submission 记录的 Session 执行上传恢复——必须先通过 `state resolve-submission` 确认投稿状态。
+- `Open` 与 `Closed(Completed)` 可继续上传；
+- 只有 `Closed(Completed)` 可投稿；
+- `RecoveryRequired` 冻结新远端动作；
+- `Abandoned / NoUsableRecording` 禁止新上传和投稿；
+- abandon 保留 Uploaded 和 Ambiguous，Attempting 先转为 Ambiguous，确定未产生远端对象的
+  Pending/Blocked 才转为 Cancelled。
+
+## Bootstrap 与恢复
+
+`run` 按 durable truth 与当前房间两个阶段启动：
+
+1. resolve 并严格校验全部配置；
+2. 若状态库存在，先从一个一致快照审计完整 Session/room ownership 图；硬冲突在任何写入前拒绝启动，可唯一认领的不一致被持久化为 `RecoveryRequired + Blocked`；
+3. 重放 artifact 与中断的远端 attempt，并从持久化 Session 派生上传、投稿和清理工作；
+4. upload worker 可在当前房间 registry 尚未完成时处理 Closed Session，Open Session 等待 registry 对账完成；
+5. 按 room name 排序并解析当前房间 canonical ID；临时网络错误按 backoff 重试，不阻断 durable work；
+6. 建立唯一 `canonical ID -> room config` registry，重复即整体失败；配置删除的 Open Session 进入恢复状态；
+7. 最后启动可运行房间的 supervisors。
+
+人工恢复命令只记录经操作者验证的事实：
+
+```text
+recover recording <sid> --finalize [--exclude-failed] | --abandon
+recover upload <sid> <index> --not-uploaded | --uploaded <filename>
+recover submission <sid> --not-submitted | --submitted (--aid ... | --bvid ...)
+recover segment <sid> <index> --keep-part | --keep-final | --exclude
+```
+
+每次裁决都 append 到 durable history；后续 attempt 不得覆盖它。
+
+## 完成标准
+
+修改状态或 I/O 代码时至少证明：风险动作前有 durable intent；崩溃后 state 与文件矩阵能
+解释发生了什么；未知远端结果不会降级为自动重试；所有异常都能由 `status --verbose`
+给出准确的下一步。happy path 通过不代表修改完成。

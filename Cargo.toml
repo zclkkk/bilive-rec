@@ -1,6 +1,6 @@
 [package]
 name = "bilive-rec"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Parity-7.0.0"
 
@@ -9,6 +9,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_urlencoded = "0.7"
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -21,5 +22,9 @@ md5 = "0.8"
 biliup = { git = "https://github.com/biliup/biliup.git", rev = "a529bbcbd2a3283efd9e2aeb204a32495391f702" }
 futures = "0.3.32"
 
+[target.'cfg(any(target_os = "android", target_vendor = "apple", target_os = "linux"))'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

@@ -44,7 +44,7 @@ pub async fn fetch_play_info(
         .json()
         .await
         .map_err(|e| {
-            AppError::Bilibili(format!("Failed to parse getRoomPlayInfo response: {e}"))
+            AppError::BilibiliResponse(format!("Failed to parse getRoomPlayInfo response: {e}"))
         })?;
 
     Ok(resp)
@@ -332,7 +332,6 @@ mod tests {
             min_segment_size: 20 * 1024 * 1024,
             qn: 10000,
             cdn: vec![],
-            delete_after_submit: false,
         }
     }
 

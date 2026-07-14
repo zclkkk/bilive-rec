@@ -19,6 +19,16 @@ pub(super) fn validate_cookie_file_path(path: &Path, label: &str) -> AppResult<(
     Ok(())
 }
 
+pub(super) fn validate_upload_cookie_file(path: &Path, label: &str) -> AppResult<u64> {
+    validate_cookie_file_path(path, label)?;
+    let credential = crate::credential::UploadCredentialFile::open(path).map_err(|error| {
+        AppError::Config(format!(
+            "{label} must be a readable, writable, valid biliup LoginInfo JSON document: {error}"
+        ))
+    })?;
+    Ok(credential.login_info().token_info.mid)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigValueError {
     Empty,
@@ -195,5 +205,43 @@ mod tests {
             parse_hms_duration("18446744073709551615:00:00"),
             Err(ConfigValueError::Overflow)
         );
+    }
+
+    #[test]
+    fn upload_cookie_rejects_raw_cookie_header() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"SESSDATA=test; bili_jct=test").unwrap();
+
+        let error = validate_upload_cookie_file(file.path(), "upload cookie").unwrap_err();
+
+        assert!(error.to_string().contains("biliup LoginInfo JSON"));
+    }
+
+    #[test]
+    fn upload_cookie_requires_a_non_zero_mid() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(
+            br#"{
+                "cookie_info": {
+                    "cookies": [{"name": "SESSDATA", "value": "test"}]
+                },
+                "sso": [],
+                "token_info": {
+                    "access_token": "test",
+                    "expires_in": 3600,
+                    "mid": 0,
+                    "refresh_token": "test"
+                },
+                "platform": null
+            }"#,
+        )
+        .unwrap();
+
+        let error = validate_upload_cookie_file(file.path(), "upload cookie").unwrap_err();
+        assert!(error.to_string().contains("non-zero Bilibili account mid"));
     }
 }

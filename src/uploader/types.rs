@@ -1,5 +1,4 @@
 use crate::config::Copyright;
-use crate::error::AppResult;
 use crate::state::model::UploadedPart;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -30,22 +29,28 @@ pub struct SubmissionRequest {
     pub parts: Vec<UploadedPart>,
 }
 
-/// Outcome of a remote submission call.
+/// Whether a known failure only applies to one artifact/submission or to the
+/// shared credential/upload target. Workers use this to avoid multiplying a
+/// broken target across every pending segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureScope {
+    Item,
+    Target,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownFailure {
+    pub reason: String,
+    pub scope: FailureScope,
+}
+
+/// Result of crossing the Bilibili submission boundary.
 ///
-/// Bilibili's submit API can answer in three ways:
-///   - `Confirmed`: code=0 and at least one of aid/bvid is returned.
-///   - `Ambiguous`: code=0 but neither aid nor bvid is returned. The remote
-///     may have accepted the submission, but we cannot prove it locally
-///     without a follow-up query — operators must verify on Bilibili and
-///     resolve via `state resolve-submission`.
-///   - `Err(...)`: a locally known failure or explicit Bilibili rejection.
-///     Transport/response errors after the submit boundary must be mapped to
-///     `Ambiguous`, because the remote side may already have accepted it.
-///
-/// Folding Ambiguous into Err would lie about the remote state; folding it
-/// into Confirmed would silently lose the aid/bvid we need to navigate back
-/// to the upload. So it gets its own arm.
-#[derive(Debug, Clone)]
+/// `RetryableKnownFailure` is safe to retry automatically because the request
+/// is known not to have reached an accepting endpoint. `BlockedKnownFailure`
+/// is also a known outcome, but requires an external/configuration correction.
+/// Once Bilibili may have accepted the request, failures must be `Ambiguous`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionOutcome {
     Confirmed {
         aid: Option<u64>,
@@ -54,18 +59,28 @@ pub enum SubmissionOutcome {
     Ambiguous {
         reason: String,
     },
+    RetryableKnownFailure(KnownFailure),
+    BlockedKnownFailure(KnownFailure),
+}
+
+/// Result of crossing the Bilibili upload boundary, with the same known versus
+/// ambiguous distinction as [`SubmissionOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadOutcome {
+    Confirmed(UploadedPart),
+    RetryableKnownFailure(KnownFailure),
+    BlockedKnownFailure(KnownFailure),
+    Ambiguous { reason: String },
 }
 
 pub trait Uploader: Send + Sync {
-    fn check_login(&self) -> impl std::future::Future<Output = AppResult<()>> + Send;
-
     fn upload_segment(
         &self,
         req: UploadRequest,
-    ) -> impl std::future::Future<Output = AppResult<UploadedPart>> + Send;
+    ) -> impl std::future::Future<Output = UploadOutcome> + Send;
 
     fn submit(
         &self,
         req: SubmissionRequest,
-    ) -> impl std::future::Future<Output = AppResult<SubmissionOutcome>> + Send;
+    ) -> impl std::future::Future<Output = SubmissionOutcome> + Send;
 }

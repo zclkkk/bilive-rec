@@ -98,10 +98,10 @@
 
 1. 主播开播后开始录制
 2. 分段 finalized 后进入上传流程
-3. 上传成功的 part 会立即写入 redb
-4. 投稿开始前写入 `Pending` submission
+3. 上传成功的 proof 会与 `Uploaded` 状态原子写入 redb
+4. 投稿跨越风险边界前写入带 attempt ID 的 `Attempting`
 5. 投稿返回 aid/bvid 后标记为 `Submitted`
-6. 明确失败标记为 `Failed`
+6. 安全的连接前失败进入持久化退避，明确拒绝进入 `Blocked`
 7. 结果不确定标记为 `Ambiguous`
 
 这里最重要的是第 3 和第 4 步：上传和投稿之间存在天然断点。视频文件可能已经传到 B 站，但投稿还没完成；投稿请求可能已经被 B 站接受，但本地还没收到完整响应。`bilive-rec` 不会在这些地方假装自己知道结果。
@@ -110,48 +110,43 @@
 
 投稿状态目前分为：
 
-- `Pending`：投稿动作已经开始，但结果还不能确定
+- `Attempting`：已持久化本次远端 attempt，调用可能正在进行
+- `RetryScheduled`：确定请求没有被接受，等待持久化 `retry_at`
 - `Submitted`：B 站返回了 aid 或 bvid，稿件已经创建
 - `Ambiguous`：远端可能已经接受，但本地无法确认最终稿件标识
-- `Failed`：明确失败
+- `RetryAuthorized`：人工确认没有稿件，允许下一次 attempt
+- `Blocked`：明确失败，需要修复 Cookie、配置或远端拒绝原因
 
 `Ambiguous` 不会被自动重试。因为盲目重试可能造成重复投稿。
 
 确认 B 站后台实际情况后，可以用：
 
 ```bash
-bilive-rec state resolve-submission <session-id> --as submitted --bvid <BV...>
-bilive-rec state resolve-submission <session-id> --as failed
+bilive-rec recover submission <session-id> --submitted --bvid <BV...>
+bilive-rec recover submission <session-id> --not-submitted
 ```
 
-解析为 `submitted` 时必须提供 `--aid` 或 `--bvid`。这个命令只处理 `Pending` 或 `Ambiguous`，不会覆盖已经确定的 `Submitted` 或 `Failed`。
+确认已投稿时必须提供 `--aid` 或 `--bvid`。只有人工确认没有稿件后才能授权重试。
 
 ### 可审计恢复
 
-`bilive-rec` 使用 redb 作为本地嵌入式状态库，记录 session、segment、uploaded part、submission plan、submission 和房间状态。
+`bilive-rec` 使用 redb 作为本地嵌入式状态库。Session 自身冻结录制/输出计划，Segment
+自身携带上传 proof、attempt 和 resolution；不再用 uploaded part 与 submission plan
+两张平行表复制事实。
 
 崩溃后可以先看状态：
 
 ```bash
-bilive-rec state inspect
+bilive-rec status
 ```
 
-再生成恢复计划：
+能够由本地事实确定的恢复会在 `run` 启动时自动执行。状态页会为远端歧义给出
+准确的人工裁决命令；如果 part/final 冲突无法自动选择，也会要求先检查两个文件再记录
+决定。例如：
 
 ```bash
-bilive-rec state recover
-```
-
-默认是 dry-run。确认计划后，再显式执行：
-
-```bash
-bilive-rec state recover --apply
-```
-
-如果涉及重新上传缺失 part，也需要明确指定 session：
-
-```bash
-bilive-rec state recover --retry-upload <session-id> --apply
+bilive-rec recover upload <session-id> <segment-index> --not-uploaded
+bilive-rec recover segment <session-id> <segment-index> --keep-final
 ```
 
 恢复逻辑的原则是保守的：能从本地事实安全推出的动作才自动执行；远端结果不确定时，宁可停下来让人确认，也不替用户猜。
@@ -183,7 +178,7 @@ credential = "main"
 credential = "captain"
 ```
 
-这样可以清楚表达“哪个房间用哪个身份拉流，哪个身份投稿”。session 里也会持久化当时使用的 credential identity，避免恢复时因为用户改了配置而悄悄换账号。
+这样可以清楚表达“哪个房间用哪个身份拉流，哪个身份投稿”。录制 Session 持久化 credential locator；上传 Session 还会冻结配置时读取的非零 Bilibili `mid`。每次上传或投稿都会重新认证并用服务端响应核对真实 `mid`，因此替换同一路径的 Cookie 文件不会让历史 Session 悄悄换账号。
 
 ### 投稿元数据和房间级覆盖
 
@@ -208,7 +203,7 @@ private = true
 
 ### 可选清理本地文件
 
-可以配置 `delete_after_submit = true`，在 B 站返回 aid/bvid、submission 被标记为 `Submitted` 后删除本地录制文件。
+可以在 `[upload]` 配置 `delete_after_submit = true`，在 B 站返回 aid/bvid、submission 被标记为 `Submitted` 后删除本地录制文件。
 
 这个选项默认关闭。
 
@@ -243,12 +238,11 @@ cargo run -- run
 | 命令 | 用途 |
 |------|------|
 | `check <url>` | 检查直播间状态、候选流、CDN 名称和最终选择 |
-| `record <url>` | 一次性录制，不上传 |
-| `upload <files...>` | 手动上传并投稿 |
 | `run` | 启动多房间自动录制上传流程 |
-| `state inspect` | 查看持久化状态 |
-| `state recover` | 生成或执行恢复计划 |
-| `state resolve-submission` | 人工裁定不确定投稿 |
+| `status` | 查看持久化状态和待处理问题 |
+| `recover upload` | 人工裁定不确定上传 |
+| `recover submission` | 人工裁定并恢复投稿 |
+| `recover recording` | 裁定异常结束的录制并释放房间 |
 
 ## 适合谁，不适合谁
 

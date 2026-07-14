@@ -1,171 +1,135 @@
-# How It Works
+# 工作原理
 
-bilive-rec 由两个独立循环组成：按房间运行的录制监督器，以及从 `redb`
-推导任务的上传 worker。录制、上传、投稿都持久化到本地状态库；崩溃后从
-状态和文件本身恢复，而不是从内存事件恢复。
+## 一条自动生命周期
 
----
+`bilive-rec run` 先解析全部房间的 canonical ID 并整体查重，随后恢复本地文件 intent、
+对账持久化房间 owner，最后才启动房间监督器和上传 worker。任何配置别名冲突都发生在
+创建 Session 之前，不会留下“某个并发任务先赢了”的半启动状态。
 
-## 房间生命周期
+房间开播时创建 `LiveSession`，同时冻结：
 
-每个房间由 `RoomState` 状态机控制：
+- 完整录制计划：Cookie、输出目录、分段时长/大小、最小文件、清晰度和 CDN；
+- 输出计划：LocalOnly，或 Bilibili 上传 target、投稿字段与提交后删除策略。
 
-```
-Idle -> Resolving -> Recording -> WaitingReconnect -> ReResolving
-  ^        |             |                  |               |
-  |        v             v                  v               v
-  +----- Offline       Failed             Idle          Recording
-```
+因此配置更新只影响未来 Session。中断后继续历史 Session 时使用历史计划，不用当前配置
+猜测原本的路径或凭据。
+
+## Session 与房间
+
+Session lifecycle：
 
 | 状态 | 含义 |
-|------|------|
-| `Idle` | 空闲，等待下次轮询 |
-| `Resolving` | 正在查询房间信息和流地址 |
-| `Recording` | 正在录制直播流 |
-| `WaitingReconnect` | 断流后等待重连 |
-| `ReResolving` | 重连时重新查询流地址 |
-| `Offline` | 主播未开播 |
-| `Failed` | 需要人工干预 |
+|---|---|
+| `Open` | 仍可录制并上传已经完成的 Segment |
+| `RecoveryRequired` | 本地录制事实需要操作者裁决，新远端动作被冻结 |
+| `Closed(Completed)` | 有可用录像，可完成上传和投稿 |
+| `Closed(NoUsableRecording)` | 没有可投稿的录像；不会伪造一个失败 Submission |
+| `Closed(Abandoned)` | 操作者终止后续上传与投稿 |
 
-房间状态只描述录制生命周期，不描述上传和投稿。上传或投稿很慢时，房间监督器仍会继续监听下一场直播。
+房间只保存 `Ready / Owned(session) / Blocked(session)`。Session 与房间所有权总在同一 redb
+事务中改变，不存在“Session 已结束但房间仍被旧 owner 占用”的正常路径。
 
----
+`close_session` 会在同一事务内读取全部 Segment。未完成的文件 intent 或 Failed Segment
+会得到 `RecoveryRequired + Blocked`；全部被过滤或零 Segment 会得到
+`NoUsableRecording + Ready`；只有存在可用录像才是 `Completed + Ready`。
 
-## 录制生命周期
+## Segment 与文件提交
 
-### 1. 流捕获
+Segment 有两个正交事实：
 
-录制从 HTTP 响应流开始。`FlvRecorder` 有两个阶段：
+- Artifact：本地文件状态；
+- Upload：远端文件状态。
 
-- **WaitSync**：等待 FLV 元数据、AVC/AAC 序列头和第一个关键帧全部到齐。在此之前的所有帧被丢弃。
-- **Recording**：开始写入分段文件。
+Artifact state 自己携带 close reason 或 failure reason：
 
-### 2. 分段策略
+```text
+Writing
+  ├─> Finalizing -> Ready
+  ├─> Discarding -> Filtered
+  └─> Failed
 
-录制过程中按以下条件自动分段：
+Ready -> Deleting -> Deleted
+```
 
-- **大小阈值**：分段文件达到 `segment_size` 时轮转
-- **时间阈值**：分段录制时长达到 `segment_time` 时轮转
-- **序列头变更**：CDN 切换导致序列头变化时轮转
+part 文件用 `create_new` 创建。保留录像时先 flush/sync 文件，再持久化 `Finalizing`，
+然后执行不会覆盖既有 final 的原子 rename、sync 父目录，最后写 `Ready`。过滤与删除同样
+先写 `Discarding`/`Deleting`，再执行 remove、sync 父目录，最后写终态。进程可以在任一点
+中断，下一次 `run` 都会用同一份文件矩阵重放，而不是从日志猜测。
 
-每个分段先以 `.part` 扩展名写入，结束后重命名为 `.flv`。
-
-### 3. DB 先于文件
-
-新分段开始前，先在 `redb` 中写入 `Segment` 记录（状态为 `Recording`）。如果在文件创建前崩溃，recovery 会看到一个没有对应文件的 Recording 分段并标记为 Failed。孤立的 `.part` 文件不会被当作事实来源。
-
-### 4. 断流处理
-
-直播流中断后，进入 `WaitingReconnect`：
-
-- 记录断流时间，开始计算宽限期（`offline_grace_s`）
-- 宽限期内复播：继续录制到同一个 `LiveSession`
-- 宽限期超时：将 `LiveSession` 标记为 `Finalized`，释放房间回到监听状态
-
----
-
-## 上传与投稿
-
-上传和投稿由独立 worker 负责。worker 不接收“任务事件”作为事实来源，而是扫描 `redb`：
-
-- `Finalized` 分段且没有 `UploadedPart`：可以上传
-- `Finalized` session 且所有分段已满足上传条件：可以投稿
-- `Submitted` session 且配置允许清理：可以删除本地录制文件
-
-### 上传
-
-worker 上传所有可证明安全的 `Finalized` 分段：
-
-- 每个分段上传前标记为 `Uploading`
-- 上传成功后，`UploadedPart` 和 `SegmentStatus::Uploaded` 在同一个事务中落盘
-- 上传失败但状态可恢复时，分段回到 `Finalized`，等待下次 worker 扫描
-- `Uploading` 表示远端结果未知，不会自动重试
-
-### 投稿
-
-session 创建时会持久化 `SubmissionPlan`，冻结本次投稿的标题、简介、分区、tag、投稿身份和提交接口。用户之后修改配置，不会悄悄改变历史 session 的投稿事实。
-
-session 被录制监督器标记为 `Finalized` 后，worker 才允许投稿：
-
-1. 检查是否已有投稿记录
-2. 校验所有分段都已满足上传条件
-3. 收集所有 `UploadedPart`，按序号排序
-4. **先持久化 `Pending` 投稿记录**，再调用 B 站投稿 API
-5. 根据返回结果记录最终状态
-
-| 结果 | 投稿状态 | 含义 |
-|------|----------|------|
-| 返回 aid/bvid | `Submitted` | 确认成功 |
-| HTTP 200 + code=0 但无标识符 | `Ambiguous` | 可能成功，需人工确认 |
-| 请求失败 | `Failed` | 明确失败 |
-
-`delete_after_submit` 仅在 `Submitted` 状态下触发。`Pending`、`Ambiguous`、`Failed` 不会删除文件。
-
----
-
-## 崩溃恢复
-
-崩溃重启后，`RoomSupervisor` 从 `redb` 读取持久化的 `RoomState`，恢复仍处于录制生命周期内的房间。上传 worker 重新扫描 `Segment`、`UploadedPart`、`SubmissionPlan` 和 `Submission`，继续处理未完成的上传/投稿。
-
-### state inspect
+如果本地 intent 与文件矩阵冲突（通常是 `.part` 与 `.flv` 同时存在），程序不会擅自覆盖
+或删除。检查内容后使用：
 
 ```bash
-bilive-rec state inspect
+bilive-rec recover segment <session_id> <index> --keep-part
+bilive-rec recover segment <session_id> <index> --keep-final
+bilive-rec recover segment <session_id> <index> --exclude
 ```
 
-输出示例：
+## 上传
 
-```
-Summary:
-  sessions: 3
-  segments: 15
-  uploaded_parts: 12
-  submissions: 2
-  submission_plans: 3
+上传 proof（B 站文件名与分 P 标题）直接内嵌在 `UploadState::Uploaded`，不会再与另一张
+UploadedPart 表分叉。每次 attempt 和每次人工 resolution 都 append 保存。
 
-Room states:
-  room 123456: Recording  session=550e8400-...  last_error=[2024-05-15T20:30:00Z] network error: connection refused
-  room 789012: Idle
-```
+远端结果分为四类：
 
-`last_error` 字段记录最近一次暂时性录制错误。成功状态转换会清除它。
+| 结果 | 行为 |
+|---|---|
+| `Confirmed` | 原子写入 Uploaded proof |
+| `RetryableKnownFailure` | 确定尚未越过接受边界，持久化指数退避时间 |
+| `BlockedKnownFailure` | Cookie、文件、配置或明确拒绝；停止自动重试 |
+| `Ambiguous` | B 站可能已接受；必须人工核实 |
 
-### state recover
+target 级故障还会打开持久化 circuit breaker，避免同一份坏 Cookie 在所有待上传 Segment
+上重复失败。退避从 30 秒指数增长，最大 30 分钟。
+
+Ambiguous/Blocked 需要确认真实结果：
 
 ```bash
-bilive-rec state recover          # dry-run，只打印计划
-bilive-rec state recover --apply  # 实际执行
+bilive-rec recover upload <session_id> <index> --not-uploaded
+bilive-rec recover upload <session_id> <index> --uploaded <bili_filename>
 ```
 
-recovery 会检测以下异常并生成恢复计划：
+`--not-uploaded` 的含义是“确认不存在”，不是无条件重试：Abandoned Session 会进入
+Cancelled，不会复活上传。
 
-| 异常 | 恢复动作 |
-|------|----------|
-| Session 卡在 Recording（无活跃房间状态） | 标记为 Failed |
-| Segment 卡在 Recording（无活跃房间状态） | 标记为 Failed |
-| Finalized Segment 没有 UploadedPart | 正常 worker backlog；显式 `--retry-upload` 时才计划重传 |
-| Room 卡在 Failed | `--reset-room` 重置为 Idle |
-| 投稿 Pending/Ambiguous | 不自动处理，需 `resolve-submission` |
+## 投稿与本地清理
 
-recovery 是幂等的：多次运行不会产生副作用。
+只有 `Closed(Completed)` 且所有可用 Segment 都具有 Uploaded proof 时才会创建投稿
+attempt。没有 Submission row 表示尚未跨越投稿风险边界。
 
-### state resolve-submission
+明确远端拒绝进入 `Blocked`，安全的连接前失败进入有 `retry_at` 的 `RetryScheduled`，请求
+可能已被接受时进入 `Ambiguous`。人工裁决使用：
 
 ```bash
-bilive-rec state resolve-submission <session_id> --as submitted --bvid BV1xx411x7xx
-bilive-rec state resolve-submission <session_id> --as failed
+bilive-rec recover submission <session_id> --not-submitted
+bilive-rec recover submission <session_id> --submitted --bvid <BV...>
 ```
 
----
+`--not-submitted` 追加 resolution 并进入 `RetryAuthorized`；下一次 attempt 不覆盖过去的
+attempt 或 resolution。
 
-## 错误分类
+开启 `delete_after_submit` 时，只有已确认 Submitted、Ready 且 Uploaded 的文件才进入
+`Deleting -> Deleted` 协议。先删除文件、后补状态的崩溃窗口不存在。
 
-系统将错误分为三类，决定是否重试：
+## Abandon 的真实语义
 
-| 分类 | 错误类型 | 行为 |
-|------|----------|------|
-| 可重试 | 网络错误、B 站 API 错误、流协议错误、重复媒体数据 | 持久化错误信息，进入 WaitingReconnect 重试 |
-| 致命 | IO 错误、配置错误、数据库错误、状态逻辑错误 | 终止当前房间，进入 Failed |
-| 特殊 | 优雅关闭（Ctrl-C） | 保持当前状态不变，等待重启恢复 |
+Abandon 关闭 Session 并释放房间，但不抹除远端事实：
 
-错误信息通过 `last_error` 持久化，可通过 `state inspect` 查看，无需翻阅日志。
+- Uploaded 保持 Uploaded；
+- Ambiguous 保持 Ambiguous；
+- Attempting 先归一为 Ambiguous；
+- Pending 与明确未产生远端对象的 Blocked 才变成 Cancelled；
+- 不会投稿。
+
+## 状态检查
+
+`status`/`recover` 使用 `open_existing` 打开状态库。配置中的 `data.dir` 错误或数据库缺失会
+直接报错，绝不在错误位置创建空库。
+
+```bash
+bilive-rec status --verbose
+```
+
+verbose 输出包含冻结计划、Session 录制事件、Artifact close/failure reason、part/final
+文件矩阵、上传与投稿 attempt/resolution、target gate，以及每个异常的下一条命令。
+执行离线状态命令前先停止 `run`，避免与正在进行的远端操作竞争。
